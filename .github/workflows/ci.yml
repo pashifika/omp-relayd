@@ -127,12 +127,80 @@ jobs:
           }
           ' "${files[@]}"
 
+  # Runtime job. Owns the Rust crate under `server/`, whose toolchain this
+  # change introduces.
+  rust:
+    name: rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: server
+    env:
+      # Pinned, not a floating channel: a toolchain that changes underneath a
+      # previously green build makes a red one unexplainable. Bump deliberately.
+      RUST_VERSION: 1.97.1
+      # The oldest toolchain `server/Cargo.toml` claims to support. Checked
+      # below so the claim cannot rot into a comment nobody verifies.
+      RUST_MSRV: 1.85.0
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install "$RUST_VERSION" \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --no-self-update
+          rustup default "$RUST_VERSION"
+
+          # Printed, not assumed: every result below belongs to these versions.
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: Check formatting
+        timeout-minutes: 5
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        timeout-minutes: 10
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        timeout-minutes: 10
+        run: cargo test --locked --all-features
+
+      - name: Build documentation
+        timeout-minutes: 10
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+      - name: Check the declared minimum supported Rust version
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install "$RUST_MSRV" --profile minimal --no-self-update
+          cargo "+$RUST_MSRV" --version
+          cargo "+$RUST_MSRV" check --locked --all-targets --all-features
+
   # The single status check branch protection requires. `.github/rulesets/main.json`
   # names the literal string `ci`; nothing mechanically verifies the two agree, so
   # renaming this job silently blocks every merge with no failing job to point at.
   ci:
     name: ci
-    needs: [hygiene]
+    needs: [hygiene, rust]
     # `always()` is load-bearing. Without it this job is skipped when a dependency
     # fails, and a skipped required check blocks a pull request rather than failing
     # it -- a stuck merge button instead of a red one.
