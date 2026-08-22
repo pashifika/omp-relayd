@@ -5,3 +5,4 @@
 # the same workflow skills into both directories on every install.
 .claude/
 .omp/
+# protection probe; this branch is never merged
