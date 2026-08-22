@@ -172,6 +172,16 @@ jobs:
         timeout-minutes: 5
         run: cargo fmt --all -- --check
 
+      # `--all-targets` builds the tests too, and their dev-dependency features
+      # unify into the library's. So a feature the library genuinely needs can be
+      # declared only under `[dev-dependencies]` and every other check here will
+      # still pass, while a consumer building just the library fails. That is not
+      # hypothetical: `tokio`'s `io-util` was declared that way and the library
+      # did not build standalone.
+      - name: Check the library on its own features
+        timeout-minutes: 5
+        run: cargo check --locked --lib
+
       - name: Lint
         timeout-minutes: 10
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
