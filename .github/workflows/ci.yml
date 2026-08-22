@@ -31,6 +31,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Hold the run open so a superseding push can cancel it
+        timeout-minutes: 5
+        run: sleep 180
+
       - name: Verify every action reference is SHA-pinned with a version comment
         timeout-minutes: 5
         run: |
