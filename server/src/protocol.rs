@@ -483,6 +483,12 @@ pub fn body_over_budget(body: &str) -> Option<usize> {
     (body.len() > MAX_BODY_BYTES).then_some(body.len())
 }
 
+/// Deliberate `clippy::pedantic` violation on a throwaway branch, to prove the
+/// `rust` job fails the `ci` gate rather than only claiming it would.
+pub fn gate_probe(value: u64) -> u32 {
+    value as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
