@@ -18,7 +18,8 @@ use std::io;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
 
 /// The only protocol major version this relay speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -435,6 +436,35 @@ pub fn codec() -> LengthDelimitedCodec {
 /// Wraps a byte stream in the protocol framing codec.
 pub fn framed<S>(io: S) -> Framed<S, LengthDelimitedCodec> {
     Framed::new(io, codec())
+}
+
+/// The read half of a split connection, framed.
+pub type FrameReader<S> = FramedRead<ReadHalf<S>, LengthDelimitedCodec>;
+
+/// The write half of a split connection, framed.
+pub type FrameWriter<S> = FramedWrite<WriteHalf<S>, LengthDelimitedCodec>;
+
+/// Splits a byte stream into halves that are framed, and polled, independently.
+///
+/// The relay drives reading and writing as two concurrent futures, so that a
+/// write to a peer which has stopped reading cannot stop the relay from reading
+/// that peer's heartbeats. That separation has to happen at the transport:
+/// [`Framed`] is a single object and a pending `send` borrows it mutably, so no
+/// arrangement above it can read and write at the same time.
+///
+/// This is the shape a message broker converges on for the same reason --
+/// `RabbitMQ` gives every connection a reader process and a writer process, and
+/// tracks heartbeats on the reader, so a slow consumer stalls only its own
+/// writer.
+pub fn framed_split<S>(io: S) -> (FrameReader<S>, FrameWriter<S>)
+where
+    S: AsyncRead + AsyncWrite,
+{
+    let (read_half, write_half) = tokio::io::split(io);
+    (
+        FramedRead::new(read_half, codec()),
+        FramedWrite::new(write_half, codec()),
+    )
 }
 
 /// Classifies a framing-layer error, returning the code to report to the peer.

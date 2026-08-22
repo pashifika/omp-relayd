@@ -25,6 +25,12 @@ rmp-serde = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.44", features = [
+    # `io-util` is a runtime need, not a test one: `tokio::io::split` and its
+    # `ReadHalf`/`WriteHalf` are how the connection reads and writes
+    # independently. It reached the library through dev-dependency feature
+    # unification at first, which builds tests and `--all-targets` but leaves
+    # `cargo build -p omp-relayd --lib` and `cargo doc` failing.
+    "io-util",
     "macros",
     "net",
     "rt-multi-thread",
@@ -37,9 +43,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-# `test-util` gives tests a paused clock; `io-util` gives them in-memory duplex
-# streams, which exercise the generic transport seam without a socket.
-tokio = { version = "1.44", features = ["io-util", "test-util"] }
+# `test-util` gives tests a paused clock. `io-util`'s in-memory duplex streams
+# exercise the generic transport seam without a socket, and it is declared
+# above because the library itself needs it.
+tokio = { version = "1.44", features = ["test-util"] }
 
 [lints.rust]
 # The relay parses untrusted input from the network. Nothing here needs `unsafe`,

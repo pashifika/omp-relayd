@@ -693,6 +693,158 @@ async fn a_replacement_connection_takes_over_the_peer_name() {
     );
 }
 
+/// Fills `to`'s socket buffer and then its outbound queue, returning how many
+/// sends were accepted before backpressure. Large bodies get there in tens of
+/// frames rather than thousands.
+async fn fill_pipeline(sender: &mut Client<tokio::net::TcpStream>, to: &str) -> usize {
+    let body = "x".repeat(32 * 1024);
+    let mut routed = 0usize;
+    for attempt in 1..=2000 {
+        sender
+            .send(&ClientFrame::Send {
+                id: format!("m{attempt}"),
+                to: to.to_owned(),
+                body: body.clone(),
+                reply_to: None,
+            })
+            .await;
+        match sender.recv().await {
+            ServerFrame::Receipt {
+                status: ReceiptStatus::Routed,
+                ..
+            } => routed += 1,
+            ServerFrame::Receipt {
+                status: ReceiptStatus::RecipientBackpressure,
+                ..
+            } => return routed,
+            other => panic!("attempt {attempt}: unexpected {other:?}"),
+        }
+    }
+    panic!("backpressure never appeared after 2000 sends of 32 KiB");
+}
+
+/// Regression: the eviction signal used to be the closure of the outbound
+/// queue, and a closed `mpsc` channel yields every buffered frame before it
+/// reports closure. So the diagnostic sat behind the backlog -- and the design
+/// notes that a peer being replaced is *usually* one that stopped reading, so
+/// usually one whose backlog is full.
+///
+/// Measured before the fix: `PeerReplaced` arrived after 145 queued messages
+/// when the peer resumed reading, and when it did not read it received no
+/// diagnostic at all and held its socket until the idle deadline.
+#[tokio::test]
+async fn a_superseded_connection_is_told_before_its_backlog_is_drained() {
+    let relay = Relay::start().await;
+    let here = room("replacement-backlog");
+
+    let mut sender = Client::join(&relay, &here, "sender").await;
+    // Registered and never read from, so a backlog builds up behind it.
+    let mut stale = Client::join(&relay, &here, "target").await;
+
+    let backlog = fill_pipeline(&mut sender, "target").await;
+    assert!(
+        backlog > 0,
+        "the fixture needs a non-empty backlog to be meaningful"
+    );
+
+    // Supersede it, then read. Eviction must overtake the *backlog*; it cannot
+    // un-send bytes already committed to the socket or to the codec's write
+    // buffer, so some frames still precede the diagnostic. That residue is
+    // bounded by socket buffer sizes and does not scale with queue depth --
+    // observed between 2 and 17 frames depending on load, against a 145-frame
+    // backlog. What must not happen is the diagnostic arriving behind the whole
+    // backlog, which is what the queue-closure signal did: measured at 145 of
+    // 145 before the eviction flag existed.
+    //
+    // So the assertion is proportional rather than absolute. An exact count
+    // would be asserting the kernel's buffer sizes, which is not the contract.
+    let _fresh = Client::join(&relay, &here, "target").await;
+
+    let mut ahead_of_diagnostic = 0usize;
+    loop {
+        match stale.recv().await {
+            ServerFrame::Message { .. } => ahead_of_diagnostic += 1,
+            ServerFrame::Error { code, .. } => {
+                assert_eq!(
+                    code,
+                    ErrorCode::PeerReplaced,
+                    "the superseded connection must be told it was replaced"
+                );
+                break;
+            }
+            other => panic!("unexpected frame on a superseded connection: {other:?}"),
+        }
+        assert!(
+            ahead_of_diagnostic * 4 < backlog,
+            "eviction must overtake the {backlog}-frame backlog rather than queue behind \
+             it: only frames already committed to the socket may precede the diagnostic, \
+             and that residue must not scale with queue depth, but {ahead_of_diagnostic} \
+             frames arrived first"
+        );
+    }
+    println!(
+        "backlog {backlog} frames; {ahead_of_diagnostic} already-committed frame(s) \
+         preceded peer_replaced"
+    );
+    stale.expect_closed().await;
+}
+
+/// Regression: a peer that keeps sending heartbeats must not be disconnected
+/// for silence it did not commit. TCP is full-duplex, so a peer whose receive
+/// buffer is full can still send -- but while the relay was blocked writing to
+/// it, the inbound half was not polled, so those frames went unread and the
+/// idle deadline was never reset.
+///
+/// Measured before the fix: a peer that sent 9 pings over 2.72 s against a
+/// 1.5 s idle deadline was disconnected anyway.
+#[tokio::test]
+async fn a_stalled_peer_that_keeps_pinging_is_not_disconnected() {
+    let idle = Duration::from_millis(600);
+    let relay = Relay::with_deadlines(Deadlines {
+        hello: Duration::from_secs(5),
+        idle,
+    })
+    .await;
+    let here = room("stalled-heartbeat");
+
+    let mut sender = Client::join(&relay, &here, "sender").await;
+    // Never read from: its socket buffer and queue both fill, so the relay's
+    // writer for this peer is blocked for the rest of the test.
+    let mut slow = Client::join(&relay, &here, "slow").await;
+
+    fill_pipeline(&mut sender, "slow").await;
+
+    // Both peers behave like busy but conscientious clients: heartbeats on
+    // time. `slow` additionally never drains, so the relay's writer for it is
+    // blocked for the rest of the test. The sender heartbeats too, because its
+    // own idle deadline is running and a disconnected sender would confuse the
+    // result with an unrelated timeout.
+    let mut pings = 0usize;
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < idle * 3 {
+        slow.send(&ClientFrame::Ping).await;
+        pings += 1;
+
+        sender.send(&ClientFrame::Ping).await;
+        assert_eq!(
+            sender.recv().await,
+            ServerFrame::Pong,
+            "the sender is reading normally and must stay healthy while another \
+             peer's writer is blocked"
+        );
+
+        tokio::time::sleep(idle / 4).await;
+    }
+
+    assert!(
+        relay.state.list_peers(&here).iter().any(|n| n == "slow"),
+        "a peer that sent {pings} valid pings over {:?} -- three times the {idle:?} idle \
+         deadline -- must still be registered; `peer-relay` resets the deadline on any \
+         valid inbound frame, and a blocked write must not stop those frames being read",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn late_cleanup_of_a_superseded_connection_keeps_the_replacement() {
     let relay = Relay::start().await;

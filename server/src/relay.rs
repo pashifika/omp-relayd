@@ -24,8 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep_until, timeout, timeout_at};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::protocol::{
     self, ClientFrame, ErrorCode, PROTOCOL_VERSION, ReceiptStatus, RoomId, ServerFrame,
@@ -96,6 +95,19 @@ impl Default for Deadlines {
 struct PeerHandle {
     connection_id: u64,
     outbound: mpsc::Sender<ServerFrame>,
+    /// Set when a newer connection takes this peer name.
+    ///
+    /// Separate from `outbound` on purpose. Closing the queue cannot serve as
+    /// the eviction signal, because a closed [`mpsc`] channel yields every
+    /// buffered frame *before* it reports closure -- so the signal would arrive
+    /// behind the backlog, and a peer being replaced is usually one that stopped
+    /// reading, so usually one whose backlog is full. Measured before this
+    /// existed: the superseded connection received no diagnostic at all and
+    /// held its socket until the idle deadline.
+    ///
+    /// A `watch` rather than a `Notify` because its receiver is cancel-safe
+    /// under `select!` and its state survives a dropped waiter.
+    evict: watch::Sender<bool>,
 }
 
 /// Outcome of registering a peer name.
@@ -160,20 +172,24 @@ impl ServerState {
     /// Registers `peer` in `room`, superseding any existing connection of the
     /// same name.
     ///
-    /// Dropping the superseded [`PeerHandle`] closes its outbound channel,
-    /// which is how the superseded connection task learns it was replaced. That
-    /// signal cannot be lost to a full queue, which is exactly the state a
-    /// stalled connection being replaced is likely to be in.
+    /// The superseded connection is signalled through its [`PeerHandle::evict`]
+    /// flag, not by the closure of its outbound queue. The queue cannot carry
+    /// the signal: a closed [`mpsc`] channel drains every buffered frame before
+    /// it reports closure, so the eviction would queue behind a backlog -- and
+    /// the peer being replaced is usually one that stopped reading, so usually
+    /// one whose backlog is full.
     fn register(
         &self,
         room: &RoomId,
         peer: &str,
         outbound: mpsc::Sender<ServerFrame>,
+        evict: watch::Sender<bool>,
     ) -> Registration {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let handle = PeerHandle {
             connection_id,
             outbound,
+            evict,
         };
 
         let superseded = self
@@ -181,7 +197,11 @@ impl ServerState {
             .entry(room.clone())
             .or_default()
             .insert(peer.to_owned(), handle)
-            .map(|previous| previous.connection_id);
+            .map(|previous| {
+                // Ignored: a receiver that is already gone needs no telling.
+                let _ = previous.evict.send(true);
+                previous.connection_id
+            });
 
         Registration {
             connection_id,
@@ -266,6 +286,10 @@ struct RegisteredPeer {
     room: RoomId,
     peer: String,
     connection_id: u64,
+    /// Carried here rather than threaded through every handler. It is a
+    /// property of the connection, and the handlers that log it already receive
+    /// this guard.
+    peer_addr: SocketAddr,
 }
 
 impl Drop for RegisteredPeer {
@@ -309,7 +333,7 @@ pub async fn serve(
 
     loop {
         tokio::select! {
-            () = wait_for_shutdown(&mut shutdown) => break,
+            () = wait_for_flag(&mut shutdown) => break,
 
             // Reap finished tasks so the set tracks live connections rather
             // than every connection ever accepted.
@@ -362,6 +386,11 @@ pub async fn serve(
 /// Generic over the stream so that a later private-transport change can pass a
 /// TLS stream without touching framing, routing, or protocol handling. This
 /// change only ever passes a [`tokio::net::TcpStream`].
+///
+/// Once admitted, the connection runs as **two concurrent futures over
+/// independently framed halves**: a reader that never writes, and a writer that
+/// never reads, so a peer that stops reading cannot stop the relay from reading
+/// that peer's heartbeats.
 pub async fn run_connection<S>(
     io: S,
     state: Arc<ServerState>,
@@ -370,23 +399,30 @@ pub async fn run_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut framed = protocol::framed(io);
+    let (mut reader, mut writer) = protocol::framed_split(io);
 
-    if let Some((room, peer)) =
-        admit(&mut framed, &mut shutdown, state.deadlines(), peer_addr).await
+    if let Some((room, peer)) = admit(
+        &mut reader,
+        &mut writer,
+        &mut shutdown,
+        state.deadlines(),
+        peer_addr,
+    )
+    .await
     {
         // From here every exit path deregisters: `registered` owns the registry
         // entry and drops at the end of this block, before the close log below,
         // including if the block unwinds.
-        let (registered, outbound) = register_peer(&state, room, peer, peer_addr);
+        let (registered, outbound, evicted) = register_peer(&state, room, peer, peer_addr);
 
         // Bounded: the handshake is not complete until `ready` is out, and a
         // peer that never reads must not park this task before it is even
-        // registered.
+        // registered. Still sequential, because there is nothing to read
+        // concurrently with until the peer is registered.
         if timeout(
             state.deadlines().hello,
             write_frame(
-                &mut framed,
+                &mut writer,
                 &ServerFrame::Ready {
                     protocol: PROTOCOL_VERSION,
                 },
@@ -396,12 +432,13 @@ pub async fn run_connection<S>(
         .is_ok_and(|written| written.is_ok())
         {
             pump(
-                &mut framed,
+                reader,
+                writer,
                 &state,
                 &registered,
                 outbound,
+                evicted,
                 &mut shutdown,
-                peer_addr,
             )
             .await;
         }
@@ -410,16 +447,21 @@ pub async fn run_connection<S>(
     tracing::info!(%peer_addr, "connection closed");
 }
 
-/// Claims the peer name and returns the guard that owns it, along with the
-/// receiving end of its outbound queue.
+/// Claims the peer name and returns the guard that owns it, the receiving end
+/// of its outbound queue, and its eviction signal.
 fn register_peer(
     state: &Arc<ServerState>,
     room: RoomId,
     peer: String,
     peer_addr: SocketAddr,
-) -> (RegisteredPeer, mpsc::Receiver<ServerFrame>) {
+) -> (
+    RegisteredPeer,
+    mpsc::Receiver<ServerFrame>,
+    watch::Receiver<bool>,
+) {
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
-    let registration = state.register(&room, &peer, outbound_tx);
+    let (evict_tx, evict_rx) = watch::channel(false);
+    let registration = state.register(&room, &peer, outbound_tx, evict_tx);
     let connection_id = registration.connection_id;
 
     if let Some(superseded_connection_id) = registration.superseded {
@@ -441,109 +483,224 @@ fn register_peer(
             room,
             peer,
             connection_id,
+            peer_addr,
         },
         outbound_rx,
+        evict_rx,
     )
 }
 
+/// Capacity of the reply channel between the reader and the writer.
+///
+/// The reader emits at most one reply per inbound frame and processes frames
+/// serially, so a handful of slots is ample slack for pipelining. If it does
+/// fill, the writer is not draining, which means the peer is not reading its
+/// own replies -- so the connection is closed rather than the reader blocked.
+const REPLY_QUEUE_CAPACITY: usize = 8;
+
 /// Drives a registered connection until it closes.
 ///
-/// The four events a live connection waits on are inbound frames, its outbound
-/// queue, the idle deadline, and shutdown. Branch selection is deliberately
-/// left unbiased: a connection that both sends and receives at full rate must
-/// not starve its own writes behind its own reads.
+/// Reading and writing run as **two concurrent futures over independently
+/// framed halves of the socket**. That is the load-bearing structure here, and
+/// it replaced a single `select!` loop for a reason worth stating.
+///
+/// `tokio::select!` drops its branch futures before running the chosen branch's
+/// handler, so an `.await` *inside* a handler suspends the whole loop: while a
+/// socket write pends, no other branch is polled. Bounding that write -- which
+/// an earlier revision did -- turns "parks forever" into "parks until the
+/// deadline, deaf to everything", which is better but still wrong in two
+/// measured ways. A peer that kept sending heartbeats on time was disconnected
+/// because nobody read them, and a superseded peer was neither told nor closed
+/// promptly because the eviction signal sat behind its own backlog.
+///
+/// Splitting removes the shape rather than patching the symptom a third time:
+/// a stalled write now stalls only the writer, so the reader keeps consuming
+/// heartbeats and keeps enforcing the idle deadline, which is the same division
+/// of labour a message broker settles on -- `RabbitMQ`'s per-connection reader
+/// and writer processes, with liveness tracked on the reader.
+///
+/// The reader owns the idle deadline, the protocol state machine, and shutdown.
+/// The writer owns the socket's write half and nothing else. They communicate
+/// over one bounded reply channel, and the reader signals "no more" by dropping
+/// its end.
 async fn pump<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+    reader: protocol::FrameReader<S>,
+    writer: protocol::FrameWriter<S>,
     state: &ServerState,
     registered: &RegisteredPeer,
-    mut outbound: mpsc::Receiver<ServerFrame>,
+    outbound: mpsc::Receiver<ServerFrame>,
+    evicted: watch::Receiver<bool>,
     shutdown: &mut watch::Receiver<bool>,
-    peer_addr: SocketAddr,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite,
+{
+    let (reply_tx, reply_rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
+
+    let write_loop = run_writer(writer, outbound, reply_rx, evicted, registered);
+    let read_loop = run_reader(reader, state, registered, reply_tx, shutdown);
+
+    tokio::pin!(write_loop);
+
+    tokio::select! {
+        () = &mut write_loop => {
+            // The writer finished first: the socket failed, or this connection
+            // was superseded and has already said so. Nothing left to send.
+        }
+        () = read_loop => {
+            // The reader has queued its closing diagnostic and dropped its end
+            // of the reply channel, so the writer will drain what remains and
+            // stop. Bounded, because a peer that is not reading cannot be
+            // allowed to hold the task open while its diagnostic fails to land.
+            let _ = timeout(TERMINAL_WRITE_TIMEOUT, write_loop).await;
+        }
+    }
+}
+
+/// Owns the socket's write half. Never reads, so it can block freely.
+///
+/// Branch order is deliberate. Eviction outranks everything: it must overtake a
+/// backlog rather than queue behind it, which is the whole reason it is a
+/// separate signal and not the closure of the outbound queue. Replies outrank
+/// deliveries so that a peer's own `receipt` or `pong` is not stuck behind
+/// frames addressed to it. Neither starves the other in practice, because the
+/// reader is serial: once a reply is written, the next poll finds the reply
+/// channel empty and takes a delivery.
+async fn run_writer<S>(
+    mut writer: protocol::FrameWriter<S>,
+    mut outbound: mpsc::Receiver<ServerFrame>,
+    mut replies: mpsc::Receiver<ServerFrame>,
+    mut evicted: watch::Receiver<bool>,
+    registered: &RegisteredPeer,
+) where
+    S: AsyncWrite,
+{
+    loop {
+        tokio::select! {
+            biased;
+
+            () = wait_for_flag(&mut evicted) => {
+                log_replacement(registered);
+                close_with(
+                    &mut writer,
+                    ErrorCode::PeerReplaced,
+                    "a newer connection registered this peer name".to_owned(),
+                )
+                .await;
+                return;
+            }
+
+            reply = replies.recv() => match reply {
+                Some(frame) => {
+                    if write_frame(&mut writer, &frame).await.is_err() {
+                        return;
+                    }
+                }
+                // The reader is done. Anything still buffered has been drained
+                // by this same arm, because a closed channel yields its
+                // contents before it reports closure.
+                None => return,
+            },
+
+            delivery = outbound.recv() => match delivery {
+                Some(frame) => {
+                    // The write itself is unbounded on purpose -- the reader is
+                    // the watchdog, and a per-write timeout here would give a
+                    // silent peer one full idle window per queued frame -- but
+                    // it is raced against eviction. Without that race, being
+                    // superseded still has to wait out whichever write is
+                    // already in flight, which against a peer that has stopped
+                    // reading means waiting out the idle deadline: the retention
+                    // this signal exists to prevent.
+                    //
+                    // Cancelling mid-flush is safe. `Framed` writes through its
+                    // own buffer, so the unflushed remainder stays there and the
+                    // diagnostic is appended after it rather than interleaved --
+                    // asserted by
+                    // `a_cancelled_write_does_not_desynchronize_the_frame_stream`.
+                    let wrote = tokio::select! {
+                        biased;
+                        () = wait_for_flag(&mut evicted) => None,
+                        result = write_frame(&mut writer, &frame) => Some(result),
+                    };
+
+                    match wrote {
+                        Some(Ok(())) => {}
+                        Some(Err(_)) => return,
+                        None => break,
+                    }
+                }
+                // Only reachable if the registry entry went away without
+                // setting the eviction flag, which registration does not do.
+                None => return,
+            },
+        }
+    }
+
+    // Left the loop because eviction interrupted a write in flight.
+    log_replacement(registered);
+    close_with(
+        &mut writer,
+        ErrorCode::PeerReplaced,
+        "a newer connection registered this peer name".to_owned(),
+    )
+    .await;
+}
+
+/// Emits the superseded-connection event.
+fn log_replacement(registered: &RegisteredPeer) {
+    tracing::info!(
+        room = %registered.room,
+        peer = %registered.peer,
+        connection_id = registered.connection_id,
+        "closing superseded connection"
+    );
+}
+
+/// Owns the socket's read half, the idle deadline, and the protocol state
+/// machine. Never writes, so it is never blocked by a peer that stops reading.
+async fn run_reader<S>(
+    mut reader: protocol::FrameReader<S>,
+    state: &ServerState,
+    registered: &RegisteredPeer,
+    replies: mpsc::Sender<ServerFrame>,
+    shutdown: &mut watch::Receiver<bool>,
+) where
+    S: AsyncRead,
 {
     let deadlines = state.deadlines();
-    // Tracked as an instant rather than a pinned `Sleep` because every socket
-    // write is also bounded by it, and an instant is a value that can be handed
-    // to `timeout_at` while a timer object cannot.
     let mut idle_deadline = Instant::now() + deadlines.idle;
 
     loop {
         tokio::select! {
-            () = wait_for_shutdown(shutdown) => {
+            () = wait_for_flag(shutdown) => {
                 tracing::debug!(
                     connection_id = registered.connection_id,
                     "closing connection for shutdown"
                 );
-                break;
+                return;
             }
 
             () = sleep_until(idle_deadline) => {
                 log_heartbeat_timeout(registered, deadlines.idle);
-                close_with(
-                    framed,
+                queue_diagnostic(
+                    &replies,
                     ErrorCode::IdleTimeout,
                     format!("no frame within {:?}", deadlines.idle),
-                )
-                .await;
-                break;
+                );
+                return;
             }
 
-            queued = outbound.recv() => {
-                if let Some(frame) = queued {
-                    // Bounded by the same deadline the branch above enforces. A
-                    // socket write to a peer that has stopped reading pends
-                    // indefinitely, and because it runs in this handler rather
-                    // than in the `select!`, it would otherwise stop the idle
-                    // branch from ever being polled again -- parking the task,
-                    // its file descriptor, and up to 8 MiB of queued frames for
-                    // as long as the peer cares to hold them.
-                    match timeout_at(idle_deadline, write_frame(framed, &frame)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => break,
-                        Err(_elapsed) => {
-                            log_heartbeat_timeout(registered, deadlines.idle);
-                            close_with(
-                                framed,
-                                ErrorCode::IdleTimeout,
-                                format!("no frame within {:?}", deadlines.idle),
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                } else {
-                    // The registry dropped this connection's sender: a newer
-                    // connection has taken the peer name.
-                    tracing::info!(
-                        room = %registered.room,
-                        peer = %registered.peer,
-                        connection_id = registered.connection_id,
-                        "closing superseded connection"
-                    );
-                    close_with(
-                        framed,
-                        ErrorCode::PeerReplaced,
-                        "a newer connection registered this peer name".to_owned(),
-                    )
-                    .await;
-                    break;
-                }
-            }
-
-            inbound = framed.next() => {
+            inbound = reader.next() => {
                 if handle_inbound(
-                    framed,
+                    &replies,
                     state,
                     registered,
                     inbound,
                     &mut idle_deadline,
-                    peer_addr,
                 )
-                .await
                 .is_break()
                 {
-                    break;
+                    return;
                 }
             }
         }
@@ -567,17 +724,13 @@ fn log_heartbeat_timeout(registered: &RegisteredPeer, deadline: Duration) {
 /// Resets the idle deadline for any frame that decoded, which is what "valid
 /// inbound frame" means: a frame the relay could read, whatever it then does
 /// with it.
-async fn handle_inbound<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+fn handle_inbound(
+    replies: &mpsc::Sender<ServerFrame>,
     state: &ServerState,
     registered: &RegisteredPeer,
     read: Option<io::Result<BytesMut>>,
     idle_deadline: &mut Instant,
-    peer_addr: SocketAddr,
-) -> ControlFlow<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> ControlFlow<()> {
     // `None` is a clean end of stream: the peer hung up.
     let Some(read) = read else {
         return ControlFlow::Break(());
@@ -586,7 +739,7 @@ where
     let payload = match read {
         Ok(payload) => payload,
         Err(error) => {
-            report_framing_error(framed, &error, peer_addr).await;
+            report_framing_error(replies, &error, registered.peer_addr);
             return ControlFlow::Break(());
         }
     };
@@ -595,20 +748,20 @@ where
         Ok(frame) => frame,
         Err(error) => {
             tracing::info!(
-                %peer_addr,
+                peer_addr = %registered.peer_addr,
                 connection_id = registered.connection_id,
                 payload_bytes = payload.len(),
                 reason = error.kind(),
                 "frame decode failed"
             );
-            close_with(framed, ErrorCode::MalformedFrame, error.to_string()).await;
+            queue_diagnostic(replies, ErrorCode::MalformedFrame, error.to_string());
             return ControlFlow::Break(());
         }
     };
 
     *idle_deadline = Instant::now() + state.deadlines().idle;
 
-    handle_frame(framed, state, registered, frame).await
+    handle_frame(replies, state, registered, frame)
 }
 
 /// Reads and validates `hello`, returning the admitted room and peer name.
@@ -616,24 +769,27 @@ where
 /// Every rejection states its cause on the wire before the caller closes the
 /// connection.
 async fn admit<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+    reader: &mut protocol::FrameReader<S>,
+    writer: &mut protocol::FrameWriter<S>,
     shutdown: &mut watch::Receiver<bool>,
     deadlines: Deadlines,
     peer_addr: SocketAddr,
 ) -> Option<(RoomId, String)>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite,
 {
+    // Still sequential: until the peer is registered there is nothing to
+    // deliver, so nothing is gained by reading and writing concurrently.
     let read = tokio::select! {
-        () = wait_for_shutdown(shutdown) => return None,
-        read = timeout(deadlines.hello, framed.next()) => read,
+        () = wait_for_flag(shutdown) => return None,
+        read = timeout(deadlines.hello, reader.next()) => read,
     };
 
     let payload = match read {
         Err(_elapsed) => {
             tracing::info!(%peer_addr, deadline = ?deadlines.hello, "handshake deadline elapsed");
             close_with(
-                framed,
+                writer,
                 ErrorCode::HelloTimeout,
                 format!("no hello within {:?}", deadlines.hello),
             )
@@ -643,7 +799,7 @@ where
         // Hung up before saying anything: nothing to diagnose.
         Ok(None) => return None,
         Ok(Some(Err(error))) => {
-            report_framing_error(framed, &error, peer_addr).await;
+            report_framing_error_now(writer, &error, peer_addr).await;
             return None;
         }
         Ok(Some(Ok(payload))) => payload,
@@ -658,7 +814,7 @@ where
                 reason = error.kind(),
                 "frame decode failed"
             );
-            close_with(framed, ErrorCode::MalformedFrame, error.to_string()).await;
+            close_with(writer, ErrorCode::MalformedFrame, error.to_string()).await;
             return None;
         }
     };
@@ -676,7 +832,7 @@ where
         let frame_type = frame.type_name();
         tracing::info!(%peer_addr, frame_type, "first frame was not hello");
         close_with(
-            framed,
+            writer,
             ErrorCode::InvalidHello,
             format!("first frame must be hello, received {frame_type}"),
         )
@@ -692,7 +848,7 @@ where
             "protocol version rejected"
         );
         close_with(
-            framed,
+            writer,
             ErrorCode::UnsupportedProtocol,
             format!("protocol {offered} is not supported; this relay speaks {PROTOCOL_VERSION}"),
         )
@@ -708,7 +864,7 @@ where
         if let Err(error) = protocol::validate_identifier(value) {
             tracing::info!(%peer_addr, field, %error, "identifier rejected");
             close_with(
-                framed,
+                writer,
                 ErrorCode::InvalidIdentifier,
                 format!("{field} {error}"),
             )
@@ -723,19 +879,12 @@ where
 /// Handles one decoded frame from a registered connection.
 ///
 /// [`ControlFlow::Break`] means the connection must close.
-async fn handle_frame<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+fn handle_frame(
+    replies: &mpsc::Sender<ServerFrame>,
     state: &ServerState,
     registered: &RegisteredPeer,
     frame: ClientFrame,
-) -> ControlFlow<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    // `handle_inbound` has just reset the idle deadline, so this is that same
-    // instant: every reply to this frame must be on the wire before it.
-    let deadline = Instant::now() + state.deadlines().idle;
-
+) -> ControlFlow<()> {
     match frame {
         ClientFrame::Hello { .. } => {
             tracing::info!(
@@ -744,33 +893,30 @@ where
                 connection_id = registered.connection_id,
                 "duplicate hello"
             );
-            close_with(
-                framed,
+            queue_diagnostic(
+                replies,
                 ErrorCode::DuplicateHello,
                 "this connection is already registered".to_owned(),
-            )
-            .await;
+            );
             ControlFlow::Break(())
         }
 
-        ClientFrame::Ping => write_or_break(framed, &ServerFrame::Pong, deadline).await,
+        ClientFrame::Ping => enqueue_reply(replies, ServerFrame::Pong),
 
         ClientFrame::List { request_id } => {
             if let Err(error) = protocol::validate_correlation_id(&request_id) {
-                return write_or_break(
-                    framed,
-                    &ServerFrame::Error {
+                return enqueue_reply(
+                    replies,
+                    ServerFrame::Error {
                         code: ErrorCode::InvalidIdentifier,
                         message: Some(format!("list.request_id {error}")),
                         request_id: None,
                     },
-                    deadline,
-                )
-                .await;
+                );
             }
 
             let peers = state.list_peers(&registered.room);
-            write_or_break(framed, &ServerFrame::Peers { request_id, peers }, deadline).await
+            enqueue_reply(replies, ServerFrame::Peers { request_id, peers })
         }
 
         ClientFrame::Send {
@@ -778,7 +924,7 @@ where
             to,
             body,
             reply_to,
-        } => handle_send(framed, state, registered, id, to, body, reply_to).await,
+        } => handle_send(replies, state, registered, id, to, body, reply_to),
 
         ClientFrame::Unsupported => {
             tracing::info!(
@@ -786,16 +932,14 @@ where
                 peer = %registered.peer,
                 "unsupported frame type"
             );
-            write_or_break(
-                framed,
-                &ServerFrame::Error {
+            enqueue_reply(
+                replies,
+                ServerFrame::Error {
                     code: ErrorCode::UnsupportedFrame,
                     message: Some("this protocol version does not implement that frame".to_owned()),
                     request_id: None,
                 },
-                deadline,
             )
-            .await
         }
     }
 }
@@ -806,31 +950,24 @@ where
 /// an invalid target are recoverable and keep the connection open; an
 /// over-budget body is not, so it is checked last, once the frame is known to
 /// be one the relay would otherwise have delivered.
-async fn handle_send<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+fn handle_send(
+    replies: &mpsc::Sender<ServerFrame>,
     state: &ServerState,
     registered: &RegisteredPeer,
     id: String,
     to: String,
     body: String,
     reply_to: Option<String>,
-) -> ControlFlow<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let deadline = Instant::now() + state.deadlines().idle;
-
+) -> ControlFlow<()> {
     if let Err(error) = protocol::validate_correlation_id(&id) {
-        return write_or_break(
-            framed,
-            &ServerFrame::Error {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
                 code: ErrorCode::InvalidIdentifier,
                 message: Some(format!("send.id {error}")),
                 request_id: None,
             },
-            deadline,
-        )
-        .await;
+        );
     }
 
     if let Err(error) = protocol::validate_identifier(&to) {
@@ -840,16 +977,14 @@ where
             %error,
             "send target rejected"
         );
-        return write_or_break(
-            framed,
-            &ServerFrame::Receipt {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Receipt {
                 id,
                 to: bounded_target(to),
                 status: ReceiptStatus::InvalidTarget,
             },
-            deadline,
-        )
-        .await;
+        );
     }
 
     // `reply_to` is the other half of the envelope the body budget reserves
@@ -861,9 +996,9 @@ where
         .as_deref()
         .and_then(|value| protocol::validate_correlation_id(value).err())
     {
-        return write_or_break(
-            framed,
-            &ServerFrame::Error {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
                 code: ErrorCode::InvalidIdentifier,
                 message: Some(format!("send.reply_to {error}")),
                 // `id` passed validation above, so this is the one rejection on
@@ -873,9 +1008,7 @@ where
                 // positional relationship to anything.
                 request_id: Some(id),
             },
-            deadline,
-        )
-        .await;
+        );
     }
 
     // Checked before routing, so the encode failure never lands on the
@@ -889,8 +1022,8 @@ where
             budget = protocol::MAX_BODY_BYTES,
             "body exceeds the relayable budget"
         );
-        close_with(
-            framed,
+        queue_diagnostic(
+            replies,
             ErrorCode::FrameTooLarge,
             format!(
                 "body is {body_bytes} bytes; at most {} can be relayed within the {}-byte \
@@ -898,8 +1031,7 @@ where
                 protocol::MAX_BODY_BYTES,
                 protocol::MAX_FRAME_BYTES
             ),
-        )
-        .await;
+        );
         return ControlFlow::Break(());
     }
 
@@ -919,7 +1051,7 @@ where
 
     log_route(registered, &to, &id, body_bytes, status);
 
-    write_or_break(framed, &ServerFrame::Receipt { id, to, status }, deadline).await
+    enqueue_reply(replies, ServerFrame::Receipt { id, to, status })
 }
 
 /// Clamps a rejected `to` value to the identifier limit before it is echoed.
@@ -985,75 +1117,87 @@ fn log_route(
 
 /// Encodes and writes one frame, flushing it.
 async fn write_frame<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+    writer: &mut protocol::FrameWriter<S>,
     frame: &ServerFrame,
 ) -> io::Result<()>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncWrite,
 {
     // Unreachable for the frames this relay builds, which hold only strings,
     // `u32`s, and vectors of strings.
     let payload = protocol::encode(frame).map_err(io::Error::other)?;
-    framed.send(payload).await
+    writer.send(payload).await
 }
 
-/// Writes one frame, reporting whether the connection survived.
+/// Hands one reply to the writer, reporting whether the connection survives.
 ///
-/// `deadline` bounds the socket write for the same reason the outbound queue's
-/// write is bounded: a peer that has stopped reading would otherwise park this
-/// task indefinitely, and a parked task stops enforcing its own deadlines.
-async fn write_or_break<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
-    frame: &ServerFrame,
-    deadline: Instant,
-) -> ControlFlow<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    match timeout_at(deadline, write_frame(framed, frame)).await {
-        Ok(Ok(())) => ControlFlow::Continue(()),
-        Ok(Err(error)) => {
-            tracing::debug!(%error, "connection write failed");
+/// Non-blocking on purpose. The reader must never wait on the socket, which is
+/// the entire point of the split, so a full reply channel is not something to
+/// wait out: it means the writer has not drained eight replies, which means the
+/// peer is not reading even its own answers. There is nothing to gain by
+/// keeping that connection, and the reader stays responsive by refusing to
+/// block on it.
+fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> ControlFlow<()> {
+    match replies.try_send(frame) {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(TrySendError::Full(_)) => {
+            tracing::info!(
+                capacity = REPLY_QUEUE_CAPACITY,
+                "reply queue full; the peer is not reading its own replies"
+            );
             ControlFlow::Break(())
         }
-        Err(_elapsed) => {
-            tracing::info!("connection write outlived the idle deadline");
-            // The relay is closing this connection on its own initiative, so
-            // the same rule applies here as in the idle branch of `pump`: state
-            // the cause. Without this the one close that a peer reaches by
-            // being slow rather than by being wrong was the one close that
-            // arrived bare. Bounded and best-effort like every other terminal
-            // write, so a peer that is not reading cannot be helped -- but one
-            // that resumes reading learns why it was dropped.
-            close_with(
-                framed,
-                ErrorCode::IdleTimeout,
-                "a reply could not be written within the idle deadline".to_owned(),
-            )
-            .await;
-            ControlFlow::Break(())
-        }
+        // The writer is gone, so the connection is already closing.
+        Err(TrySendError::Closed(_)) => ControlFlow::Break(()),
     }
 }
 
-/// Makes one bounded, best-effort attempt to name the cause of a close.
+/// Queues the frame that names why the relay is closing this connection.
 ///
 /// A bare EOF is indistinguishable from a crashed relay, a wrong port, or a
-/// version mismatch, so every close the relay initiates states its reason. The
-/// attempt is discarded if the socket is already broken or too slow.
-async fn close_with<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
-    code: ErrorCode,
-    mut message: String,
-) where
-    S: AsyncWrite + Unpin,
+/// version mismatch, so every close the relay initiates states its reason. This
+/// is best-effort in two ways: the queue may be full, and the writer's flush is
+/// bounded by [`TERMINAL_WRITE_TIMEOUT`] once the reader has finished.
+fn queue_diagnostic(replies: &mpsc::Sender<ServerFrame>, code: ErrorCode, message: String) {
+    let frame = ServerFrame::Error {
+        code,
+        message: Some(cap_diagnostic(message)),
+        request_id: None,
+    };
+    if replies.try_send(frame).is_err() {
+        tracing::debug!(
+            code = code.as_str(),
+            "could not queue the closing diagnostic; the peer gets a bare close"
+        );
+    }
+}
+
+/// Makes one bounded, best-effort attempt to name the cause of a close, writing
+/// straight to the socket.
+///
+/// For the two closes that must overtake anything queued: a handshake rejection,
+/// which happens before there is a queue, and an eviction, which must not sit
+/// behind the backlog it is displacing.
+async fn close_with<S>(writer: &mut protocol::FrameWriter<S>, code: ErrorCode, message: String)
+where
+    S: AsyncWrite,
 {
-    // Two callers pass a decoder's error text, which quotes the payload it
-    // rejected -- and quoting escapes, so a payload well inside the inbound cap
-    // can produce a diagnostic well outside it. An unencodable `error` frame is
-    // silently dropped by the `let _` below, leaving the peer with exactly the
-    // bare EOF this function exists to prevent. Capping here fixes every call
-    // site at once.
+    let frame = ServerFrame::Error {
+        code,
+        message: Some(cap_diagnostic(message)),
+        request_id: None,
+    };
+    let _ = timeout(TERMINAL_WRITE_TIMEOUT, write_frame(writer, &frame)).await;
+}
+
+/// Truncates diagnostic text on a UTF-8 boundary.
+///
+/// Callers pass a decoder's error text, which quotes the payload it rejected --
+/// and quoting escapes, so a payload well inside the inbound cap can produce a
+/// diagnostic well outside it. An unencodable `error` frame is silently dropped,
+/// leaving the peer with exactly the bare EOF the diagnostic exists to prevent.
+/// Capping in one place fixes every call site at once.
+fn cap_diagnostic(mut message: String) -> String {
     if message.len() > MAX_DIAGNOSTIC_BYTES {
         let mut end = MAX_DIAGNOSTIC_BYTES;
         while end > 0 && !message.is_char_boundary(end) {
@@ -1061,42 +1205,51 @@ async fn close_with<S>(
         }
         message.truncate(end);
     }
-
-    let frame = ServerFrame::Error {
-        code,
-        message: Some(message),
-        request_id: None,
-    };
-    let _ = timeout(TERMINAL_WRITE_TIMEOUT, write_frame(framed, &frame)).await;
+    message
 }
 
-/// Reports a framing-layer failure, naming its cause when the framing layer
-/// knows one.
-async fn report_framing_error<S>(
-    framed: &mut Framed<S, LengthDelimitedCodec>,
+/// Reports a framing-layer failure on a registered connection, naming its cause
+/// when the framing layer knows one.
+fn report_framing_error(
+    replies: &mpsc::Sender<ServerFrame>,
     error: &io::Error,
     peer_addr: SocketAddr,
-) where
-    S: AsyncWrite + Unpin,
-{
+) {
     if let Some(code) = protocol::framing_error_code(error) {
         tracing::info!(%peer_addr, code = code.as_str(), %error, "framing violation");
-        close_with(framed, code, error.to_string()).await;
+        queue_diagnostic(replies, code, error.to_string());
     } else {
         // A transport failure: there is no socket left to explain it on.
         tracing::debug!(%peer_addr, %error, "connection read failed");
     }
 }
 
-/// Resolves once shutdown has been signalled, or the supervisor is gone.
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    if *shutdown.borrow_and_update() {
+/// The same report during admission, where there is no writer task yet.
+async fn report_framing_error_now<S>(
+    writer: &mut protocol::FrameWriter<S>,
+    error: &io::Error,
+    peer_addr: SocketAddr,
+) where
+    S: AsyncWrite,
+{
+    if let Some(code) = protocol::framing_error_code(error) {
+        tracing::info!(%peer_addr, code = code.as_str(), %error, "framing violation");
+        close_with(writer, code, error.to_string()).await;
+    } else {
+        tracing::debug!(%peer_addr, %error, "connection read failed");
+    }
+}
+
+/// Resolves once a `watch` flag is set, or its sender is gone.
+///
+/// Used for both shutdown and eviction: each transitions false -> true exactly
+/// once, so any change is the signal, and a dropped sender means whoever would
+/// have set it has left -- also a reason to stop.
+async fn wait_for_flag(flag: &mut watch::Receiver<bool>) {
+    if *flag.borrow_and_update() {
         return;
     }
-    // The flag transitions false -> true exactly once, so any change is the
-    // signal. A dropped sender means the supervisor is gone, which is also a
-    // reason to stop.
-    let _ = shutdown.changed().await;
+    let _ = flag.changed().await;
 }
 
 #[cfg(test)]
@@ -1111,6 +1264,18 @@ mod tests {
 
     fn peer_queue() -> (mpsc::Sender<ServerFrame>, mpsc::Receiver<ServerFrame>) {
         mpsc::channel(OUTBOUND_QUEUE_CAPACITY)
+    }
+
+    /// Registers a peer the way a connection does, returning the registration
+    /// and the eviction flag its writer would watch.
+    fn register_in(
+        state: &ServerState,
+        room: &RoomId,
+        peer: &str,
+        outbound: mpsc::Sender<ServerFrame>,
+    ) -> (Registration, watch::Receiver<bool>) {
+        let (evict_tx, evict_rx) = watch::channel(false);
+        (state.register(room, peer, outbound, evict_tx), evict_rx)
     }
 
     fn message(id: &str) -> ServerFrame {
@@ -1140,10 +1305,10 @@ mod tests {
         let state = ServerState::new();
 
         let (first_tx, mut first_rx) = peer_queue();
-        let first = state.register(&room(), "reviewer", first_tx);
+        let (first, mut first_evicted) = register_in(&state, &room(), "reviewer", first_tx);
 
         let (second_tx, _second_rx) = peer_queue();
-        let second = state.register(&room(), "reviewer", second_tx);
+        let (second, _second_evicted) = register_in(&state, &room(), "reviewer", second_tx);
 
         assert_eq!(
             second.superseded,
@@ -1157,8 +1322,13 @@ mod tests {
             second.connection_id
         );
         assert!(
+            *first_evicted.borrow_and_update(),
+            "the superseded connection's eviction flag must be set: it is the signal its \
+             writer watches, and it has to overtake the backlog rather than queue behind it"
+        );
+        assert!(
             matches!(first_rx.try_recv(), Err(TryRecvError::Disconnected)),
-            "the superseded queue must close, which is how its task learns it was replaced"
+            "the superseded queue also closes, but only the flag is relied upon"
         );
     }
 
@@ -1167,10 +1337,10 @@ mod tests {
         let state = ServerState::new();
 
         let (first_tx, _first_rx) = peer_queue();
-        let first = state.register(&room(), "reviewer", first_tx);
+        let (first, _first_evicted) = register_in(&state, &room(), "reviewer", first_tx);
 
         let (second_tx, mut second_rx) = peer_queue();
-        let second = state.register(&room(), "reviewer", second_tx);
+        let (second, _second_evicted) = register_in(&state, &room(), "reviewer", second_tx);
 
         assert!(
             !state.deregister(&room(), "reviewer", first.connection_id),
@@ -1218,7 +1388,7 @@ mod tests {
         ] {
             let (tx, rx) = peer_queue();
             queues.push(rx);
-            state.register(&room, peer, tx);
+            register_in(&state, &room, peer, tx);
         }
 
         assert_eq!(
@@ -1241,7 +1411,7 @@ mod tests {
     fn routing_reports_offline_success_and_backpressure() {
         let state = ServerState::new();
         let (tx, mut rx) = peer_queue();
-        state.register(&room(), "windows-main", tx);
+        register_in(&state, &room(), "windows-main", tx);
 
         assert_eq!(
             state.route(&room(), "nobody", message("msg-1")),
@@ -1284,7 +1454,7 @@ mod tests {
     fn a_gone_receiver_reads_as_offline() {
         let state = ServerState::new();
         let (tx, rx) = peer_queue();
-        state.register(&room(), "windows-main", tx);
+        register_in(&state, &room(), "windows-main", tx);
         drop(rx);
 
         assert_eq!(
@@ -1298,7 +1468,7 @@ mod tests {
     fn an_emptied_room_is_not_retained() {
         let state = ServerState::new();
         let (tx, _rx) = peer_queue();
-        let registration = state.register(&room(), "solo", tx);
+        let (registration, _evicted) = register_in(&state, &room(), "solo", tx);
 
         assert_eq!(state.read_rooms().len(), 1, "room count after registration");
         assert!(state.deregister(&room(), "solo", registration.connection_id));
@@ -1314,13 +1484,14 @@ mod tests {
     fn dropping_the_guard_deregisters_the_peer() {
         let state = Arc::new(ServerState::new());
         let (tx, _rx) = peer_queue();
-        let registration = state.register(&room(), "solo", tx);
+        let (registration, _evicted) = register_in(&state, &room(), "solo", tx);
 
         let guard = RegisteredPeer {
             state: Arc::clone(&state),
             room: room(),
             peer: "solo".to_owned(),
             connection_id: registration.connection_id,
+            peer_addr: "127.0.0.1:0".parse().expect("a loopback address"),
         };
         assert_eq!(state.list_peers(&room()), vec!["solo"]);
 
@@ -1331,31 +1502,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_write_that_outlives_its_deadline_closes_the_connection() {
-        // A duplex with a 16-byte buffer whose read half is never drained: the
-        // first frame larger than that blocks forever. Keeping `_client` alive
-        // matters -- dropping it would fail the write immediately, which is a
-        // different path from the one under test.
-        let (server_io, _client) = tokio::io::duplex(16);
-        let mut framed = protocol::framed(server_io);
+    #[test]
+    fn a_full_reply_queue_closes_the_connection_rather_than_blocking_the_reader() {
+        // Replaces a test of the bounded-write path that no longer exists. The
+        // writer's writes are deliberately unbounded now -- the reader is the
+        // watchdog -- so the question that matters here is what the *reader*
+        // does when the writer is not keeping up. It must never wait.
+        let (replies, _writer_side) = mpsc::channel(REPLY_QUEUE_CAPACITY);
 
-        let outcome = write_or_break(
-            &mut framed,
-            &ServerFrame::Message {
-                id: "msg-1".to_owned(),
-                from: "sender".to_owned(),
-                body: "x".repeat(4096),
-                reply_to: None,
-            },
-            Instant::now() + Duration::from_millis(50),
-        )
-        .await;
+        for slot in 1..=REPLY_QUEUE_CAPACITY {
+            assert!(
+                enqueue_reply(&replies, ServerFrame::Pong).is_continue(),
+                "reply slot {slot} of {REPLY_QUEUE_CAPACITY} must accept a frame"
+            );
+        }
 
         assert!(
-            outcome.is_break(),
-            "a write to a peer that never reads must be abandoned at its deadline, \
-             because a parked write stops the task from enforcing any deadline"
+            enqueue_reply(&replies, ServerFrame::Pong).is_break(),
+            "a reply that does not fit must close the connection rather than block the \
+             reader: a blocked reader stops consuming heartbeats and stops enforcing the \
+             idle deadline, which is the failure the read/write split exists to remove"
         );
     }
 
@@ -1370,7 +1536,7 @@ mod tests {
         // and its payload would desynchronize and every later frame on the
         // connection would be garbage.
         let (server_io, client_io) = tokio::io::duplex(1024);
-        let mut server = protocol::framed(server_io);
+        let (_unused_reader, mut server) = protocol::framed_split(server_io);
 
         let large = ServerFrame::Message {
             id: "msg-1".to_owned(),
