@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use omp_relayd::protocol::{
-    self, ClientFrame, ErrorCode, MAX_BODY_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION, ReceiptStatus,
-    ServerFrame,
+    self, ClientFrame, ErrorCode, MAX_BODY_BYTES, MAX_FRAME_BYTES, MAX_IDENTIFIER_BYTES,
+    PROTOCOL_VERSION, ReceiptStatus, ServerFrame,
 };
 use omp_relayd::relay::{self, Deadlines, OUTBOUND_QUEUE_CAPACITY, ServerState};
 use serde::Serialize;
@@ -342,6 +342,126 @@ async fn an_invalid_target_yields_a_receipt_and_keeps_the_connection_open() {
         sender.recv().await,
         ServerFrame::Pong,
         "an invalid target must not close the connection"
+    );
+}
+
+/// Regression: `receipt.to` echoes the value that failed validation, so an
+/// over-long target used to build a receipt larger than the frame cap. The
+/// encode failure surfaced as a bare close, delivering neither the receipt
+/// `peer-relay` requires for every valid `send` nor a stated cause.
+///
+/// The sizes are printed because they are the whole point: the inbound frame
+/// fits exactly and the naive receipt does not.
+#[tokio::test]
+async fn an_oversized_target_is_answered_with_a_receipt_rather_than_a_bare_close() {
+    let relay = Relay::start().await;
+    let mut sender = Client::join(&relay, &room("oversized-targets"), "sender").await;
+
+    // The largest `to` a client can put on the wire: grown until the inbound
+    // `send` frame would exceed the cap, then stepped back one byte.
+    let mut to = String::new();
+    loop {
+        to.push('x');
+        let candidate = ClientFrame::Send {
+            id: "m1".to_owned(),
+            to: to.clone(),
+            body: String::new(),
+            reply_to: None,
+        };
+        if protocol::encode(&candidate).expect("encodes").len() > MAX_FRAME_BYTES {
+            to.pop();
+            break;
+        }
+    }
+
+    let naive = protocol::encode(&ServerFrame::Receipt {
+        id: "m1".to_owned(),
+        to: to.clone(),
+        status: ReceiptStatus::InvalidTarget,
+    })
+    .expect("encodes")
+    .len();
+    println!(
+        "to = {} bytes; unclamped receipt = {naive} bytes; frame cap = {MAX_FRAME_BYTES}",
+        to.len()
+    );
+    assert!(
+        naive > MAX_FRAME_BYTES,
+        "this test is only meaningful while an unclamped receipt exceeds the cap; \
+         observed {naive} bytes against a {MAX_FRAME_BYTES}-byte cap"
+    );
+
+    sender
+        .send(&ClientFrame::Send {
+            id: "m1".to_owned(),
+            to: to.clone(),
+            body: String::new(),
+            reply_to: None,
+        })
+        .await;
+
+    assert_eq!(
+        sender.recv().await,
+        ServerFrame::Receipt {
+            id: "m1".to_owned(),
+            to: to[..MAX_IDENTIFIER_BYTES].to_owned(),
+            status: ReceiptStatus::InvalidTarget,
+        },
+        "an over-long target must be reported as invalid, with the echo clamped \
+         to the identifier limit"
+    );
+
+    sender.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        sender.recv().await,
+        ServerFrame::Pong,
+        "an over-long target is a target-validation failure, so the connection \
+         must stay open like every other one"
+    );
+}
+
+/// A rejected `reply_to` is the one `send` failure whose `id` is already known
+/// good, so it is the one the client can be told about by name. Without the
+/// echo a client pipelining sends cannot tell which frame the error answers.
+#[tokio::test]
+async fn a_rejected_reply_to_names_the_send_it_rejected() {
+    let relay = Relay::start().await;
+    let mut sender = Client::join(&relay, &room("reply-correlation"), "sender").await;
+
+    sender
+        .send(&ClientFrame::Send {
+            id: "send-42".to_owned(),
+            to: "recipient".to_owned(),
+            body: "hi".to_owned(),
+            reply_to: Some("r".repeat(129)),
+        })
+        .await;
+
+    match sender.recv().await {
+        ServerFrame::Error {
+            code,
+            request_id,
+            message,
+        } => {
+            assert_eq!(
+                code,
+                ErrorCode::InvalidIdentifier,
+                "an over-long reply_to is an identifier failure; message was {message:?}"
+            );
+            assert_eq!(
+                request_id.as_deref(),
+                Some("send-42"),
+                "the error must name the send it rejected"
+            );
+        }
+        other => panic!("expected an invalid_identifier error, received {other:?}"),
+    }
+
+    sender.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        sender.recv().await,
+        ServerFrame::Pong,
+        "a rejected reply_to is recoverable and must keep the connection open"
     );
 }
 

@@ -844,7 +844,7 @@ where
             framed,
             &ServerFrame::Receipt {
                 id,
-                to,
+                to: bounded_target(to),
                 status: ReceiptStatus::InvalidTarget,
             },
             deadline,
@@ -866,7 +866,12 @@ where
             &ServerFrame::Error {
                 code: ErrorCode::InvalidIdentifier,
                 message: Some(format!("send.reply_to {error}")),
-                request_id: None,
+                // `id` passed validation above, so this is the one rejection on
+                // the `send` path that can name the frame it rejected. A client
+                // pipelining sends has no other way to tell which one failed:
+                // the connection stays open, so the error arrives with no
+                // positional relationship to anything.
+                request_id: Some(id),
             },
             deadline,
         )
@@ -915,6 +920,36 @@ where
     log_route(registered, &to, &id, body_bytes, status);
 
     write_or_break(framed, &ServerFrame::Receipt { id, to, status }, deadline).await
+}
+
+/// Clamps a rejected `to` value to the identifier limit before it is echoed.
+///
+/// `receipt.to` is the one field the relay echoes that is *not* already bounded
+/// by a validated inbound value: on every other path `to` passed
+/// [`protocol::validate_identifier`] and is at most
+/// [`protocol::MAX_IDENTIFIER_BYTES`], but the `invalid_target` receipt echoes
+/// the value that just failed that check -- including because it was too long.
+///
+/// Unclamped, that reopens the class of bug the body budget exists to close. A
+/// `send` whose `to` is 65508 bytes fits the inbound frame cap exactly, and the
+/// receipt built from it is 65555 bytes: `LengthDelimitedCodec::encode` refuses
+/// it, `write_or_break` breaks on the `Err`, and the sender's connection closes
+/// having received neither the receipt `peer-relay` requires for every valid
+/// `send` nor the `error` that the close-with-a-stated-cause rule requires.
+///
+/// Clamping rather than closing is what keeps the promise that a target which
+/// fails validation is recoverable and keeps the connection open. The excess
+/// carries no information: a value past the limit is not a peer name, and the
+/// client correlates the receipt by `id`, not by `to`.
+fn bounded_target(mut to: String) -> String {
+    if to.len() > protocol::MAX_IDENTIFIER_BYTES {
+        let mut end = protocol::MAX_IDENTIFIER_BYTES;
+        while end > 0 && !to.is_char_boundary(end) {
+            end -= 1;
+        }
+        to.truncate(end);
+    }
+    to
 }
 
 /// Emits the routing outcome. Carries metadata only: never `body`.
