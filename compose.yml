@@ -1,0 +1,29 @@
+services:
+  relay:
+    build:
+      context: .
+    image: omp-relayd:0.1.0
+    restart: unless-stopped
+
+    # The relay has no authentication and no encryption, so the default binding
+    # is loopback: reaching it requires being on this host. Exposing it to a
+    # trusted private LAN is one explicit override and nothing else:
+    #
+    #   OMP_RELAY_BIND=192.168.1.10 docker compose up -d
+    #
+    # There is no public mode. `OMP_RELAY_BIND=0.0.0.0` would publish the port
+    # on every interface, which this deployment does not support.
+    ports:
+      - "${OMP_RELAY_BIND:-127.0.0.1}:7788:7788"
+
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+
+    # The relay is in-memory: it reads no configuration file and writes nothing.
+    # A writable filesystem or any retained capability would only be available
+    # to an attacker who reached the unauthenticated port.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
