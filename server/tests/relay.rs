@@ -654,6 +654,89 @@ async fn ping_is_answered_and_resets_the_idle_deadline() {
 }
 
 #[tokio::test]
+async fn a_peer_that_stops_reading_is_closed_by_the_idle_deadline() {
+    let relay = Relay::with_deadlines(Deadlines {
+        hello: Duration::from_secs(5),
+        idle: Duration::from_millis(400),
+    })
+    .await;
+    let here = room("write-stall");
+
+    let mut sender = Client::join(&relay, &here, "sender").await;
+    // Registered and never read from. Once its outbound queue and socket
+    // buffers fill, its connection task is inside a socket write that nobody
+    // is draining.
+    let _stalled = Client::join(&relay, &here, "stalled").await;
+
+    let body = "x".repeat(32 * 1024);
+    for attempt in 1..=2000 {
+        sender
+            .send(&ClientFrame::Send {
+                id: format!("m{attempt}"),
+                to: "stalled".to_owned(),
+                body: body.clone(),
+                reply_to: None,
+            })
+            .await;
+
+        if let ServerFrame::Receipt {
+            status: ReceiptStatus::RecipientBackpressure,
+            ..
+        } = sender.recv().await
+        {
+            break;
+        }
+    }
+
+    // The stalled peer has sent nothing since its `hello`, so the idle deadline
+    // must reclaim it along with the megabytes its queue is holding. A stalled
+    // write must not be able to outlive the deadline that exists to reclaim it.
+    wait_until_deregistered(&relay, &here, "stalled").await;
+}
+
+#[tokio::test]
+async fn a_peer_that_never_reads_its_ready_frame_is_abandoned() {
+    // Same defect class as the test above, but before registration completes:
+    // the `ready` write is the first thing the relay sends, and a peer that
+    // never reads it must not park the task either.
+    let here = room("ready-stall");
+    let state = Arc::new(ServerState::with_deadlines(Deadlines {
+        hello: Duration::from_millis(200),
+        idle: Duration::from_secs(90),
+    }));
+
+    // A 16-byte buffer, so the ~22-byte `ready` frame cannot be handed over in
+    // one write.
+    let (server_io, client_io) = tokio::io::duplex(16);
+    let (_shutdown, shutdown_rx) = watch::channel(false);
+    let connection = tokio::spawn(relay::run_connection(
+        server_io,
+        Arc::clone(&state),
+        shutdown_rx,
+        "127.0.0.1:0".parse().expect("a literal loopback address"),
+    ));
+
+    let mut client = Client::new(client_io);
+    client
+        .send(&ClientFrame::Hello {
+            protocol: PROTOCOL_VERSION,
+            room: here.clone(),
+            peer: "never-reads".to_owned(),
+        })
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("the connection task must finish rather than park inside the ready write")
+        .expect("the connection task did not panic");
+
+    assert!(
+        state.list_peers(&here).is_empty(),
+        "an abandoned handshake must leave no registration behind"
+    );
+}
+
+#[tokio::test]
 async fn nothing_is_replayed_to_a_reconnecting_peer() {
     let relay = Relay::start().await;
     let here = room("no-replay");

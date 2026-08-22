@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
@@ -25,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, Sleep, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::protocol::{
@@ -373,14 +372,20 @@ pub async fn run_connection<S>(
         // including if the block unwinds.
         let (registered, outbound) = register_peer(&state, room, peer, peer_addr);
 
-        if write_frame(
-            &mut framed,
-            &ServerFrame::Ready {
-                protocol: PROTOCOL_VERSION,
-            },
+        // Bounded: the handshake is not complete until `ready` is out, and a
+        // peer that never reads must not park this task before it is even
+        // registered.
+        if timeout(
+            state.deadlines().hello,
+            write_frame(
+                &mut framed,
+                &ServerFrame::Ready {
+                    protocol: PROTOCOL_VERSION,
+                },
+            ),
         )
         .await
-        .is_ok()
+        .is_ok_and(|written| written.is_ok())
         {
             pump(
                 &mut framed,
@@ -450,8 +455,10 @@ async fn pump<S>(
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let deadlines = state.deadlines();
-    let idle = sleep_until(Instant::now() + deadlines.idle);
-    tokio::pin!(idle);
+    // Tracked as an instant rather than a pinned `Sleep` because every socket
+    // write is also bounded by it, and an instant is a value that can be handed
+    // to `timeout_at` while a timer object cannot.
+    let mut idle_deadline = Instant::now() + deadlines.idle;
 
     loop {
         tokio::select! {
@@ -463,14 +470,8 @@ async fn pump<S>(
                 break;
             }
 
-            () = &mut idle => {
-                tracing::info!(
-                    room = %registered.room,
-                    peer = %registered.peer,
-                    connection_id = registered.connection_id,
-                    deadline = ?deadlines.idle,
-                    "heartbeat timeout"
-                );
+            () = sleep_until(idle_deadline) => {
+                log_heartbeat_timeout(registered, deadlines.idle);
                 close_with(
                     framed,
                     ErrorCode::IdleTimeout,
@@ -482,8 +483,26 @@ async fn pump<S>(
 
             queued = outbound.recv() => {
                 if let Some(frame) = queued {
-                    if write_frame(framed, &frame).await.is_err() {
-                        break;
+                    // Bounded by the same deadline the branch above enforces. A
+                    // socket write to a peer that has stopped reading pends
+                    // indefinitely, and because it runs in this handler rather
+                    // than in the `select!`, it would otherwise stop the idle
+                    // branch from ever being polled again -- parking the task,
+                    // its file descriptor, and up to 8 MiB of queued frames for
+                    // as long as the peer cares to hold them.
+                    match timeout_at(idle_deadline, write_frame(framed, &frame)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => break,
+                        Err(_elapsed) => {
+                            log_heartbeat_timeout(registered, deadlines.idle);
+                            close_with(
+                                framed,
+                                ErrorCode::IdleTimeout,
+                                format!("no frame within {:?}", deadlines.idle),
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 } else {
                     // The registry dropped this connection's sender: a newer
@@ -505,15 +524,34 @@ async fn pump<S>(
             }
 
             inbound = framed.next() => {
-                if handle_inbound(framed, state, registered, inbound, idle.as_mut(), peer_addr)
-                    .await
-                    .is_break()
+                if handle_inbound(
+                    framed,
+                    state,
+                    registered,
+                    inbound,
+                    &mut idle_deadline,
+                    peer_addr,
+                )
+                .await
+                .is_break()
                 {
                     break;
                 }
             }
         }
     }
+}
+
+/// Emits the heartbeat-timeout event, from either the idle branch or a write
+/// that outlived the same deadline.
+fn log_heartbeat_timeout(registered: &RegisteredPeer, deadline: Duration) {
+    tracing::info!(
+        room = %registered.room,
+        peer = %registered.peer,
+        connection_id = registered.connection_id,
+        deadline = ?deadline,
+        "heartbeat timeout"
+    );
 }
 
 /// Decodes one inbound read and dispatches it.
@@ -526,7 +564,7 @@ async fn handle_inbound<S>(
     state: &ServerState,
     registered: &RegisteredPeer,
     read: Option<io::Result<BytesMut>>,
-    idle: Pin<&mut Sleep>,
+    idle_deadline: &mut Instant,
     peer_addr: SocketAddr,
 ) -> ControlFlow<()>
 where
@@ -560,7 +598,7 @@ where
         }
     };
 
-    idle.reset(Instant::now() + state.deadlines().idle);
+    *idle_deadline = Instant::now() + state.deadlines().idle;
 
     handle_frame(framed, state, registered, frame).await
 }
@@ -686,6 +724,10 @@ async fn handle_frame<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // `handle_inbound` has just reset the idle deadline, so this is that same
+    // instant: every reply to this frame must be on the wire before it.
+    let deadline = Instant::now() + state.deadlines().idle;
+
     match frame {
         ClientFrame::Hello { .. } => {
             tracing::info!(
@@ -703,7 +745,7 @@ where
             ControlFlow::Break(())
         }
 
-        ClientFrame::Ping => write_or_break(framed, &ServerFrame::Pong).await,
+        ClientFrame::Ping => write_or_break(framed, &ServerFrame::Pong, deadline).await,
 
         ClientFrame::List { request_id } => {
             if let Err(error) = protocol::validate_correlation_id(&request_id) {
@@ -714,12 +756,13 @@ where
                         message: Some(format!("list.request_id {error}")),
                         request_id: None,
                     },
+                    deadline,
                 )
                 .await;
             }
 
             let peers = state.list_peers(&registered.room);
-            write_or_break(framed, &ServerFrame::Peers { request_id, peers }).await
+            write_or_break(framed, &ServerFrame::Peers { request_id, peers }, deadline).await
         }
 
         ClientFrame::Send {
@@ -742,6 +785,7 @@ where
                     message: Some("this protocol version does not implement that frame".to_owned()),
                     request_id: None,
                 },
+                deadline,
             )
             .await
         }
@@ -766,6 +810,8 @@ async fn handle_send<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let deadline = Instant::now() + state.deadlines().idle;
+
     if let Err(error) = protocol::validate_correlation_id(&id) {
         return write_or_break(
             framed,
@@ -774,6 +820,7 @@ where
                 message: Some(format!("send.id {error}")),
                 request_id: None,
             },
+            deadline,
         )
         .await;
     }
@@ -792,6 +839,7 @@ where
                 to,
                 status: ReceiptStatus::InvalidTarget,
             },
+            deadline,
         )
         .await;
     }
@@ -837,7 +885,7 @@ where
 
     log_route(registered, &to, &id, body_bytes, status);
 
-    write_or_break(framed, &ServerFrame::Receipt { id, to, status }).await
+    write_or_break(framed, &ServerFrame::Receipt { id, to, status }, deadline).await
 }
 
 /// Emits the routing outcome. Carries metadata only: never `body`.
@@ -886,17 +934,26 @@ where
 }
 
 /// Writes one frame, reporting whether the connection survived.
+///
+/// `deadline` bounds the socket write for the same reason the outbound queue's
+/// write is bounded: a peer that has stopped reading would otherwise park this
+/// task indefinitely, and a parked task stops enforcing its own deadlines.
 async fn write_or_break<S>(
     framed: &mut Framed<S, LengthDelimitedCodec>,
     frame: &ServerFrame,
+    deadline: Instant,
 ) -> ControlFlow<()>
 where
     S: AsyncWrite + Unpin,
 {
-    match write_frame(framed, frame).await {
-        Ok(()) => ControlFlow::Continue(()),
-        Err(error) => {
+    match timeout_at(deadline, write_frame(framed, frame)).await {
+        Ok(Ok(())) => ControlFlow::Continue(()),
+        Ok(Err(error)) => {
             tracing::debug!(%error, "connection write failed");
+            ControlFlow::Break(())
+        }
+        Err(_elapsed) => {
+            tracing::info!("connection write outlived the idle deadline");
             ControlFlow::Break(())
         }
     }
@@ -1180,6 +1237,34 @@ mod tests {
         assert!(
             state.list_peers(&room()).is_empty(),
             "deregistration runs in Drop, so it covers every exit path including a panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_that_outlives_its_deadline_closes_the_connection() {
+        // A duplex with a 16-byte buffer whose read half is never drained: the
+        // first frame larger than that blocks forever. Keeping `_client` alive
+        // matters -- dropping it would fail the write immediately, which is a
+        // different path from the one under test.
+        let (server_io, _client) = tokio::io::duplex(16);
+        let mut framed = protocol::framed(server_io);
+
+        let outcome = write_or_break(
+            &mut framed,
+            &ServerFrame::Message {
+                id: "msg-1".to_owned(),
+                from: "sender".to_owned(),
+                body: "x".repeat(4096),
+                reply_to: None,
+            },
+            Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            outcome.is_break(),
+            "a write to a peer that never reads must be abandoned at its deadline, \
+             because a parked write stops the task from enforcing any deadline"
         );
     }
 }
