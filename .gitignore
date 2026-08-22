@@ -5,3 +5,5 @@
 # the same workflow skills into both directories on every install.
 .claude/
 .omp/
+
+# scratch line for CI verification; this branch is never merged
