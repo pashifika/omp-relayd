@@ -157,6 +157,16 @@ where
         io.flush().await.expect("flush raw bytes");
     }
 
+    /// Half-closes the connection, so the relay reads end of stream while a
+    /// declared payload is still outstanding.
+    pub async fn shutdown_write(&mut self) {
+        self.framed
+            .get_mut()
+            .shutdown()
+            .await
+            .expect("shut down the write half");
+    }
+
     /// Reads the next server frame, failing the test if none arrives.
     pub async fn recv(&mut self) -> ServerFrame {
         let payload = timeout(READ_TIMEOUT, self.framed.next())

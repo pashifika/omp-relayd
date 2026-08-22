@@ -713,6 +713,55 @@ async fn a_zero_length_frame_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_truncated_frame_is_not_decoded() {
+    let relay = Relay::start().await;
+    let here = room("truncated");
+    let mut peer = Client::join(&relay, &here, "peer").await;
+
+    // A legal declared length whose payload never fully arrives. This is a
+    // different path from the oversized declaration above: the length passes
+    // the cap, so the codec waits for bytes that end instead.
+    peer.send_unframed(&length_prefix(32)).await;
+    peer.send_unframed(b"\x84\xa4type").await;
+    peer.shutdown_write().await;
+
+    // A partial payload must not be decoded into anything, and a transport
+    // failure has no socket left to explain itself on, so no error frame is
+    // expected -- only a close.
+    peer.expect_closed().await;
+
+    wait_until_deregistered(&relay, &here, "peer").await;
+}
+
+#[tokio::test]
+async fn an_unknown_first_frame_type_is_rejected_as_an_invalid_hello() {
+    #[derive(Serialize)]
+    struct Broadcast<'a> {
+        #[serde(rename = "type")]
+        kind: &'a str,
+        body: &'a str,
+    }
+
+    let relay = Relay::start().await;
+    let mut client = Client::connect(&relay).await;
+
+    let payload = protocol::encode(&Broadcast {
+        kind: "broadcast",
+        body: "before saying hello",
+    })
+    .expect("encode");
+    client.send_payload(payload.to_vec()).await;
+
+    // The handshake requirement takes precedence over the unknown-frame rule: a
+    // connection with no room cannot process any frame but `hello`, so this
+    // closes with `invalid_hello` rather than staying open with
+    // `unsupported_frame` as it would after registration.
+    client
+        .expect_error_then_close(ErrorCode::InvalidHello)
+        .await;
+}
+
+#[tokio::test]
 async fn undecodable_and_non_map_payloads_are_rejected_as_malformed() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("corrupt bytes", vec![0xc1, 0x00, 0x00]),

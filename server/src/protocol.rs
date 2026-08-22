@@ -485,6 +485,9 @@ pub fn body_over_budget(body: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+    use tokio_util::codec::Encoder;
+
     use super::*;
 
     /// MessagePack array markers: `fixarray`, `array16`, `array32`.
@@ -932,6 +935,54 @@ mod tests {
             body_over_budget(&over_budget),
             Some(MAX_BODY_BYTES + 1),
             "one byte over the budget must be reported with its observed size"
+        );
+    }
+
+    #[test]
+    fn the_length_prefix_counts_payload_bytes_only() {
+        let mut codec = codec();
+        let mut wire = BytesMut::new();
+
+        codec
+            .encode(Bytes::from(vec![0x5a; 42]), &mut wire)
+            .expect("encodes");
+
+        assert_eq!(
+            &wire[..4],
+            &[0x00, 0x00, 0x00, 0x2a],
+            "a 42-byte payload must be introduced by 00 00 00 2A, big-endian and \
+             excluding the prefix itself; observed {:02x?}",
+            &wire[..4]
+        );
+        assert_eq!(
+            wire.len(),
+            4 + 42,
+            "the frame must be the four-byte prefix plus exactly 42 payload bytes"
+        );
+        assert!(
+            wire[4..].iter().all(|&byte| byte == 0x5a),
+            "the payload must follow the prefix unaltered: {:02x?}",
+            &wire[4..]
+        );
+    }
+
+    #[test]
+    fn a_real_frame_is_framed_with_its_own_length() {
+        let payload = encode(&ServerFrame::Pong).expect("encodes");
+        let mut codec = codec();
+        let mut wire = BytesMut::new();
+        codec.encode(payload.clone(), &mut wire).expect("encodes");
+
+        let declared = u32::from_be_bytes(wire[..4].try_into().expect("four bytes"));
+        assert_eq!(
+            declared as usize,
+            payload.len(),
+            "the declared length must equal the payload length, not the framed length"
+        );
+        assert_eq!(
+            wire.len() - 4,
+            payload.len(),
+            "the bytes after the prefix must be exactly the payload"
         );
     }
 }
