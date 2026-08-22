@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+# One in-flight run per pull request, or per ref outside one. A newer push
+# supersedes and cancels the run it replaces.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runtime job. Language-specific jobs (`rust`, `bun`) are added by the changes
+  # that introduce those toolchains, and each extends the `ci` gate's `needs`.
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the workflow tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Verify every action reference is SHA-pinned with a version comment
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(
+            find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort
+          )
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "hygiene: no workflow files under .github/workflows; this check would verify nothing"
+            exit 1
+          fi
+
+          echo "hygiene: scanning ${#files[@]} workflow file(s)"
+          printf '  %s\n' "${files[@]}"
+
+          awk '
+          BEGIN {
+            checked = 0
+            violations = 0
+            sq = sprintf("%c", 39)
+          }
+          {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+
+            # A commented-out example is documentation, not a live reference.
+            if (line ~ /^#/) next
+
+            sub(/^-[[:space:]]+/, "", line)
+            if (line !~ /^uses:[[:space:]]*/) next
+            sub(/^uses:[[:space:]]*/, "", line)
+
+            # Separate the trailing version comment from the reference itself.
+            comment = ""
+            hash = index(line, "#")
+            if (hash > 0) {
+              comment = substr(line, hash + 1)
+              line = substr(line, 1, hash - 1)
+            }
+            sub(/[[:space:]]+$/, "", line)
+            sub(/^[[:space:]]+/, "", comment)
+            sub(/[[:space:]]+$/, "", comment)
+
+            ref = line
+            if (length(ref) > 1) {
+              first = substr(ref, 1, 1)
+              last = substr(ref, length(ref), 1)
+              if ((first == "\"" && last == "\"") || (first == sq && last == sq))
+                ref = substr(ref, 2, length(ref) - 2)
+            }
+            if (ref == "") next
+
+            checked++
+
+            # Action references carry exactly one "@"; scan from the right so a
+            # reusable-workflow path never confuses the split.
+            at = 0
+            for (i = length(ref); i > 0; i--)
+              if (substr(ref, i, 1) == "@") { at = i; break }
+
+            if (at == 0) {
+              printf "  FAIL %s:%d %s -- not pinned to a commit SHA\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            sha = substr(ref, at + 1)
+            if (sha !~ /^[0-9a-f]{40}$/) {
+              printf "  FAIL %s:%d %s -- not pinned to a full 40-character commit SHA\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            if (comment == "") {
+              printf "  FAIL %s:%d %s -- SHA pin carries no trailing version comment\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            printf "  ok   %s:%d %s (%s)\n", FILENAME, FNR, ref, comment
+          }
+          END {
+            if (checked == 0) {
+              print "hygiene: no uses: references found; this check would verify nothing"
+              exit 1
+            }
+            if (violations > 0) {
+              printf "hygiene: %d of %d reference(s) rejected; every uses: must read owner/repo@<40-hex-sha> # <version>\n", violations, checked
+              exit 1
+            }
+            printf "hygiene: %d reference(s) checked, all SHA-pinned with a version comment\n", checked
+          }
+          ' "${files[@]}"
+
+  # The single status check branch protection requires. `.github/rulesets/main.json`
+  # names the literal string `ci`; nothing mechanically verifies the two agree, so
+  # renaming this job silently blocks every merge with no failing job to point at.
+  ci:
+    name: ci
+    needs: [hygiene]
+    # `always()` is load-bearing. Without it this job is skipped when a dependency
+    # fails, and a skipped required check blocks a pull request rather than failing
+    # it -- a stuck merge button instead of a red one.
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate runtime job results
+        timeout-minutes: 5
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+
+          count=$(jq 'length' <<< "$RESULTS")
+
+          if [ "$count" -eq 0 ]; then
+            echo "ci: no aggregated jobs; the gate would report success while verifying nothing"
+            exit 1
+          fi
+
+          echo "ci: aggregating $count job result(s)"
+          jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<< "$RESULTS"
+
+          # Anything other than success -- failure, cancellation, or a skip -- is a
+          # failure of the gate. A skipped dependency must not pass as verified.
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<< "$RESULTS")
+
+          if [ -n "$failed" ]; then
+            echo "ci: gate failed; these jobs did not succeed:"
+            printf '  %s\n' $failed
+            exit 1
+          fi
+
+          echo "ci: all $count job(s) succeeded"
