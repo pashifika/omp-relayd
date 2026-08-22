@@ -49,6 +49,14 @@ pub const IDLE_DEADLINE: Duration = Duration::from_secs(90);
 /// Without it a peer that has stopped reading could pin the task indefinitely.
 const TERMINAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Ceiling on the diagnostic text carried in an `error` frame.
+///
+/// Clients branch on `code` and never parse `message`, so truncation costs
+/// nothing they rely on. It buys two things: an `error` frame that always fits
+/// the frame cap, and a bound on how much of a rejected payload can be quoted
+/// back at its sender.
+const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+
 /// How long [`serve`] lets connection tasks notice shutdown and close their
 /// sockets. This waits on relay tasks, never on a client acknowledging
 /// anything.
@@ -844,6 +852,27 @@ where
         .await;
     }
 
+    // `reply_to` is the other half of the envelope the body budget reserves
+    // room for. Leaving it unchecked reopened exactly the attack the budget
+    // closes: an oversized `reply_to` with an empty body passes every other
+    // check, and the `message` built from it exceeds the frame cap, so the
+    // encode failure lands on the recipient's connection.
+    if let Some(error) = reply_to
+        .as_deref()
+        .and_then(|value| protocol::validate_correlation_id(value).err())
+    {
+        return write_or_break(
+            framed,
+            &ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("send.reply_to {error}")),
+                request_id: None,
+            },
+            deadline,
+        )
+        .await;
+    }
+
     // Checked before routing, so the encode failure never lands on the
     // recipient's connection: otherwise any sender could close any peer.
     if let Some(body_bytes) = protocol::body_over_budget(&body) {
@@ -967,10 +996,24 @@ where
 async fn close_with<S>(
     framed: &mut Framed<S, LengthDelimitedCodec>,
     code: ErrorCode,
-    message: String,
+    mut message: String,
 ) where
     S: AsyncWrite + Unpin,
 {
+    // Two callers pass a decoder's error text, which quotes the payload it
+    // rejected -- and quoting escapes, so a payload well inside the inbound cap
+    // can produce a diagnostic well outside it. An unencodable `error` frame is
+    // silently dropped by the `let _` below, leaving the peer with exactly the
+    // bare EOF this function exists to prevent. Capping here fixes every call
+    // site at once.
+    if message.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut end = MAX_DIAGNOSTIC_BYTES;
+        while end > 0 && !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+
     let frame = ServerFrame::Error {
         code,
         message: Some(message),
@@ -1265,6 +1308,72 @@ mod tests {
             outcome.is_break(),
             "a write to a peer that never reads must be abandoned at its deadline, \
              because a parked write stops the task from enforcing any deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_does_not_desynchronize_the_frame_stream() {
+        use futures_util::StreamExt as _;
+
+        // The claim under test: when `timeout_at` cancels `write_frame` after a
+        // partial socket write, the un-flushed remainder stays in the codec's
+        // write buffer, so the diagnostic written next is appended after it
+        // rather than interleaved with it. If that were wrong, a length prefix
+        // and its payload would desynchronize and every later frame on the
+        // connection would be garbage.
+        let (server_io, client_io) = tokio::io::duplex(1024);
+        let mut server = protocol::framed(server_io);
+
+        let large = ServerFrame::Message {
+            id: "msg-1".to_owned(),
+            from: "sender".to_owned(),
+            body: "x".repeat(8 * 1024),
+            reply_to: None,
+        };
+        let diagnostic = ServerFrame::Error {
+            code: ErrorCode::IdleTimeout,
+            message: Some("no frame within 400ms".to_owned()),
+            request_id: None,
+        };
+
+        // Starts reading only after the first write has been cancelled, so the
+        // cancellation lands mid-flush rather than before any byte moves.
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let mut client = protocol::framed(client_io);
+            let mut received = Vec::new();
+            while received.len() < 2 {
+                let Some(Ok(payload)) = client.next().await else {
+                    break;
+                };
+                received.push(protocol::decode::<ServerFrame>(&payload).expect("decodable frame"));
+            }
+            received
+        });
+
+        let cancelled = timeout(Duration::from_millis(50), write_frame(&mut server, &large)).await;
+        assert!(
+            cancelled.is_err(),
+            "the fixture needs the first write to be cancelled while the peer is not reading"
+        );
+
+        timeout(
+            Duration::from_secs(5),
+            write_frame(&mut server, &diagnostic),
+        )
+        .await
+        .expect("the diagnostic write completes once the peer drains")
+        .expect("the diagnostic write succeeds");
+
+        let received = timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the reader finishes")
+            .expect("the reader did not panic");
+
+        assert_eq!(
+            received,
+            vec![large, diagnostic],
+            "the cancelled frame must arrive whole and be followed by the diagnostic"
         );
     }
 }

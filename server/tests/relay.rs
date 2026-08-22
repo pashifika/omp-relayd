@@ -902,6 +902,100 @@ async fn an_unknown_frame_type_is_reported_and_the_connection_stays_open() {
     );
 }
 
+/// Builds a `send` payload of exactly `target` bytes by tuning `reply_to`,
+/// leaving `body` empty so the body budget cannot be what rejects it.
+fn send_payload_with_long_reply_to(target: usize, to: &str) -> Vec<u8> {
+    let mut reply_len = target;
+
+    for _ in 0..10 {
+        let payload = protocol::encode(&ClientFrame::Send {
+            id: "i".to_owned(),
+            to: to.to_owned(),
+            body: String::new(),
+            reply_to: Some("r".repeat(reply_len)),
+        })
+        .expect("encode");
+
+        match payload.len().cmp(&target) {
+            Ordering::Equal => return payload.to_vec(),
+            Ordering::Greater => reply_len -= payload.len() - target,
+            Ordering::Less => reply_len += target - payload.len(),
+        }
+    }
+
+    panic!("could not build a payload of exactly {target} bytes");
+}
+
+#[tokio::test]
+async fn an_oversized_reply_to_cannot_close_the_recipient() {
+    let relay = Relay::start().await;
+    let here = room("reply-to-budget");
+
+    let mut sender = Client::join(&relay, &here, "sender").await;
+    let mut recipient = Client::join(&relay, &here, "recipient").await;
+
+    // The body budget guards `body` only. An oversized `reply_to` with an empty
+    // body passes every check, and the `message` built from it exceeds the frame
+    // cap -- so the encode failure would land on the recipient.
+    let payload = send_payload_with_long_reply_to(MAX_FRAME_BYTES, "recipient");
+    assert_eq!(payload.len(), MAX_FRAME_BYTES, "fixture size");
+    sender.send_payload(payload).await;
+
+    match sender.recv().await {
+        ServerFrame::Error { code, .. } => assert_eq!(
+            code,
+            ErrorCode::InvalidIdentifier,
+            "an unrelayable reply_to must be refused at the sender"
+        ),
+        other => panic!("expected invalid_identifier, received {other:?}"),
+    }
+
+    assert_eq!(
+        recipient.recv_within(QUIET).await,
+        None,
+        "nothing may be delivered"
+    );
+    recipient.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        recipient.recv().await,
+        ServerFrame::Pong,
+        "one sender must not be able to close another peer's connection"
+    );
+}
+
+/// A `hello` whose `protocol` is a string, so serde's type-mismatch message
+/// quotes the value back. Quote characters double under `{:?}` escaping.
+#[derive(Serialize)]
+struct MalformedHello<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    protocol: &'a str,
+}
+
+#[tokio::test]
+async fn an_oversized_diagnostic_still_states_its_cause() {
+    let relay = Relay::start().await;
+    let mut client = Client::connect(&relay).await;
+
+    // Inside the inbound cap, but its escaped diagnostic is not: every `"`
+    // becomes `\"`, so ~33 KiB in becomes ~66 KiB of error text.
+    let quotes = "\"".repeat(33 * 1024);
+    let payload = protocol::encode(&MalformedHello {
+        kind: "hello",
+        protocol: &quotes,
+    })
+    .expect("encode");
+    assert!(payload.len() < MAX_FRAME_BYTES, "fixture must be accepted");
+    client.send_payload(payload.to_vec()).await;
+
+    // A close the relay initiates must state its cause. A diagnostic too large
+    // to encode would leave the peer with a bare EOF, which is the outcome the
+    // error-before-close rule exists to avoid.
+    client
+        .expect_error_then_close(ErrorCode::MalformedFrame)
+        .await;
+}
+
 #[tokio::test]
 async fn an_over_long_message_id_is_rejected_without_closing_the_connection() {
     let relay = Relay::start().await;

@@ -39,6 +39,14 @@ pub const MAX_CORRELATION_BYTES: usize = 128;
 /// `from` (64 bytes), every key name, and the map and string markers: 365
 /// bytes. 512 is that rounded up, so the budget below sits 147 bytes inside the
 /// true limit rather than exactly on it.
+///
+/// Those maxima are a *premise*, and every one of them has to be enforced for
+/// the budget to mean anything. `id` and `reply_to` are checked against
+/// [`MAX_CORRELATION_BYTES`] and `from` is the connection's registered peer
+/// name, already checked against [`MAX_IDENTIFIER_BYTES`]. An unchecked field
+/// here is not a slack calculation — it is a way for one sender to build a
+/// `message` the recipient's connection cannot encode, which closes that
+/// connection. `reply_to` was missed on the first pass and found in review.
 const MESSAGE_ENVELOPE_HEADROOM: usize = 512;
 
 /// Largest accepted `send.body`, in UTF-8 bytes.
