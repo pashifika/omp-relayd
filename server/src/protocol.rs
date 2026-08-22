@@ -16,7 +16,7 @@ use std::fmt;
 use std::io;
 
 use bytes::Bytes;
-use serde::de::DeserializeOwned;
+use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -71,12 +71,68 @@ pub const MAX_BODY_BYTES: usize = MAX_FRAME_BYTES - MESSAGE_ENVELOPE_HEADROOM;
 /// One type for both means no conversion and no second allocation, and it keeps
 /// the combined `<project>/<task>` spelling off the wire entirely: the two
 /// components are always transmitted as separate map fields.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct RoomId {
     /// Project component of the room identity.
     pub project: String,
     /// Task component of the room identity.
     pub task: String,
+}
+
+/// Accepts `room` only as a named map.
+///
+/// The derived implementation would also accept a two-element *array*, because
+/// that is how Serde represents a struct in non-self-describing formats. That
+/// makes the top-level [`decode`] map check leaky one level down: a positional
+/// `room` decodes here into exactly the value a named map would, so a client
+/// encoding rooms positionally interoperates with this relay by accident and
+/// breaks against any other implementation of the same contract. `wire-protocol`
+/// forbids positional frames; enforce it wherever a struct appears, not only at
+/// the payload's root.
+impl<'de> Deserialize<'de> for RoomId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MapOnly;
+
+        impl<'de> de::Visitor<'de> for MapOnly {
+            type Value = RoomId;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map with the string keys `project` and `task`")
+            }
+
+            // Deliberately no `visit_seq`: Serde's default rejects sequences
+            // with an `invalid type` error, which is the whole point.
+            fn visit_map<A>(self, mut map: A) -> Result<RoomId, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut project = None;
+                let mut task = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "project" => project = Some(map.next_value()?),
+                        "task" => task = Some(map.next_value()?),
+                        // Ignored, matching the additive evolution every other
+                        // protocol type allows.
+                        _ => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(RoomId {
+                    project: project.ok_or_else(|| de::Error::missing_field("project"))?,
+                    task: task.ok_or_else(|| de::Error::missing_field("task"))?,
+                })
+            }
+        }
+
+        // `deserialize_any` rather than `deserialize_map` so the dispatch is the
+        // wire marker's, letting an array reach the missing `visit_seq`.
+        deserializer.deserialize_any(MapOnly)
+    }
 }
 
 impl RoomId {
@@ -861,6 +917,115 @@ mod tests {
                 decoded.ok()
             );
         }
+    }
+
+    #[test]
+    fn a_nested_positional_room_is_rejected() {
+        // Only `room` is positional; the frame itself is a named map, so the
+        // top-level marker check passes and this reaches the field's own
+        // deserializer -- which is where the rule has to be enforced too.
+        #[derive(Serialize)]
+        struct SeqRoomHello {
+            r#type: &'static str,
+            protocol: u32,
+            room: (&'static str, &'static str),
+            peer: &'static str,
+        }
+
+        let payload = encode(&SeqRoomHello {
+            r#type: "hello",
+            protocol: PROTOCOL_VERSION,
+            room: ("omp-relayd", "implement-tcp-relay-server"),
+            peer: "macbook-reviewer",
+        })
+        .expect("encodes");
+        assert!(
+            is_map_marker(payload[0]),
+            "the frame itself must be a map, or this tests the top-level check \
+             instead: 0x{:02x}",
+            payload[0]
+        );
+
+        let decoded: Result<ClientFrame, Error> = decode(&payload);
+        assert!(
+            decoded.is_err(),
+            "a positional `room` decoded as {:?}; it must be rejected, or a client \
+             encoding rooms as arrays interoperates with this relay by accident \
+             and breaks against every other implementation",
+            decoded.ok()
+        );
+
+        // The named form of the same value still decodes, so the check rejects
+        // the shape rather than the content.
+        let named = encode(&ClientFrame::Hello {
+            protocol: PROTOCOL_VERSION,
+            room: RoomId::new("omp-relayd", "implement-tcp-relay-server"),
+            peer: "macbook-reviewer".to_owned(),
+        })
+        .expect("encodes");
+        decode::<ClientFrame>(&named).expect("the named form must still decode");
+    }
+
+    #[test]
+    fn bin_encoded_strings_are_accepted_and_re_encoded_as_strings() {
+        // A bounded leniency `wire-protocol` states rather than removes: this
+        // decoder accepts `bin` where the contract says `str`. What must hold
+        // is that nothing leaves carrying it, so the relay is permissive on the
+        // way in and conforming on the way out.
+        // Hand-encoded: no conforming encoder produces this shape, and Serde
+        // renders `&[u8]` as an array of integers rather than as `bin`.
+        fn fixstr(value: &str) -> Vec<u8> {
+            let bytes = value.as_bytes();
+            assert!(bytes.len() < 32, "fixstr only");
+            let mut out = vec![0xa0 | u8::try_from(bytes.len()).expect("fits")];
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        fn bin8(value: &str) -> Vec<u8> {
+            let bytes = value.as_bytes();
+            let mut out = vec![0xc4, u8::try_from(bytes.len()).expect("fits")];
+            out.extend_from_slice(bytes);
+            out
+        }
+
+        let mut payload = vec![0x84];
+        for (key, value) in [
+            ("type", "send"),
+            ("id", "msg-1"),
+            ("to", "windows-main"),
+            ("body", "review the diff"),
+        ] {
+            payload.extend(fixstr(key));
+            // The discriminator itself stays a string: Serde reads the tag
+            // before any field, so a `bin` tag fails for an unrelated reason
+            // and would not exercise the field decoding under test.
+            payload.extend(if key == "type" {
+                fixstr(value)
+            } else {
+                bin8(value)
+            });
+        }
+        assert!(
+            payload.windows(2).any(|window| window == [0xc4, 0x05]),
+            "the fixture must actually carry a bin8 field: {payload:02x?}"
+        );
+
+        let decoded: ClientFrame = decode(&payload).expect("bin-encoded strings are accepted");
+        let expected = ClientFrame::Send {
+            id: "msg-1".to_owned(),
+            to: "windows-main".to_owned(),
+            body: "review the diff".to_owned(),
+            reply_to: None,
+        };
+        assert_eq!(decoded, expected);
+
+        assert_eq!(
+            encode(&decoded).expect("re-encodes"),
+            encode(&expected).expect("encodes"),
+            "a frame that arrived with bin fields must go back out as strings, or \
+             the leniency propagates into the bytes other implementations read"
+        );
     }
 
     #[test]

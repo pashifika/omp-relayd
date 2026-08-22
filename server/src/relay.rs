@@ -535,10 +535,19 @@ async fn pump<S>(
     S: AsyncRead + AsyncWrite,
 {
     let (reply_tx, reply_rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
+    // Both halves watch it: the writer so eviction overtakes the backlog, the
+    // reader so a superseded connection stops routing.
+    let mut reader_evicted = evicted.clone();
 
     let write_loop = run_writer(writer, outbound, reply_rx, evicted, registered);
-    let read_loop = run_reader(reader, state, registered, reply_tx, shutdown);
-
+    let read_loop = run_reader(
+        reader,
+        state,
+        registered,
+        reply_tx,
+        shutdown,
+        &mut reader_evicted,
+    );
     tokio::pin!(write_loop);
 
     tokio::select! {
@@ -591,8 +600,20 @@ async fn run_writer<S>(
 
             reply = replies.recv() => match reply {
                 Some(frame) => {
-                    if write_frame(&mut writer, &frame).await.is_err() {
-                        return;
+                    // Raced against eviction for the same reason the delivery
+                    // arm is. A bare await here masked the flag: once this arm
+                    // was chosen, a reply write pending on a full socket buffer
+                    // never polled it, so replacing a peer that had stopped
+                    // reading waited out the reply instead of overtaking it.
+                    let wrote = tokio::select! {
+                        biased;
+                        () = wait_for_flag(&mut evicted) => None,
+                        result = write_frame(&mut writer, &frame) => Some(result),
+                    };
+                    match wrote {
+                        Some(Ok(())) => {}
+                        Some(Err(_)) => return,
+                        None => break,
                     }
                 }
                 // The reader is done. Anything still buffered has been drained
@@ -664,6 +685,7 @@ async fn run_reader<S>(
     registered: &RegisteredPeer,
     replies: mpsc::Sender<ServerFrame>,
     shutdown: &mut watch::Receiver<bool>,
+    evicted: &mut watch::Receiver<bool>,
 ) where
     S: AsyncRead,
 {
@@ -676,6 +698,18 @@ async fn run_reader<S>(
                 tracing::debug!(
                     connection_id = registered.connection_id,
                     "closing connection for shutdown"
+                );
+                return;
+            }
+
+            // Being superseded has to stop *inbound* processing too, not only
+            // outbound delivery. Otherwise a replaced connection keeps routing
+            // frames under a peer name it no longer owns, and recipients see
+            // messages attributed to the peer the replacement now is.
+            () = wait_for_flag(evicted) => {
+                tracing::debug!(
+                    connection_id = registered.connection_id,
+                    "superseded; stopping inbound processing"
                 );
                 return;
             }
@@ -702,6 +736,18 @@ async fn run_reader<S>(
                 {
                     return;
                 }
+
+                // Hand the writer a turn before taking the next frame.
+                //
+                // `FramedRead` returns every frame it has already buffered
+                // without pending, and nothing in this loop awaits, so a
+                // pipelined burst is decoded in a single poll and the writer is
+                // never scheduled in between. The reply channel then fills from
+                // frames the writer would otherwise have drained, and a healthy
+                // peer that simply pipelined its requests gets closed.
+                // Measured before this yield: a 24-send burst in one 998-byte
+                // write produced 8 receipts and a close.
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -1035,6 +1081,28 @@ fn handle_send(
         return ControlFlow::Break(());
     }
 
+    // The acknowledgement is claimed before the frame is routed. `peer-relay`
+    // requires exactly one receipt per valid `send`, so routing first and
+    // finding no room afterwards delivered the message and lost its receipt --
+    // leaving the sender unable to tell whether to retry.
+    let Some(receipt_slot) = reserve_receipt(replies) else {
+        tracing::info!(
+            room = %registered.room,
+            peer = %registered.peer,
+            connection_id = registered.connection_id,
+            capacity = REPLY_QUEUE_CAPACITY,
+            "cannot acknowledge a send; closing without routing it"
+        );
+        queue_diagnostic(
+            replies,
+            ErrorCode::IdleTimeout,
+            "replies are not being drained, so this send cannot be acknowledged; \
+             it was not routed"
+                .to_owned(),
+        );
+        return ControlFlow::Break(());
+    };
+
     // `body` is moved into the delivered frame and is never a log field; only
     // its size is observable in logs.
     let body_bytes = body.len();
@@ -1051,7 +1119,8 @@ fn handle_send(
 
     log_route(registered, &to, &id, body_bytes, status);
 
-    enqueue_reply(replies, ServerFrame::Receipt { id, to, status })
+    receipt_slot.send(ServerFrame::Receipt { id, to, status });
+    ControlFlow::Continue(())
 }
 
 /// Clamps a rejected `to` value to the identifier limit before it is echoed.
@@ -1129,27 +1198,52 @@ where
     writer.send(payload).await
 }
 
-/// Hands one reply to the writer, reporting whether the connection survives.
+/// Hands one reply to the writer, dropping it rather than closing when the
+/// writer is not keeping up.
 ///
-/// Non-blocking on purpose. The reader must never wait on the socket, which is
-/// the entire point of the split, so a full reply channel is not something to
-/// wait out: it means the writer has not drained eight replies, which means the
-/// peer is not reading even its own answers. There is nothing to gain by
-/// keeping that connection, and the reader stays responsive by refusing to
-/// block on it.
+/// Non-blocking on purpose: the reader must never wait on the socket, which is
+/// the point of the split. A full channel means the writer has not drained
+/// [`REPLY_QUEUE_CAPACITY`] replies, which means the peer is not reading even
+/// its own answers -- so this reply could not have reached it either way.
+///
+/// Dropping rather than closing is what keeps the heartbeat guarantee. A peer
+/// that keeps sending `ping` while not draining generates one `pong` per ping;
+/// closing on a full channel disconnected exactly the peer `peer-relay` says
+/// must be kept, and did so after nine pings. Measured before this split
+/// existed: 15 pings, deregistered at the 15th.
+///
+/// Used for every reply whose loss costs the peer nothing it can observe:
+/// `pong`, `peers`, and the recoverable `error` frames. A `send` receipt is
+/// contractual and uses [`reserve_receipt`] instead.
 fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> ControlFlow<()> {
     match replies.try_send(frame) {
         Ok(()) => ControlFlow::Continue(()),
         Err(TrySendError::Full(_)) => {
-            tracing::info!(
+            tracing::debug!(
                 capacity = REPLY_QUEUE_CAPACITY,
-                "reply queue full; the peer is not reading its own replies"
+                "reply dropped: the peer is not draining its own replies"
             );
-            ControlFlow::Break(())
+            ControlFlow::Continue(())
         }
         // The writer is gone, so the connection is already closing.
         Err(TrySendError::Closed(_)) => ControlFlow::Break(()),
     }
+}
+
+/// Claims the slot a `send` receipt will occupy, before the send is routed.
+///
+/// `peer-relay` requires exactly one `receipt` for every syntactically valid
+/// `send`, so the acknowledgement has to be secured *first*. Routing and then
+/// discovering there is no room routed the message and dropped its receipt:
+/// measured at 24 coalesced sends, 8 receipts, 9 delivered, then a close. The
+/// sender could not tell that its ninth message had been delivered, so it would
+/// resend it.
+///
+/// Returning `None` therefore means "do not route this frame", and the caller
+/// closes the connection instead. Nothing was delivered, so the sender's retry
+/// after reconnecting is correct rather than a duplicate.
+fn reserve_receipt(replies: &mpsc::Sender<ServerFrame>) -> Option<mpsc::Permit<'_, ServerFrame>> {
+    replies.try_reserve().ok()
 }
 
 /// Queues the frame that names why the relay is closing this connection.
@@ -1503,11 +1597,10 @@ mod tests {
     }
 
     #[test]
-    fn a_full_reply_queue_closes_the_connection_rather_than_blocking_the_reader() {
-        // Replaces a test of the bounded-write path that no longer exists. The
-        // writer's writes are deliberately unbounded now -- the reader is the
-        // watchdog -- so the question that matters here is what the *reader*
-        // does when the writer is not keeping up. It must never wait.
+    fn a_full_reply_queue_drops_a_reply_but_never_blocks_the_reader() {
+        // The reader must never wait on the socket, so a full reply channel is
+        // not something to wait out. What it does instead depends on whether
+        // the reply is contractual.
         let (replies, _writer_side) = mpsc::channel(REPLY_QUEUE_CAPACITY);
 
         for slot in 1..=REPLY_QUEUE_CAPACITY {
@@ -1518,10 +1611,55 @@ mod tests {
         }
 
         assert!(
-            enqueue_reply(&replies, ServerFrame::Pong).is_break(),
-            "a reply that does not fit must close the connection rather than block the \
-             reader: a blocked reader stops consuming heartbeats and stops enforcing the \
-             idle deadline, which is the failure the read/write split exists to remove"
+            enqueue_reply(&replies, ServerFrame::Pong).is_continue(),
+            "a `pong` that does not fit must be dropped and the connection kept: the peer \
+             is not draining, so it could not have received the pong either way, and \
+             closing here disconnected exactly the heartbeating peer `peer-relay` says \
+             must be kept -- measured at 15 pings before this changed"
+        );
+
+        assert!(
+            reserve_receipt(&replies).is_none(),
+            "a `send` receipt is contractual, so a full queue must refuse the reservation \
+             instead: the caller then declines to route, which is what stops a send being \
+             delivered with its receipt dropped"
+        );
+    }
+
+    #[test]
+    fn a_reserved_receipt_slot_is_held_until_it_is_used() {
+        let (replies, mut writer_side) = mpsc::channel(REPLY_QUEUE_CAPACITY);
+
+        // Fill every slot but one, then reserve it.
+        for slot in 1..REPLY_QUEUE_CAPACITY {
+            assert!(
+                enqueue_reply(&replies, ServerFrame::Pong).is_continue(),
+                "filling slot {slot} must succeed"
+            );
+        }
+        let slot = reserve_receipt(&replies).expect("the last slot is free");
+
+        assert!(
+            reserve_receipt(&replies).is_none(),
+            "the reservation must actually consume capacity, or two sends could both \
+             believe they are acknowledged"
+        );
+
+        slot.send(ServerFrame::Receipt {
+            id: "m1".to_owned(),
+            to: "windows-main".to_owned(),
+            status: ReceiptStatus::Routed,
+        });
+
+        let mut receipts = 0usize;
+        while let Ok(frame) = writer_side.try_recv() {
+            if matches!(frame, ServerFrame::Receipt { .. }) {
+                receipts += 1;
+            }
+        }
+        assert_eq!(
+            receipts, 1,
+            "the reserved slot must deliver exactly one receipt"
         );
     }
 

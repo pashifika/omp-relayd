@@ -30,6 +30,11 @@ fn send(id: &str, to: &str, body: &str) -> ClientFrame {
     }
 }
 
+/// Slack covering the relay's post-reader terminal write grace, so a test that
+/// must observe state *after* a connection would have been torn down does not
+/// sample inside the window where it still looks alive.
+const TERMINAL_GRACE_ALLOWANCE: Duration = Duration::from_secs(2);
+
 fn routed(id: &str, to: &str) -> ServerFrame {
     ServerFrame::Receipt {
         id: id.to_owned(),
@@ -789,14 +794,141 @@ async fn a_superseded_connection_is_told_before_its_backlog_is_drained() {
     stale.expect_closed().await;
 }
 
+/// Regression: eviction reached only the writer, so a superseded connection's
+/// reader kept accepting frames and routing them under a peer name it no longer
+/// owned. A recipient then saw a message whose `from` names the peer the
+/// *replacement* now is, sent by a connection that had already been displaced.
+///
+/// The frame-count test above is deliberately not the only check on eviction.
+/// It can be satisfied by an implementation that drains a small fixed fraction
+/// of the backlog, as an audit pointed out, and it says nothing about inbound
+/// processing. This one is exact: the smuggled message either arrives or it does
+/// not.
+#[tokio::test]
+async fn a_superseded_connection_stops_routing() {
+    let relay = Relay::with_deadlines(Deadlines {
+        hello: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+    })
+    .await;
+    let here = room("superseded-inbound");
+
+    let mut victim = Client::join(&relay, &here, "victim").await;
+    let mut filler = Client::join(&relay, &here, "filler").await;
+    let mut stale = Client::join(&relay, &here, "ghost").await;
+
+    // The writer for `ghost` must be *blocked* for this test to discriminate.
+    // With an empty backlog the writer notices eviction and exits at once, the
+    // outer select ends the connection, and the reader is dropped before it
+    // could route anything -- so the test would pass whether or not the reader
+    // watches the flag. Blocking the writer leaves the reader alive for the
+    // terminal grace, which is the window the defect lived in.
+    let backlog = fill_pipeline(&mut filler, "ghost").await;
+    assert!(backlog > 0, "the fixture needs the writer to be blocked");
+
+    let _fresh = Client::join(&relay, &here, "ghost").await;
+
+    // No sleep: send into the window while the superseded writer is still
+    // finishing. `stale` never reads, so its writer stays blocked throughout.
+    stale
+        .send(&send("smuggled", "victim", "sent after being replaced"))
+        .await;
+
+    assert_eq!(
+        victim.recv_within(QUIET).await,
+        None,
+        "a connection that has been superseded must not route: the message would reach \
+         the recipient attributed to a peer name the replacement now owns"
+    );
+}
+
+/// Regression: `peer-relay` requires exactly one `receipt` per syntactically
+/// valid `send`. The reader decodes every frame `FramedRead` has already
+/// buffered without yielding, so a pipelined burst filled the reply channel
+/// before the writer was ever scheduled; the frame that overflowed it was
+/// *routed first* and then lost its receipt, and the connection closed.
+///
+/// Measured before the fix: 24 sends written as one 998-byte write produced
+/// 8 receipts and 9 deliveries -- the sender could not tell that its ninth
+/// message had arrived, so it would resend it.
+#[tokio::test]
+async fn a_pipelined_burst_is_acknowledged_frame_for_frame() {
+    // Far more than the reply queue can hold, written as a single burst so the
+    // frames arrive coalesced and are all buffered by the codec at once.
+    const BURST: usize = 24;
+
+    let relay = Relay::start().await;
+    let here = room("pipelined-burst");
+
+    let mut recipient = Client::join(&relay, &here, "recipient").await;
+    let mut sender = Client::join(&relay, &here, "sender").await;
+
+    let mut bytes = Vec::new();
+    for n in 0..BURST {
+        let payload = protocol::encode(&send(&format!("m{n}"), "recipient", "x")).expect("encode");
+        bytes.extend_from_slice(&u32::try_from(payload.len()).expect("fits").to_be_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    sender.send_unframed(&bytes).await;
+
+    let mut acknowledged = Vec::new();
+    for _ in 0..BURST {
+        match sender.recv().await {
+            ServerFrame::Receipt { id, status, .. } => {
+                assert_eq!(
+                    status,
+                    ReceiptStatus::Routed,
+                    "the recipient is registered and reading, so {id} must be routed"
+                );
+                acknowledged.push(id);
+            }
+            other => panic!("expected a receipt, received {other:?}"),
+        }
+    }
+
+    let mut delivered = Vec::new();
+    for _ in 0..BURST {
+        match recipient.recv().await {
+            ServerFrame::Message { id, .. } => delivered.push(id),
+            other => panic!("expected a message, received {other:?}"),
+        }
+    }
+
+    let expected: Vec<String> = (0..BURST).map(|n| format!("m{n}")).collect();
+    assert_eq!(
+        acknowledged, expected,
+        "every send in a pipelined burst must be acknowledged, in order"
+    );
+    assert_eq!(
+        delivered, expected,
+        "and delivered exactly once each: routing more than was acknowledged is what \
+         left the sender unable to tell whether to resend"
+    );
+
+    // Still usable afterwards.
+    sender.send(&ClientFrame::Ping).await;
+    assert_eq!(sender.recv().await, ServerFrame::Pong);
+}
+
 /// Regression: a peer that keeps sending heartbeats must not be disconnected
 /// for silence it did not commit. TCP is full-duplex, so a peer whose receive
 /// buffer is full can still send -- but while the relay was blocked writing to
 /// it, the inbound half was not polled, so those frames went unread and the
 /// idle deadline was never reset.
 ///
-/// Measured before the fix: a peer that sent 9 pings over 2.72 s against a
+/// Measured before the split: a peer that sent 9 pings over 2.72 s against a
 /// 1.5 s idle deadline was disconnected anyway.
+///
+/// The first version of this test passed for the wrong reason, and an audit
+/// caught it. Two things were wrong and both are fixed here. It sent pings for
+/// only three idle deadlines, and it checked registration immediately after the
+/// loop -- inside the one-second terminal grace that follows the reader
+/// stopping, so a connection already on its way out still looked registered.
+/// Against the real defect it should have failed: measured with a longer window,
+/// the peer survived 14 pings and was deregistered at the 15th, because each
+/// undeliverable `pong` consumed a reply slot until the ninth closed the
+/// connection. The window now runs well past both the deadline and the grace,
+/// and the ping count is far beyond the reply-queue depth.
 #[tokio::test]
 async fn a_stalled_peer_that_keeps_pinging_is_not_disconnected() {
     let idle = Duration::from_millis(600);
@@ -815,13 +947,17 @@ async fn a_stalled_peer_that_keeps_pinging_is_not_disconnected() {
     fill_pipeline(&mut sender, "slow").await;
 
     // Both peers behave like busy but conscientious clients: heartbeats on
-    // time. `slow` additionally never drains, so the relay's writer for it is
-    // blocked for the rest of the test. The sender heartbeats too, because its
-    // own idle deadline is running and a disconnected sender would confuse the
-    // result with an unrelated timeout.
+    // time. `slow` additionally never drains. The sender heartbeats too,
+    // because its own idle deadline is running and a disconnected sender would
+    // confuse the result with an unrelated timeout.
+    //
+    // The window is deliberately long enough to cover the idle deadline, the
+    // terminal grace, and many more pings than the reply queue can hold, and
+    // registration is checked on every iteration rather than only at the end.
     let mut pings = 0usize;
     let started = tokio::time::Instant::now();
-    while started.elapsed() < idle * 3 {
+    let window = idle * 5 + TERMINAL_GRACE_ALLOWANCE;
+    while started.elapsed() < window {
         slow.send(&ClientFrame::Ping).await;
         pings += 1;
 
@@ -833,14 +969,25 @@ async fn a_stalled_peer_that_keeps_pinging_is_not_disconnected() {
              peer's writer is blocked"
         );
 
-        tokio::time::sleep(idle / 4).await;
+        tokio::time::sleep(idle / 5).await;
+
+        assert!(
+            relay.state.list_peers(&here).iter().any(|n| n == "slow"),
+            "a peer that has sent {pings} valid pings over {:?} must still be \
+             registered; `peer-relay` resets the deadline on any valid inbound frame, \
+             a blocked write must not stop those frames being read, and an \
+             undeliverable reply must be dropped rather than close the connection",
+            started.elapsed()
+        );
     }
 
     assert!(
-        relay.state.list_peers(&here).iter().any(|n| n == "slow"),
-        "a peer that sent {pings} valid pings over {:?} -- three times the {idle:?} idle \
-         deadline -- must still be registered; `peer-relay` resets the deadline on any \
-         valid inbound frame, and a blocked write must not stop those frames being read",
+        pings > OUTBOUND_QUEUE_CAPACITY / 8,
+        "the window must produce far more pings than the reply queue can hold, \
+         or the test cannot observe a reply-queue overflow; sent {pings}"
+    );
+    println!(
+        "survived {pings} pings over {:?} while never reading",
         started.elapsed()
     );
 }
