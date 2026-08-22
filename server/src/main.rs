@@ -131,6 +131,17 @@ fn init_tracing() {
 }
 
 async fn run(listen: String) -> ExitCode {
+    // Registered before anything else can block, and deliberately not at the
+    // point it is awaited. This process is PID 1 in the container, and the
+    // kernel discards a signal sent to a PID-namespace init process whose
+    // disposition is still the default rather than queueing it. A handler
+    // installed after the listener bound would therefore drop a SIGTERM that
+    // arrived during startup, and the relay would keep running until Docker's
+    // grace period expired and SIGKILL arrived -- which is exactly the
+    // behaviour the Dockerfile's "no init shim" note claims this binary does
+    // not have.
+    let mut termination = Termination::install();
+
     let listener = match TcpListener::bind(&listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -151,7 +162,7 @@ async fn run(listen: String) -> ExitCode {
         shutdown_rx,
     ));
 
-    wait_for_termination().await;
+    termination.recv().await;
     tracing::info!("termination signal received");
     // Ignored: the receiver lives in the task awaited immediately below.
     let _ = shutdown_tx.send(true);
@@ -164,28 +175,63 @@ async fn run(listen: String) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Resolves on the first termination signal the platform offers.
-async fn wait_for_termination() {
+/// Termination signals, with registration separated from waiting.
+///
+/// The split is the point: see the comment at the call site in [`run`]. A
+/// single `wait_for_termination().await` reads more simply but cannot register
+/// a handler before the work it is meant to interrupt.
+struct Termination {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
+    sigterm: Option<tokio::signal::unix::Signal>,
+}
 
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sigterm.recv() => {}
+impl Termination {
+    /// Installs handlers for every termination signal the platform offers.
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let sigterm = match signal(SignalKind::terminate()) {
+                Ok(sigterm) => Some(sigterm),
+                Err(error) => {
+                    tracing::warn!(%error, "no SIGTERM handler; only SIGINT will stop the relay");
+                    None
                 }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "no SIGTERM handler; only SIGINT will stop the relay");
-                let _ = tokio::signal::ctrl_c().await;
-            }
+            };
+            Self { sigterm }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    /// Resolves on the first termination signal to arrive.
+    ///
+    /// `ctrl_c` registers on first poll rather than here, which is acceptable
+    /// because SIGINT reaches PID 1 only from an interactive terminal, where
+    /// startup has necessarily already finished.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            match self.sigterm.as_mut() {
+                Some(sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }

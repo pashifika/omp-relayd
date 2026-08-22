@@ -80,6 +80,32 @@ fn hello_fixture_carries_a_nested_room_map() {
         "a nested map (room.project and room.task) rather than a flattened or \
          combined room string",
     );
+
+    // The property the fixture exists for, asserted directly rather than left
+    // implicit in the bytes -- as the other two fixtures already do.
+    //
+    // Without this, the risk this fixture names is covered only by the
+    // byte-equality comparison, which `UPDATE_FIXTURES=1` exists to overwrite.
+    // A serializer change that flattened `room`, or emitted the combined
+    // `<project>/<task>` spelling, would be blessed by the documented
+    // regeneration command -- replacing the artifact meant to catch exactly
+    // that drift. These assertions survive regeneration because they read the
+    // file back after it is written.
+    let committed = fs::read(fixture_dir().join("rust-hello.msgpack")).expect("read the fixture");
+    for key in [&b"room"[..], b"project", b"task"] {
+        assert!(
+            committed.windows(key.len()).any(|window| window == key),
+            "the hello fixture must carry {} as its own key: {committed:02x?}",
+            String::from_utf8_lossy(key)
+        );
+    }
+    assert!(
+        !committed
+            .windows(b"omp-relayd/implement".len())
+            .any(|window| window == b"omp-relayd/implement"),
+        "the hello fixture must not carry the combined <project>/<task> spelling: \
+         {committed:02x?}"
+    );
 }
 
 #[test]
