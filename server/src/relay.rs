@@ -1018,6 +1018,19 @@ where
         }
         Err(_elapsed) => {
             tracing::info!("connection write outlived the idle deadline");
+            // The relay is closing this connection on its own initiative, so
+            // the same rule applies here as in the idle branch of `pump`: state
+            // the cause. Without this the one close that a peer reaches by
+            // being slow rather than by being wrong was the one close that
+            // arrived bare. Bounded and best-effort like every other terminal
+            // write, so a peer that is not reading cannot be helped -- but one
+            // that resumes reading learns why it was dropped.
+            close_with(
+                framed,
+                ErrorCode::IdleTimeout,
+                "a reply could not be written within the idle deadline".to_owned(),
+            )
+            .await;
             ControlFlow::Break(())
         }
     }

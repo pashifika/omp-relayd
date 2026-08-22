@@ -210,28 +210,58 @@ impl Termination {
 
     /// Resolves on the first termination signal to arrive.
     ///
-    /// `ctrl_c` registers on first poll rather than here, which is acceptable
-    /// because SIGINT reaches PID 1 only from an interactive terminal, where
-    /// startup has necessarily already finished.
+    /// `ctrl_c` registers on first poll rather than in [`Self::install`], which
+    /// is acceptable because SIGINT reaches PID 1 only from an interactive
+    /// terminal, where startup has necessarily already finished.
+    ///
+    /// Its `io::Result` is matched rather than discarded. A discarded `Err`
+    /// resolves the future immediately, which a `_ =` pattern cannot tell apart
+    /// from a delivered signal -- so a failure to register the SIGINT handler
+    /// would have been reported as "termination signal received" and exited
+    /// successfully during startup, abandoning an already-working SIGTERM
+    /// listener on the way out.
     async fn recv(&mut self) {
         #[cfg(unix)]
         {
             match self.sigterm.as_mut() {
                 Some(sigterm) => {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
+                        result = tokio::signal::ctrl_c() => match result {
+                            Ok(()) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "no SIGINT handler; waiting on SIGTERM only");
+                                sigterm.recv().await;
+                            }
+                        },
                         _ = sigterm.recv() => {}
                     }
                 }
-                None => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
+                None => wait_for_ctrl_c_forever().await,
             }
         }
 
         #[cfg(not(unix))]
         {
-            let _ = tokio::signal::ctrl_c().await;
+            wait_for_ctrl_c_forever().await;
+        }
+    }
+}
+
+/// Waits for SIGINT when it is the only termination signal available.
+///
+/// If it cannot be registered there is nothing left to wait on, and returning
+/// would shut the relay down for no reason, so this parks instead. The
+/// container's `SIGKILL` remains effective either way.
+async fn wait_for_ctrl_c_forever() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "no termination signal handler could be installed; \
+                 the relay will run until it is killed"
+            );
+            std::future::pending::<()>().await;
         }
     }
 }

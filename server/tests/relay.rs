@@ -1022,6 +1022,52 @@ async fn an_unknown_frame_type_is_reported_and_the_connection_stays_open() {
     );
 }
 
+/// A length-delimited payload declares exactly how many bytes the frame
+/// occupies, so a complete frame plus anything else is not a frame. Serde's
+/// deserializer stops at the end of the first value and does not care, which
+/// made this the one malformed shape the relay accepted: the leading frame was
+/// routed and the remainder discarded in silence.
+///
+/// It matters because a stricter decoder on the other side of the contract --
+/// `@msgpack/msgpack` throws on extra bytes -- would reject exactly what this
+/// relay accepted, and the two implementations would disagree about whether
+/// the same bytes are a valid frame.
+#[tokio::test]
+async fn a_frame_followed_by_trailing_bytes_is_rejected() {
+    for (label, trailer) in [
+        ("a single junk byte", vec![0xc1u8]),
+        ("a nil", vec![0xc0u8]),
+        ("ascii garbage", b"NOT MESSAGEPACK".to_vec()),
+        (
+            "a second complete send frame",
+            protocol::encode(&send("m2", "windows-main", "smuggled"))
+                .expect("encode")
+                .to_vec(),
+        ),
+    ] {
+        let relay = Relay::start().await;
+        let here = room("trailing-bytes");
+        let mut peer = Client::join(&relay, &here, "macbook-reviewer").await;
+        let mut recipient = Client::join(&relay, &here, "windows-main").await;
+
+        let mut payload = protocol::encode(&send("m1", "windows-main", "leading"))
+            .expect("encode")
+            .to_vec();
+        payload.extend_from_slice(&trailer);
+
+        peer.send_payload(payload).await;
+        peer.expect_error_then_close(ErrorCode::MalformedFrame)
+            .await;
+
+        assert_eq!(
+            recipient.recv_within(QUIET).await,
+            None,
+            "the leading frame of a payload with {label} appended must not be \
+             routed before the payload is rejected"
+        );
+    }
+}
+
 /// Builds a `send` payload of exactly `target` bytes by tuning `reply_to`,
 /// leaving `body` empty so the body budget cannot be what rejects it.
 fn send_payload_with_long_reply_to(target: usize, to: &str) -> Vec<u8> {

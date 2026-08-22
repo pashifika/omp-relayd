@@ -301,6 +301,20 @@ pub enum Error {
     /// field, a wrong field type, or truncated bytes.
     #[error("frame payload is not a decodable protocol map: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
+    /// The payload carried a complete frame followed by bytes that were not
+    /// part of it.
+    ///
+    /// Rejected because "the payload is a MessagePack map" and "the payload
+    /// begins with a MessagePack map" are different claims, and the contract
+    /// makes the first one. `rmp_serde::from_slice` only makes the second: it
+    /// deserializes one value and never checks that the reader is exhausted.
+    #[error("frame payload has {} trailing bytes after a complete frame", total - consumed)]
+    TrailingBytes {
+        /// Bytes the deserializer consumed.
+        consumed: usize,
+        /// Bytes the payload actually carried.
+        total: usize,
+    },
     /// A frame could not be serialized. Unreachable for the frames this relay
     /// emits, which contain only strings, `u32`s, and vectors of strings.
     #[error("frame could not be encoded: {0}")]
@@ -321,6 +335,7 @@ impl Error {
             Self::EmptyPayload => "empty_payload",
             Self::NotAMap { .. } => "not_a_map",
             Self::Decode(_) => "undecodable",
+            Self::TrailingBytes { .. } => "trailing_bytes",
             Self::Encode(_) => "unencodable",
         }
     }
@@ -357,11 +372,24 @@ where
 /// between two implementations would surface only when a field was added or
 /// reordered. One leading-byte comparison closes it.
 ///
+/// The exhaustion check is the second thing the frame types do not give you.
+/// `rmp_serde::from_slice` deserializes one value and returns, without
+/// requiring that the reader reached the end, so a valid frame followed by a
+/// second frame or by arbitrary bytes decodes as the first frame and the
+/// remainder is discarded in silence. That is a divergence rather than a
+/// nicety: a length-delimited payload declares exactly how many bytes the
+/// frame occupies, and a decoder that ignores the difference accepts what a
+/// stricter one -- for instance `@msgpack/msgpack`, which throws on extra
+/// bytes -- rejects. Two implementations would then disagree about whether the
+/// same bytes are a valid frame.
+///
 /// # Errors
 ///
 /// Returns [`Error::EmptyPayload`] for a zero-length payload,
-/// [`Error::NotAMap`] when the top-level value is not a map, and
-/// [`Error::Decode`] when the map does not describe a known frame.
+/// [`Error::NotAMap`] when the top-level value is not a map,
+/// [`Error::Decode`] when the map does not describe a known frame, and
+/// [`Error::TrailingBytes`] when a complete frame does not consume the whole
+/// payload.
 pub fn decode<T>(payload: &[u8]) -> Result<T, Error>
 where
     T: DeserializeOwned,
@@ -372,7 +400,23 @@ where
     if !is_map_marker(marker) {
         return Err(Error::NotAMap { marker });
     }
-    Ok(rmp_serde::from_slice(payload)?)
+
+    // `Deserializer::new` over a cursor rather than `from_slice`, because
+    // `position()` is what makes the exhaustion check possible and it is only
+    // exposed on this reader. Every protocol type owns its data, so nothing is
+    // lost by giving up the borrowed-string path.
+    let mut deserializer = rmp_serde::Deserializer::new(io::Cursor::new(payload));
+    let frame = T::deserialize(&mut deserializer)?;
+
+    let consumed = usize::try_from(deserializer.position()).unwrap_or(usize::MAX);
+    if consumed != payload.len() {
+        return Err(Error::TrailingBytes {
+            consumed,
+            total: payload.len(),
+        });
+    }
+
+    Ok(frame)
 }
 
 /// Builds the framing codec: a four-byte big-endian length prefix counting
