@@ -5,3 +5,12 @@
 # the same workflow skills into both directories on every install.
 .claude/
 .omp/
+
+# A separate Git repository with its own remote, holding planning artifacts.
+# Ignored here so it can never be staged into this repository by accident.
+/rasen/
+
+# AGENTS.md is a tracked symlink to CLAUDE.md, so both agent tool families read
+# one file and cannot drift. The global ignore excludes AGENTS.md as tooling
+# noise; in this repository it is content, so the exclusion is reversed here.
+!AGENTS.md
