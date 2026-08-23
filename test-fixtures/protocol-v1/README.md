@@ -6,8 +6,9 @@ prefix that precedes it on the wire.
 
 The set runs in both directions, and that is the point of it. The `rust-*` files
 are produced by `server/tests/fixtures.rs` and decoded by
-`extension/test/fixtures.test.ts`; the `ts-*` files are produced by
-`extension/test/fixtures.test.ts` and decoded by `server/tests/fixtures.rs`.
+`extension/test/unit/fixtures.test.ts`; the `ts-*` files are produced by
+`extension/test/unit/fixtures.test.ts` and decoded by
+`server/tests/fixtures.rs`.
 Neither implementation verifies only its own output, because a round-trip
 through one library agrees with itself no matter what that library does.
 
@@ -37,7 +38,7 @@ the property the whole set depends on, and it is asserted separately in
 
 ```sh
 cd server    && cargo test --test fixtures   # decodes rust-* and ts-*
-cd extension && bun test test/fixtures.test.ts   # decodes rust-* and ts-*
+cd extension && bun test test/unit/fixtures.test.ts   # decodes rust-* and ts-*
 ```
 
 Against **its own** fixtures each side asserts two things:
@@ -72,7 +73,7 @@ file:
 
 ```sh
 cd server    && UPDATE_FIXTURES=1 cargo test --test fixtures        # rust-*
-cd extension && UPDATE_FIXTURES=1 bun test test/fixtures.test.ts    # ts-*
+cd extension && UPDATE_FIXTURES=1 bun test test/unit/fixtures.test.ts   # ts-*
 ```
 
 Then commit the changed files. A regenerated fixture is a protocol change and
