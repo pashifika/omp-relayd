@@ -17,6 +17,8 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
+import { connect } from "node:net";
+
 import {
   RelayClient,
   RequestFailed,
@@ -25,9 +27,13 @@ import {
 } from "../../src/client.ts";
 import type { RelayConfig } from "../../src/config.ts";
 import {
+  encodeFrame,
+  FrameAccumulator,
   MAX_IDENTIFIER_BYTES,
   PROTOCOL_VERSION,
+  validateServerFrame,
   type MessageFrame,
+  type ServerFrame,
 } from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
 import {
@@ -102,6 +108,53 @@ function shared(): RelayProcess {
     throw new Error("the shared relay is not running; setup failed");
   }
   return relay;
+}
+
+/**
+ * Completes one handshake without the client and returns the frame the relay
+ * answered `hello` with.
+ *
+ * The client does not expose `ready.protocol`, and adding that surface for a
+ * test's benefit would be the wrong trade. Reading the bytes off the wire is
+ * what makes the version assertion an observation rather than a restatement of
+ * this side's own constant.
+ */
+async function readyFrameFromWire(port: number, peer: string): Promise<ServerFrame> {
+  const socket = connect({ host: "127.0.0.1", port });
+  const accumulator = new FrameAccumulator();
+  const answered = Promise.withResolvers<ServerFrame>();
+
+  socket.setNoDelay(true);
+  socket.on("error", (error) => answered.reject(error));
+  socket.on("close", () =>
+    answered.reject(new Error("the relay closed without answering hello")),
+  );
+  socket.on("connect", () => {
+    socket.write(encodeFrame({ type: "hello", protocol: PROTOCOL_VERSION, room: ROOM, peer }));
+  });
+  socket.on("data", (chunk: Buffer) => {
+    const outcome = accumulator.push(chunk);
+    for (const value of outcome.values) {
+      const validated = validateServerFrame(value);
+      if (validated.kind === "frame") {
+        answered.resolve(validated.frame);
+      } else {
+        answered.reject(new Error(`the relay sent a ${validated.kind} value`));
+      }
+      return;
+    }
+    if (outcome.failure !== null) {
+      answered.reject(new Error(`framing failure: ${outcome.failure.detail}`));
+    }
+  });
+
+  try {
+    return await answered.promise;
+  } finally {
+    socket.removeAllListeners();
+    socket.on("error", () => {});
+    socket.destroy();
+  }
 }
 
 describe("handshake", () => {
@@ -400,19 +453,14 @@ describe("outages", () => {
 describe("protocol version", () => {
   test("the relay reports the protocol version this client speaks", async () => {
     // `ready.protocol` is the negotiated version. A mismatch here would mean
-    // the two sides disagree about which contract they are following.
-    const observed = Promise.withResolvers<number>();
-    const client = new RelayClient({
-      config: configFor(shared().port, "version-peer"),
-      scheduler: new FakeScheduler(),
-      handlers: {
-        onReady: () => observed.resolve(PROTOCOL_VERSION),
-      },
-    });
+    // the two sides disagree about which contract they are following, so the
+    // value has to be the one the relay put on the wire: resolving it from the
+    // local constant would assert that constant against itself.
+    const frame = await readyFrameFromWire(shared().port, "version-peer");
 
-    client.start();
-    expect(await observed.promise).toBe(PROTOCOL_VERSION);
-
-    await client.stop();
+    expect(frame.type).toBe("ready");
+    if (frame.type !== "ready") return;
+    console.log(`ready.protocol observed on the wire: ${frame.protocol}`);
+    expect(frame.protocol).toBe(PROTOCOL_VERSION);
   });
 });

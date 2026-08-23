@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import {
   backoffDelay,
+  HANDSHAKE_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
   RECONNECT_CAP_MS,
   RECONNECT_INITIAL_MS,
@@ -22,6 +23,7 @@ import {
 } from "../../src/client.ts";
 import type { RelayConfig } from "../../src/config.ts";
 import {
+  encodePayload,
   MAX_BODY_BYTES,
   PROTOCOL_VERSION,
   type MessageFrame,
@@ -72,6 +74,33 @@ function harnessFor(config: RelayConfig): Harness {
 const ADMIT: Script = (frame, session) => {
   if (isFrame(frame, "hello")) {
     session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+  }
+};
+
+/**
+ * A script that answers `send` with a `message` and that send's `receipt` in
+ * one socket write, so both frames reach the client in a single chunk.
+ */
+const COALESCE: Script = (frame, session) => {
+  if (isFrame(frame, "hello")) {
+    session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+  }
+  if (isFrame(frame, "send")) {
+    const message = framePayload(
+      encodePayload({ type: "message", id: "m1", from: "windows-main", body: "hi" }),
+    );
+    const receipt = framePayload(
+      encodePayload({
+        type: "receipt",
+        id: String(frame["id"]),
+        to: "windows-main",
+        status: "routed",
+      }),
+    );
+    const coalesced = new Uint8Array(message.length + receipt.length);
+    coalesced.set(message);
+    coalesced.set(receipt, message.length);
+    session.sendRaw(coalesced);
   }
 };
 
@@ -173,6 +202,138 @@ describe("handshake", () => {
     const peers = await pending;
     expect(peers.peers).toEqual([PEER]);
     expect(relay.received[1]).toEqual({ type: "list", request_id: "req-1" });
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a peers frame arriving before ready does not settle the request it names", async () => {
+    // The `list` was deliberately held back, so a reply naming it answers
+    // nothing: before admission only the handshake's own frames mean anything.
+    let admit: (() => void) | null = null;
+    let impersonate: (() => void) | null = null;
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        admit = () => session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        impersonate = () =>
+          session.send({ type: "peers", request_id: "req-1", peers: ["ghost"] });
+      }
+      if (isFrame(frame, "list")) {
+        session.send({
+          type: "peers",
+          request_id: String(frame["request_id"]),
+          peers: [PEER],
+        });
+      }
+    });
+    const { client, ready, reports } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await relay.awaitReceived(1);
+
+    const pending = client.list("req-1");
+    expect(impersonate).not.toBeNull();
+    impersonate!();
+    await reports.until(1);
+
+    const ignored = reports.last?.message;
+    expect(ignored).toContain("peers");
+    expect(ignored).toContain("before ready");
+    expect(client.pendingRequests).toBe(1);
+
+    expect(admit).not.toBeNull();
+    admit!();
+    await ready.until(1);
+
+    // It resolves after readiness, with the relay's real answer.
+    const peers = await pending;
+    expect(peers.peers).toEqual([PEER]);
+    console.log(
+      `pre-ready peers: "${ignored}"; the held list then resolved with ${peers.peers.join(", ")}`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a message frame arriving before ready does not reach the host", async () => {
+    // Ordered on one connection, so by the time the admitted message arrives
+    // the early one has definitively been handled: no sleep, nothing guessed.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "message", id: "before", from: "windows-main", body: "early" });
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.send({ type: "message", id: "after", from: "windows-main", body: "admitted" });
+      }
+    });
+    const { client, messages, reports } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await messages.until(1);
+
+    expect(messages.observed.map((message) => message.id)).toEqual(["after"]);
+    const notices = reports.observed.map((report) => report.message);
+    expect(notices.some((message) => message.includes("message"))).toBe(true);
+    console.log(
+      `delivered: ${messages.observed.map((message) => message.id).join(", ")}; reported: ${notices.join(" | ")}`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a second ready fails the connection rather than re-running admission", async () => {
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+      }
+    });
+    const { client, scheduler, ready, disconnects } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await disconnects.until(1);
+
+    expect(ready.count).toBe(1);
+    expect(disconnects.last).toContain("second ready");
+    expect(client.state).toBe("connecting");
+    // Failed through the ordinary close path, so the backoff takes over.
+    expect(scheduler.liveOf("timeout")).toHaveLength(1);
+    console.log(
+      `duplicate ready: onReady fired ${ready.count} time(s), disconnected with "${disconnects.last}"`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a peer that accepts the connection and never says ready is abandoned", async () => {
+    // Such a peer sends no `error` and no `close`, so without a deadline of its
+    // own the client stays `connecting` for the life of the process: nothing
+    // else can ever schedule a reconnect.
+    const relay = await ScriptedRelay.start(() => {});
+    const { client, scheduler, disconnects } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await relay.awaitReceived(1);
+
+    const deadline = scheduler.liveOf("timeout", HANDSHAKE_TIMEOUT_MS);
+    expect(deadline).toHaveLength(1);
+
+    scheduler.fire(deadline[0]!);
+    await disconnects.until(1);
+
+    expect(disconnects.last).toContain(`no ready within ${HANDSHAKE_TIMEOUT_MS} ms`);
+    expect(client.state).toBe("connecting");
+
+    const retry = scheduler.liveOf("timeout");
+    expect(retry).toHaveLength(1);
+    expect(retry[0]!.delay).toBeLessThanOrEqual(
+      RECONNECT_INITIAL_MS * (1 + RECONNECT_JITTER),
+    );
+    console.log(
+      `silent peer abandoned: "${disconnects.last}"; retrying in ${retry[0]!.delay} ms`,
+    );
 
     await client.stop();
     await relay.close();
@@ -373,7 +534,11 @@ describe("reconnect", () => {
     scheduler.fireNewest("timeout");
     await disconnects.until(3);
 
-    const rising = scheduler.delaysOf("timeout");
+    // The handshake deadline is a timeout as well, so the reconnect delays are
+    // the ones that are not it.
+    const rising = scheduler
+      .delaysOf("timeout")
+      .filter((delay) => delay !== HANDSHAKE_TIMEOUT_MS);
     expect(rising).toHaveLength(3);
     expect(rising[1]!).toBeGreaterThan(rising[0]!);
     expect(rising[2]!).toBeGreaterThan(rising[1]!);
@@ -387,7 +552,10 @@ describe("reconnect", () => {
     await relay.close();
     await disconnects.until(4);
 
-    const afterReset = scheduler.delaysOf("timeout").at(-1);
+    const afterReset = scheduler
+      .delaysOf("timeout")
+      .filter((delay) => delay !== HANDSHAKE_TIMEOUT_MS)
+      .at(-1);
     expect(afterReset).toBeLessThanOrEqual(
       RECONNECT_INITIAL_MS * (1 + RECONNECT_JITTER),
     );
@@ -627,6 +795,80 @@ describe("request correlation", () => {
     await relay.close();
   });
 
+  test("a correlation token that timed out is refused rather than reused", async () => {
+    // The first request's reply can still arrive. Settling this one with it
+    // would hand the caller a receipt describing a different message.
+    const relay = await ScriptedRelay.start(ADMIT);
+    const { client, scheduler, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const first = client.send({ to: "a", body: "one", id: "msg-1" });
+    scheduler.fireNewest("timeout", REQUEST_TIMEOUT_MS);
+    await expect(first).rejects.toThrow(`no reply within ${REQUEST_TIMEOUT_MS} ms`);
+
+    const reused = client.send({ to: "a", body: "one again", id: "msg-1" });
+    await expect(reused).rejects.toThrow("timed out on this connection");
+
+    // A fresh token is still accepted: the refusal is about the reused one.
+    const fresh = settlement(client.send({ to: "a", body: "two", id: "msg-2" }));
+    await relay.awaitReceived(3);
+
+    expect(relay.received).toHaveLength(3); // hello, msg-1, msg-2: not the reuse
+    expect(relay.received[2]).toEqual({ type: "send", id: "msg-2", to: "a", body: "two" });
+    expect(client.pendingRequests).toBe(1);
+    console.log(
+      `after msg-1 timed out, reuse was refused and msg-2 was written; frames received: ${relay.received.length}`,
+    );
+
+    await client.stop();
+    expect((await fresh).status).toBe("rejected");
+    await relay.close();
+  });
+
+  test("a request that timed out before it was ever written may be reissued", async () => {
+    // Nothing reached the socket, so no late reply can exist to settle the
+    // reissue: refusing the token would deny a caller a retry that is safe.
+    let admit: (() => void) | null = null;
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        admit = () => session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+      }
+      if (isFrame(frame, "list")) {
+        session.send({
+          type: "peers",
+          request_id: String(frame["request_id"]),
+          peers: [PEER],
+        });
+      }
+    });
+    const { client, scheduler, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await relay.awaitReceived(1);
+
+    // Issued while connecting, so it is held rather than written.
+    const early = client.list("req-1");
+    expect(relay.received).toHaveLength(1);
+    scheduler.fireNewest("timeout", REQUEST_TIMEOUT_MS);
+    await expect(early).rejects.toThrow(`no reply within ${REQUEST_TIMEOUT_MS} ms`);
+
+    // Readiness still arrives well inside the handshake deadline.
+    expect(admit).not.toBeNull();
+    admit!();
+    await ready.until(1);
+
+    const retried = await client.list("req-1");
+    expect(retried.peers).toEqual([PEER]);
+    console.log(
+      `an unwritten req-1 timed out; the same token was accepted again and resolved with ${retried.peers.join(", ")}`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
   test("an over-budget body is refused locally, before anything is written", async () => {
     // The relay answers an over-budget body by closing the connection, so
     // sending it would cost an outage rather than a rejected promise.
@@ -755,6 +997,354 @@ describe("failures stay inside the client", () => {
     await client.stop();
     await relay.close();
   });
+
+  test("a handler that returns a rejected promise is reported, not left unhandled", async () => {
+    // The handler types return `void`, and TypeScript accepts an `async`
+    // function there, so this is a shape a host can write by accident. The
+    // synchronous guard around the socket event cannot see the rejection.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.send({ type: "message", id: "m1", from: "windows-main", body: "hi" });
+      }
+    });
+    const reports = new Signal<Report>();
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler: new FakeScheduler(),
+      handlers: {
+        onMessage: async () => {
+          await Promise.resolve();
+          throw new Error("the host's async message handler rejected");
+        },
+        onReport: (report) => reports.fire(report),
+      },
+    });
+
+    client.start();
+    await reports.until(1);
+
+    expect(reports.last?.level).toBe("error");
+    expect(reports.last?.message).toContain("the host's async message handler rejected");
+    expect(client.state).toBe("ready");
+    // `escaped` is asserted empty in `afterEach`: that is the no-unhandled half.
+    console.log(`async rejection contained as: ${reports.last?.message}`);
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a throwing message handler does not cost a coalesced receipt its request", async () => {
+    // One socket write carrying a `message` and the pending `send`'s `receipt`.
+    // A throw that unwound the receive loop would discard the receipt: the
+    // accumulator has already consumed those bytes, so nothing re-emits them
+    // and the request would settle five seconds later as a timeout instead.
+    const relay = await ScriptedRelay.start(COALESCE);
+    const scheduler = new FakeScheduler();
+    const ready = new Signal();
+    const reports = new Signal<Report>();
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler,
+      handlers: {
+        onReady: () => ready.fire(undefined),
+        onMessage: () => {
+          throw new Error("the host's message handler is broken");
+        },
+        onReport: (report) => reports.fire(report),
+      },
+    });
+
+    client.start();
+    await ready.until(1);
+
+    const receipt = await client.send({ to: "windows-main", body: "one", id: "msg-1" });
+
+    expect(receipt.id).toBe("msg-1");
+    expect(receipt.status).toBe("routed");
+    // Settled by its receipt, not by its deadline: no request timeout is left
+    // live, and this scheduler's clock never advanced.
+    expect(scheduler.liveOf("timeout", REQUEST_TIMEOUT_MS)).toHaveLength(0);
+    expect(reports.last?.message).toContain("the host's message handler is broken");
+    console.log(
+      `coalesced chunk: the handler threw and ${receipt.id} still settled as ${receipt.status}`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a handler returning a hostile thenable is contained and costs no frame", async () => {
+    // `then` is host code too. Detecting the thenable outside the guard would
+    // let a throwing getter unwind the receive loop from just outside the
+    // callback, losing the receipt coalesced behind the message -- the same
+    // failure as a throwing handler, through a different door.
+    const relay = await ScriptedRelay.start(COALESCE);
+    const scheduler = new FakeScheduler();
+    const ready = new Signal();
+    const reports = new Signal<Report>();
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler,
+      handlers: {
+        onReady: () => ready.fire(undefined),
+        onMessage: () => ({
+          get then(): never {
+            throw new Error("the host's thenable is broken");
+          },
+        }),
+        onReport: (report) => reports.fire(report),
+      },
+    });
+
+    client.start();
+    await ready.until(1);
+
+    const receipt = await client.send({ to: "windows-main", body: "one", id: "msg-1" });
+
+    expect(receipt.id).toBe("msg-1");
+    expect(receipt.status).toBe("routed");
+    expect(scheduler.liveOf("timeout", REQUEST_TIMEOUT_MS)).toHaveLength(0);
+    expect(reports.last?.message).toContain("the host's thenable is broken");
+    console.log(
+      `hostile thenable contained as "${reports.last?.message}"; ${receipt.id} still settled as ${receipt.status}`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a handler throwing an undescribable value is contained and costs no frame", async () => {
+    // Containment has to survive describing what it caught. Two values are
+    // thrown here rather than one, because they fail at different steps and an
+    // earlier version of the guard caught only the first: a bare
+    // null-prototype object raises inside the conversion, while an `Error`
+    // whose `message` is one converts without complaint and then raises in the
+    // caller's own template literal -- outside the guard, unwinding the receive
+    // loop and losing the receipt coalesced behind the message.
+    const thrown: unknown[] = [
+      Object.create(null),
+      Object.assign(new Error("x"), { message: Object.create(null) as unknown as string }),
+    ];
+    for (const [index, value] of thrown.entries()) {
+      const relay = await ScriptedRelay.start(COALESCE);
+      const scheduler = new FakeScheduler();
+      const ready = new Signal();
+      const reports = new Signal<Report>();
+      const client = new RelayClient({
+        config: configFor(relay.port),
+        scheduler,
+        handlers: {
+          onReady: () => ready.fire(undefined),
+          onMessage: () => {
+            throw value;
+          },
+          onReport: (report) => reports.fire(report),
+        },
+      });
+
+      client.start();
+      await ready.until(1);
+
+      const receipt = await client.send({ to: "windows-main", body: "one", id: `msg-${index}` });
+
+      expect(receipt.id).toBe(`msg-${index}`);
+      expect(receipt.status).toBe("routed");
+      expect(scheduler.liveOf("timeout", REQUEST_TIMEOUT_MS)).toHaveLength(0);
+      expect(reports.last?.message).toContain("could not be described");
+      console.log(
+        `undescribable throw ${index} contained as "${reports.last?.message}"; ${receipt.id} still settled as ${receipt.status}`,
+      );
+
+      await client.stop();
+      await relay.close();
+    }
+  });
+
+  test("a throwing onReport getter is contained and costs no frame", async () => {
+    // Every other containment site funnels its diagnostic through `#report`,
+    // so reading `onReport` is host code on the recovery path. Read outside the
+    // guard, a throwing getter escaped the catch that was handling the first
+    // failure and took the coalesced receipt with it.
+    const relay = await ScriptedRelay.start(COALESCE);
+    const scheduler = new FakeScheduler();
+    const ready = new Signal();
+    let lookups = 0;
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler,
+      handlers: {
+        onReady: () => ready.fire(undefined),
+        onMessage: () => {
+          throw new Error("the host's message handler threw");
+        },
+        get onReport(): never {
+          lookups += 1;
+          throw new Error("the host's reporter getter is broken");
+        },
+      },
+    });
+
+    client.start();
+    await ready.until(1);
+
+    const receipt = await client.send({ to: "windows-main", body: "one", id: "msg-1" });
+
+    expect(receipt.id).toBe("msg-1");
+    expect(receipt.status).toBe("routed");
+    expect(lookups).toBeGreaterThan(0);
+    console.log(
+      `throwing onReport getter read ${lookups} time(s) and contained; ${receipt.id} still settled as ${receipt.status}`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a handler promise rejecting after a restart reports nothing", async () => {
+    // The stale rejection belongs to the run that `stop()` ended. `#stopped`
+    // alone cannot see that: `start()` sets it back to false, so the rejection
+    // would be reported against the run that replaced it.
+    //
+    // The message goes out on the first admission only. Sending it on both
+    // would have run B attach the same held promise, making its rejection a
+    // legitimate report and the assertion below meaningless.
+    let admissions = 0;
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        admissions += 1;
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        if (admissions === 1) {
+          session.send({ type: "message", id: "m1", from: "windows-main", body: "hi" });
+        }
+      }
+    });
+    const held = Promise.withResolvers<void>();
+    const delivered = new Signal();
+    const ready = new Signal();
+    const reports = new Signal<Report>();
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler: new FakeScheduler(),
+      handlers: {
+        onReady: () => ready.fire(undefined),
+        onMessage: () => {
+          delivered.fire(undefined);
+          return held.promise;
+        },
+        onReport: (report) => reports.fire(report),
+      },
+    });
+
+    client.start();
+    await ready.until(1);
+    await delivered.until(1);
+    await client.stop();
+    client.start();
+    // Run B's own readiness, not run A's: waiting for one would return at once
+    // and leave the rejection below racing the restart rather than following it.
+    await ready.until(2);
+
+    const before = reports.count;
+    held.reject(new Error("the host's handler rejected across a restart"));
+    await held.promise.catch(() => {});
+
+    expect(admissions).toBe(2);
+    expect(client.state).toBe("ready");
+    expect(reports.count).toBe(before);
+    console.log(
+      `across a restart (${admissions} admissions) a late rejection produced ${reports.count - before} further report(s)`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a handler promise that rejects after shutdown reports nothing", async () => {
+    // `stop()` tells its caller that no callback fires afterwards. A promise
+    // the host is still holding is the one path that can outlive it.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.send({ type: "message", id: "m1", from: "windows-main", body: "hi" });
+      }
+    });
+    const held = Promise.withResolvers<void>();
+    const delivered = new Signal();
+    const reports = new Signal<Report>();
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler: new FakeScheduler(),
+      handlers: {
+        onMessage: () => {
+          delivered.fire(undefined);
+          return held.promise;
+        },
+        onReport: (report) => reports.fire(report),
+      },
+    });
+
+    client.start();
+    await delivered.until(1);
+    await client.stop();
+
+    const before = reports.count;
+    held.reject(new Error("the host's handler rejected after shutdown"));
+    // The client attached its rejection handler first, so awaiting the same
+    // promise here resumes after it: a barrier rather than a guessed tick.
+    await held.promise.catch(() => {});
+
+    expect(reports.count).toBe(before);
+    console.log(
+      `after stop() a late rejection produced ${reports.count - before} further report(s)`,
+    );
+
+    await relay.close();
+  });
+
+  test("a throwing disconnect handler does not stop the reconnect", async () => {
+    // The throw used to be swallowed by the outer guard, which sits above the
+    // only call that arms a reconnect: the client was left with no socket, no
+    // timer, and no event that could ever arrive.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.drop();
+      }
+    });
+    const scheduler = new FakeScheduler();
+    const disconnects = new Signal<string>();
+    const reports = new Signal<Report>();
+    const client = new RelayClient({
+      config: configFor(relay.port),
+      scheduler,
+      handlers: {
+        onDisconnect: (reason) => {
+          disconnects.fire(reason);
+          throw new Error("the host's disconnect handler is broken");
+        },
+        onReport: (report) => reports.fire(report),
+      },
+    });
+
+    client.start();
+    await disconnects.until(1);
+
+    const retry = scheduler.liveOf("timeout");
+    expect(retry).toHaveLength(1);
+    expect(client.state).toBe("connecting");
+    expect(
+      reports.observed.some((report) =>
+        report.message.includes("the host's disconnect handler is broken"),
+      ),
+    ).toBe(true);
+    console.log(
+      `the disconnect handler threw; a reconnect is still armed for ${retry[0]!.delay} ms`,
+    );
+
+    await client.stop();
+    await relay.close();
+  });
 });
 
 describe("the host owns every timer", () => {
@@ -768,7 +1358,11 @@ describe("the host owns every timer", () => {
     const realSetInterval = globalThis.setInterval;
 
     const relay = await ScriptedRelay.start(ADMIT);
-    const clientDelays = new Set([REQUEST_TIMEOUT_MS, HEARTBEAT_INTERVAL_MS]);
+    const clientDelays = new Set([
+      REQUEST_TIMEOUT_MS,
+      HEARTBEAT_INTERVAL_MS,
+      HANDSHAKE_TIMEOUT_MS,
+    ]);
 
     // @ts-expect-error deliberately replacing an ambient global for the duration
     globalThis.setTimeout = (callback: () => void, delay?: number) => {
@@ -789,6 +1383,7 @@ describe("the host owns every timer", () => {
 
       expect(scheduler.delaysOf("interval")).toContain(HEARTBEAT_INTERVAL_MS);
       expect(scheduler.delaysOf("timeout")).toContain(REQUEST_TIMEOUT_MS);
+      expect(scheduler.delaysOf("timeout")).toContain(HANDSHAKE_TIMEOUT_MS);
 
       const leaked = ambientDelays.filter((delay) => clientDelays.has(delay));
       expect(leaked).toEqual([]);
@@ -840,6 +1435,32 @@ describe("the host owns every timer", () => {
     console.log(
       `shutdown cancelled all ${before} timer(s) created; ${scheduler.live.length} remain live`,
     );
+  });
+
+  test("shutdown cancels a handshake deadline that never came due", async () => {
+    // The one timer that exists only while connecting, which the test above --
+    // running from a ready connection -- cannot cover.
+    const relay = await ScriptedRelay.start(() => {});
+    const { client, scheduler } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await relay.awaitReceived(1);
+
+    const deadline = scheduler.liveOf("timeout", HANDSHAKE_TIMEOUT_MS);
+    expect(deadline).toHaveLength(1);
+
+    await client.stop();
+
+    expect(deadline[0]!.cancelled).toBe(true);
+    expect(scheduler.live).toHaveLength(0);
+    // Firing a cancelled timer is refused, which is the assertion: no live
+    // callback is left to fail a connection that is already gone.
+    expect(() => scheduler.fire(deadline[0]!)).toThrow();
+    console.log(
+      `handshake deadline of ${deadline[0]!.delay} ms cancelled by shutdown; ${scheduler.live.length} timer(s) remain live`,
+    );
+
+    await relay.close();
   });
 
   test("without a supplied scheduler the client uses the ambient timers and behaves the same", async () => {

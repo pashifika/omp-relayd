@@ -63,6 +63,16 @@ export const REQUEST_TIMEOUT_MS = 5_000;
  */
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 
+/**
+ * Deadline for `ready` to arrive after the socket opens.
+ *
+ * Twice the relay's own five-second `hello` deadline, so a relay still inside
+ * its own handshake window is never abandoned, while a peer that accepts the
+ * connection and then says nothing becomes an ordinary reconnect instead of
+ * leaving the client `connecting` for the life of the process.
+ */
+export const HANDSHAKE_TIMEOUT_MS = 10_000;
+
 /** Delay before the first reconnect attempt of an outage. */
 export const RECONNECT_INITIAL_MS = 500;
 
@@ -237,6 +247,20 @@ export function backoffDelay(attempt: number, random: () => number): number {
 }
 
 /**
+ * `value` as a promise, when it is one.
+ *
+ * Every host handler type returns `void`, and TypeScript accepts an `async`
+ * function wherever a `void`-returning one is expected, so any of them may hand
+ * back a promise whose rejection a synchronous `try`/`catch` cannot observe.
+ * Tested by `then` rather than by `instanceof Promise`, because the promise may
+ * come from another realm or another library.
+ */
+function asThenable(value: unknown): PromiseLike<unknown> | null {
+  const candidate = value as PromiseLike<unknown> | null;
+  return typeof candidate?.then === "function" ? candidate : null;
+}
+
+/**
  * A connection to one relay, for one room and one peer name.
  *
  * Construction does nothing observable. {@link start} begins connecting and
@@ -249,13 +273,32 @@ export class RelayClient {
   readonly #scheduler: Scheduler;
   readonly #handlers: RelayClientHandlers;
   readonly #pending = new Map<string, PendingRequest>();
+  /**
+   * Correlation keys whose request timed out on the current connection.
+   *
+   * A reply later than the deadline still names one, so reissuing it would let
+   * that reply settle a different request. Cleared when the connection ends,
+   * which is the whole scope over which such a reply is possible.
+   */
+  readonly #timedOut = new Set<string>();
 
   #state: ClientState = "stopped";
   #stopped = true;
+  /**
+   * Which run of this client is current, incremented by every `stop()`.
+   *
+   * `#stopped` alone cannot isolate a detached rejection: a handler's promise
+   * may still be pending when `stop()` resolves, and a later `start()` sets
+   * that flag back to false, so the stale rejection would be reported against
+   * the run that replaced it. Comparing the run it was attached in keeps
+   * `stop()`'s promise that no callback fires afterwards.
+   */
+  #generation = 0;
   #socket: Socket | null = null;
   #accumulator: FrameAccumulator | null = null;
   #heartbeat: TimerHandle | null = null;
   #reconnect: TimerHandle | null = null;
+  #handshake: TimerHandle | null = null;
   #attempt = 0;
   /**
    * Whether the current outage has already been reported.
@@ -314,9 +357,12 @@ export class RelayClient {
    */
   async stop(): Promise<void> {
     this.#stopped = true;
+    this.#generation += 1;
     this.#state = "stopped";
     this.#cancelReconnect();
+    this.#clearHandshakeDeadline();
     this.#clearHeartbeat();
+    this.#timedOut.clear();
     this.#failPending(new RequestFailed("stopped", "the client was stopped"));
 
     const socket = this.#socket;
@@ -473,6 +519,9 @@ export class RelayClient {
 
     socket.on("connect", () => {
       this.#guard("connect", () => {
+        // Armed before the write, so nothing can leave the client waiting on a
+        // peer that accepted the connection and then said nothing.
+        this.#armHandshakeDeadline(socket);
         this.#write({
           type: "hello",
           protocol: PROTOCOL_VERSION,
@@ -511,7 +560,7 @@ export class RelayClient {
       const validated = validateServerFrame(value);
       switch (validated.kind) {
         case "frame":
-          this.#dispatch(validated.frame);
+          this.#dispatch(socket, validated.frame);
           break;
         case "ignorable":
           // Forward compatibility: a relay one version ahead may send a frame
@@ -539,15 +588,39 @@ export class RelayClient {
     }
   }
 
-  #dispatch(frame: ServerFrame): void {
+  /**
+   * Routes one validated server frame, honouring the connection phase.
+   *
+   * Before `ready` the client has written nothing but `hello`, so a `peers`,
+   * `receipt`, or `message` answers nothing: delivering one would settle a
+   * request that was deliberately never written, or hand the host a message
+   * from a connection that has not been admitted. Only the handshake's own two
+   * answers mean anything there.
+   *
+   * A second `ready` is a protocol violation rather than a re-admission:
+   * re-running the readiness path would re-fire `onReady`, re-arm the
+   * heartbeat, and re-flush, so the connection is failed instead.
+   */
+  #dispatch(socket: Socket, frame: ServerFrame): void {
+    if (this.#state === "ready") {
+      if (frame.type === "ready") {
+        this.#closeConnection(socket, "the relay sent a second ready frame");
+        return;
+      }
+    } else if (frame.type !== "ready" && frame.type !== "error") {
+      this.#report("warn", `ignored a ${frame.type} frame received before ready`);
+      return;
+    }
+
     switch (frame.type) {
       case "ready":
         this.#state = "ready";
         this.#attempt = 0;
         this.#outageReported = false;
+        this.#clearHandshakeDeadline();
         this.#armHeartbeat();
         this.#flushUnwritten();
-        this.#handlers.onReady?.();
+        this.#notify("onReady", () => this.#handlers.onReady?.());
         break;
 
       case "pong":
@@ -555,7 +628,7 @@ export class RelayClient {
         break;
 
       case "message":
-        this.#handlers.onMessage?.(frame);
+        this.#notify("onMessage", () => this.#handlers.onMessage?.(frame));
         break;
 
       case "peers":
@@ -619,7 +692,10 @@ export class RelayClient {
     }
     this.#socket = null;
     this.#accumulator = null;
+    this.#clearHandshakeDeadline();
     this.#clearHeartbeat();
+    // A late reply can only name a token from the connection that is ending.
+    this.#timedOut.clear();
     this.#state = this.#stopped ? "stopped" : "connecting";
 
     socket.removeAllListeners();
@@ -629,11 +705,13 @@ export class RelayClient {
     socket.destroy();
 
     this.#failPending(new RequestFailed("disconnected", reason));
-    this.#handlers.onDisconnect?.(reason);
 
+    // Recovery is armed before the host is told, so that reconnecting cannot
+    // depend on what the host's handler does.
     if (!this.#stopped) {
       this.#scheduleReconnect(reason);
     }
+    this.#notify("onDisconnect", () => this.#handlers.onDisconnect?.(reason));
   }
 
   #scheduleReconnect(reason: string): void {
@@ -663,6 +741,34 @@ export class RelayClient {
     if (this.#reconnect !== null) {
       this.#scheduler.clearTimeout(this.#reconnect);
       this.#reconnect = null;
+    }
+  }
+
+  /**
+   * Arms the deadline for `ready` on a freshly opened connection.
+   *
+   * The heartbeat cannot serve as this deadline: its callback returns unless
+   * the state is already `ready`, so it is inert during exactly the phase this
+   * covers. Expiry goes through the ordinary close path, so a silent peer ends
+   * up on the same backoff as an unreachable one.
+   */
+  #armHandshakeDeadline(socket: Socket): void {
+    this.#clearHandshakeDeadline();
+    this.#handshake = this.#scheduler.setTimeout(() => {
+      this.#handshake = null;
+      this.#guard("handshake deadline", () => {
+        this.#closeConnection(
+          socket,
+          `no ready within ${HANDSHAKE_TIMEOUT_MS} ms of connecting`,
+        );
+      });
+    }, HANDSHAKE_TIMEOUT_MS);
+  }
+
+  #clearHandshakeDeadline(): void {
+    if (this.#handshake !== null) {
+      this.#scheduler.clearTimeout(this.#handshake);
+      this.#handshake = null;
     }
   }
 
@@ -725,6 +831,16 @@ export class RelayClient {
       });
       return;
     }
+    if (this.#timedOut.has(key)) {
+      settle({
+        ok: false,
+        error: new RequestFailed(
+          "invalid_request",
+          `a ${kind} with correlation token ${JSON.stringify(token)} timed out on this connection; its late reply would settle this request instead`,
+        ),
+      });
+      return;
+    }
 
     let encoded: Uint8Array;
     try {
@@ -746,6 +862,12 @@ export class RelayClient {
     entry.timer = this.#scheduler.setTimeout(() => {
       entry.timer = null;
       this.#guard("request timeout", () => {
+        // Tombstoned only once the frame has actually reached the socket. A
+        // request still holding its encoding was never sent, so no late reply
+        // can exist and its token stays free for a retry.
+        if (entry.unwritten === null) {
+          this.#timedOut.add(key);
+        }
         this.#settleKey(key, {
           ok: false,
           error: new RequestFailed(
@@ -868,13 +990,50 @@ export class RelayClient {
     }
   }
 
-  #report(level: ReportLevel, message: string): void {
-    const handler = this.#handlers.onReport;
-    if (handler === undefined) {
-      return;
-    }
+  /**
+   * Invokes one host callback so that neither a synchronous throw nor a
+   * rejected promise can reach the host process or the client's own control
+   * flow.
+   *
+   * Containment at the socket-event boundary is not enough: a `#guard` around
+   * the whole event still loses every frame that event had left to dispatch,
+   * and it cannot see a rejection at all.
+   */
+  #notify(site: string, call: () => unknown): void {
+    // Captured at attach time, not read at rejection time: see `#generation`.
+    const generation = this.#generation;
     try {
-      handler({ level, message });
+      // Inspecting the return value stays inside the guard: the thenable is
+      // host code too, so reading `then` or calling it can throw, and a throw
+      // out here would unwind the frame loop exactly as one from the callback
+      // itself would.
+      void asThenable(call())?.then(undefined, (error: unknown) => {
+        // `stop()` promises its caller that no callback fires afterwards, and
+        // a detached rejection is the one path that can outlive it.
+        if (this.#stopped || generation !== this.#generation) {
+          return;
+        }
+        this.#report("error", `the host's ${site} handler rejected: ${describe(error)}`);
+      });
+    } catch (error) {
+      this.#report("error", `the host's ${site} handler failed: ${describe(error)}`);
+    }
+  }
+
+  #report(level: ReportLevel, message: string): void {
+    try {
+      // Read inside the guard: `onReport` may be a getter, and this is the one
+      // path every other containment site funnels its diagnostic through, so a
+      // throw here would escape the guard that called it.
+      const handler = this.#handlers.onReport;
+      if (handler === undefined) {
+        return;
+      }
+      const returned: unknown = handler({ level, message });
+      // Not routed through `#notify`: a reporter's own failure has nowhere to
+      // be reported. Attaching to its rejection is still required, or an async
+      // reporter turns a logging fault into an unhandled rejection.
+      void asThenable(returned)?.then(undefined, () => {});
     } catch {
       // A host whose own reporter throws cannot be told about it. Swallowing is
       // the only option that does not escalate a logging fault into a crash.
