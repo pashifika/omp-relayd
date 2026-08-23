@@ -264,6 +264,23 @@ jobs:
         timeout-minutes: 5
         run: bun run test:packaging
 
+      # `test:packaging` rebuilds `dist/index.js` before loading it, so a green
+      # packaging step proves that a fresh bundle builds and loads -- never that
+      # the committed one matches the source beside it. The README tells an
+      # operator to load the committed file directly after `git clone`, with no
+      # build step, so without this a pull request carrying an innocuous source
+      # diff and a substituted bundle would merge green.
+      - name: Verify the committed bundle matches the one built from source
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # A pathspec matching nothing makes `git diff` exit 0, so the path is
+          # confirmed tracked before its diff is trusted. Paths are relative to
+          # this job's `extension` working directory.
+          git ls-files --error-unmatch dist/index.js
+          git diff --exit-code -- dist/index.js
+
   # Runtime job. Proves the two implementations actually agree, by running the
   # TypeScript client against the real relay binary rather than against a mock.
   #
