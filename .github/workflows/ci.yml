@@ -260,6 +260,10 @@ jobs:
         timeout-minutes: 5
         run: bun run test:unit
 
+      - name: Build and smoke-test the standalone extension bundle
+        timeout-minutes: 5
+        run: bun run test:packaging
+
   # Runtime job. Proves the two implementations actually agree, by running the
   # TypeScript client against the real relay binary rather than against a mock.
   #

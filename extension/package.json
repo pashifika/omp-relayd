@@ -3,18 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "OMP Relay client library: protocol v1 over TCP, no OMP dependency",
+  "description": "OMP Relay client and OMP extension for protocol v1 over TCP",
   "license": "MIT",
   "scripts": {
+    "build": "bun build src/index.ts --target=bun --format=esm --outdir=dist",
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration --timeout 20000",
+    "test:packaging": "bun run build && bun test test/packaging",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@msgpack/msgpack": "3.1.3"
   },
   "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.0.1",
     "@types/bun": "1.3.14",
     "typescript": "5.9.3"
   }
