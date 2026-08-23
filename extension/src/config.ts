@@ -226,7 +226,13 @@ export interface ResolvedClient {
   readonly purpose: string | null;
   readonly sources: ResolvedSources;
   readonly globalPath: string;
-  /** The project file that supplied the room, or `null` when none was read. */
+  /**
+   * The project file that was read, or `null` when the root holds none.
+   *
+   * "Read" rather than "supplied the room": the file is always read so its
+   * placement is validated, and {@link ResolvedSources} is what says whether
+   * anything came from it.
+   */
   readonly projectPath: string | null;
   readonly projectRoot: ProjectRoot;
 }
@@ -661,20 +667,19 @@ export async function resolveWithGlobal(
   const parameters = options.parameters ?? {};
   const projectRoot = resolveProjectRoot(options.env, options.cwd);
 
-  // Only read the project file when it can still contribute. Both room halves
-  // supplied as parameters means a checkout with no committed file, or an
-  // unreadable one, is no obstacle to joining.
-  const needsProjectFile = parameters.project === undefined || parameters.task === undefined;
-  let projectFile: ProjectConfig = { project: null, task: null };
-  let projectPath: string | null = null;
-  if (needsProjectFile) {
-    const loaded = await loadProjectConfig(projectConfigPath(projectRoot.path));
-    if (!loaded.ok) {
-      return { ok: false, path: loaded.path, absent: false, problem: loaded.problem };
-    }
-    projectFile = loaded.config;
-    projectPath = loaded.path;
+  // Read unconditionally, even when both room halves arrive as parameters and
+  // the file can contribute nothing. Placement is a rule about the file rather
+  // than about this call: skipping the read when the values were not needed
+  // would make "a project file may not name `transport`" hold only on the paths
+  // that happened to consult it, and the guarantee that a misplaced field is
+  // never silently ignored is not one that can be conditional on how the
+  // operator chose to join.
+  const loaded = await loadProjectConfig(projectConfigPath(projectRoot.path));
+  if (!loaded.ok) {
+    return { ok: false, path: loaded.path, absent: false, problem: loaded.problem };
   }
+  const projectFile = loaded.config;
+  const projectPath = loaded.path;
 
   const project = parameters.project ?? projectFile.project;
   const task = parameters.task ?? projectFile.task;

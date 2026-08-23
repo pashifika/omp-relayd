@@ -496,11 +496,17 @@ export default function ompRelay(pi: ExtensionAPI): void {
   /**
    * The purpose still owed to this session, under `auto` only.
    *
-   * Set at connect and cleared by the first inbound message. Under `manual` the
-   * join result carries it, so nothing is owed; under `auto` there is no call to
-   * return it from and no operator present at connect time, so it rides the
-   * first message — the moment work arrives is the moment the policy matters,
-   * and once per session is enough because the text is then in the transcript.
+   * Armed once, where the session begins, and cleared by the first inbound
+   * message. Deliberately not armed in {@link connect}: a `join` is a new
+   * connection but the same session, so arming there would re-owe a debt the
+   * session had already been paid and deliver the same operator text twice —
+   * which the capability forbids in as many words.
+   *
+   * Under `manual` nothing is ever owed, because the join result carries the
+   * text to the caller that asked. Under `auto` there is no call to return it
+   * from and no operator present at connect time, so it rides the first
+   * message: the moment work arrives is the moment the policy matters, and once
+   * is enough because the text is then in the transcript.
    */
   let pendingPurpose: string | null = null;
 
@@ -562,8 +568,8 @@ export default function ompRelay(pi: ExtensionAPI): void {
     });
     client = next;
     live = { config, startup: resolved.startup };
-    // Owed only under `auto`; a manual join returns the text to its caller.
-    pendingPurpose = resolved.startup === "auto" ? resolved.purpose : null;
+    // Not armed here. See {@link pendingPurpose}: a rejoin is a new connection
+    // within one session, and the debt belongs to the session.
     next.start();
     return next;
   };
@@ -744,6 +750,9 @@ export default function ompRelay(pi: ExtensionAPI): void {
       notifyOnce(ctx, outcome.problem.reason, "error");
       return;
     }
+    // The session's one debt, incurred where the session begins. `startup` is
+    // `auto` on this path by construction, so no mode test is needed.
+    pendingPurpose = outcome.resolved.purpose;
     connect(ctx, outcome.resolved);
   });
 

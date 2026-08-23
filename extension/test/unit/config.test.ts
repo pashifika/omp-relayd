@@ -408,6 +408,32 @@ describe("field placement is enforced by name and by file", () => {
     expect(outcome.problem.reason).toContain(globalPath);
     console.log(`global file naming room: ${outcome.problem.reason}`);
   });
+
+  test.each([
+    ["neither", {}],
+    ["both room halves", { project: "acme", task: "pr-471" }],
+  ])(
+    "a project file naming transport is rejected when the join supplies %s",
+    async (_label, parameters) => {
+      // The guarantee is that a misplaced field is never *silently ignored*, so
+      // it cannot hold only on the paths that happened to consult the file.
+      // Skipping the read when the values were not needed made the rejection
+      // depend on how the operator chose to join.
+      const scope = await machine({
+        project: `${PROJECT}transport:\n  mode: local\n  address: 10.0.0.1:9999\n`,
+      });
+
+      const outcome = await resolveClient({ env: scope.env, cwd: scope.projectRoot, parameters });
+
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) return;
+      expect(outcome.problem.field).toBe("transport");
+      expect(outcome.problem.reason).toContain(scope.projectPath);
+      console.log(
+        `join supplying ${Object.keys(parameters).length} parameter(s): refused at ${outcome.problem.field}`,
+      );
+    },
+  );
 });
 
 describe("loading", () => {
@@ -442,6 +468,36 @@ describe("loading", () => {
     if (!outcome.ok) return;
     expect(outcome.path).toBeNull();
     expect(outcome.config).toEqual({ project: null, task: null });
+  });
+
+  test("unparseable YAML in the project file is reported naming that file", async () => {
+    // The scenario says *either* file. Only the global half was covered, which
+    // left the project half working by construction rather than by contract.
+    const scope = await machine({ project: "room:\n  project: p\n : : :\n" });
+    const outcome = await loadProjectConfig(scope.projectPath);
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.path).toBe(scope.projectPath);
+    expect(outcome.problem.field).toBeNull();
+    expect(outcome.problem.reason).toContain("not valid YAML");
+    expect(outcome.problem.reason).toContain(scope.projectPath);
+    console.log(`unparseable project file: ${outcome.problem.reason}`);
+  });
+
+  test("an unparseable project file stops a join that did not need it", async () => {
+    // Reading is unconditional, so a broken committed file is reported even
+    // when both room halves arrived as parameters.
+    const scope = await machine({ project: "room:\n  project: p\n : : :\n" });
+    const outcome = await resolveClient({
+      env: scope.env,
+      cwd: scope.projectRoot,
+      parameters: { project: "acme", task: "pr-471" },
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.problem.reason).toContain("not valid YAML");
   });
 });
 

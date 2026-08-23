@@ -2458,17 +2458,12 @@ async function resolveClient(options) {
 async function resolveWithGlobal(global, globalPath, options) {
   const parameters = options.parameters ?? {};
   const projectRoot = resolveProjectRoot(options.env, options.cwd);
-  const needsProjectFile = parameters.project === undefined || parameters.task === undefined;
-  let projectFile = { project: null, task: null };
-  let projectPath = null;
-  if (needsProjectFile) {
-    const loaded = await loadProjectConfig(projectConfigPath(projectRoot.path));
-    if (!loaded.ok) {
-      return { ok: false, path: loaded.path, absent: false, problem: loaded.problem };
-    }
-    projectFile = loaded.config;
-    projectPath = loaded.path;
+  const loaded = await loadProjectConfig(projectConfigPath(projectRoot.path));
+  if (!loaded.ok) {
+    return { ok: false, path: loaded.path, absent: false, problem: loaded.problem };
   }
+  const projectFile = loaded.config;
+  const projectPath = loaded.path;
   const project = parameters.project ?? projectFile.project;
   const task = parameters.task ?? projectFile.task;
   if (project === null || task === null) {
@@ -2861,7 +2856,6 @@ function ompRelay(pi) {
     });
     client = next;
     live = { config, startup: resolved.startup };
-    pendingPurpose = resolved.startup === "auto" ? resolved.purpose : null;
     next.start();
     return next;
   };
@@ -2986,6 +2980,7 @@ function ompRelay(pi) {
       notifyOnce(ctx, outcome.problem.reason, "error");
       return;
     }
+    pendingPurpose = outcome.resolved.purpose;
     connect2(ctx, outcome.resolved);
   });
   pi.on("session_shutdown", async () => {

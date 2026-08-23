@@ -621,6 +621,47 @@ describe("joining a live session", () => {
     }
   });
 
+  test("renaming the peer reconnects and the relay reports the new name", async () => {
+    // The sibling of the changed-task case, and the one the capability states
+    // separately: `as` is the other half of what `join` may change, and the
+    // roster the relay answers with is where the new name has to appear.
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      await harness.mesh({ action: "join" });
+      recorder.peers = ["second-terminal"];
+      const renamed = await harness.mesh({ action: "join", as: "second-terminal" });
+
+      expect(relay.connections).toBe(2);
+      expect(relay.open).toBe(1);
+      // The room is unchanged; only the identity registered under it moved.
+      expect(recorder.hellos).toEqual([
+        { ...ROOM, peer: PEER },
+        { ...ROOM, peer: "second-terminal" },
+      ]);
+      expect(renamed.details["unchanged"]).toBe(false);
+      expect(renamed.details["peer"]).toBe("second-terminal");
+      expect(renamed.details["peers"]).toEqual(["second-terminal"]);
+      expect(renamed.details["sources"]).toEqual({
+        project: "project-file",
+        task: "project-file",
+        peer: "parameter",
+      });
+      console.log(
+        `rename: relay saw peers ${recorder.hellos.map((h) => h.peer).join(" then ")}; roster after rename ${JSON.stringify(renamed.details["peers"])}`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
   test("two concurrent joins leave exactly one client", async () => {
     const recorder = recordingRelay();
     const relay = await ScriptedRelay.start(recorder.script);
@@ -726,6 +767,41 @@ describe("the machine's purpose under automatic startup", () => {
       expect(second.split("\n")[0]).toBe("Remote message from alpha");
       console.log(
         `auto session: message 1 carried the purpose preamble (${first.split("\n").length} lines), message 2 did not (${second.split("\n").length} lines)`,
+      );
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a rejoin does not re-owe the purpose the session was already paid", async () => {
+    // "Once per session", not once per connection. A `join` opens a new
+    // connection within the same session, and arming the debt at connect made
+    // the same operator text arrive a second time -- which the second
+    // assertion above cannot see, because it never rejoins.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { purpose });
+      await relay.awaitReceived(1);
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+
+      await harness.mesh({ action: "join", task: "another-room" });
+      expect(relay.connections).toBe(2);
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-2" });
+      await harness.calls.injected.until(2);
+
+      const carried = harness.calls.userMessages.map((entry) =>
+        String(entry.content).includes(purpose),
+      );
+      expect(carried).toEqual([true, false]);
+      console.log(
+        `across a rejoin (${relay.connections} connections, 1 session): purpose carried by message ${carried.map((c, i) => (c ? i + 1 : null)).filter((v) => v !== null).join(", ")} only`,
       );
 
       await shutdown();
