@@ -194,3 +194,112 @@ fn receipt_fixture_encodes_its_status_as_a_string() {
         "the receipt fixture must spell its status out: {committed:02x?}"
     );
 }
+
+/// Checks a fixture produced by the *other* implementation.
+///
+/// Deliberately not [`check_fixture`]. That function also asserts that a fresh
+/// encode reproduces the committed bytes, which is the right check for this
+/// crate's own output and the wrong one here: `wire-protocol` requires the two
+/// languages to agree on decoded *values*, not on bytes. Demanding byte
+/// equality would couple this crate to `@msgpack/msgpack`'s encoder choices and
+/// fail on a difference that breaks nothing.
+///
+/// A missing file is a hard failure rather than a regeneration, because this
+/// side cannot produce a TypeScript fixture: run `bun test` in `extension/`.
+fn check_foreign_fixture<T>(name: &str, expected: &T, risk: &str)
+where
+    T: DeserializeOwned + PartialEq + Debug,
+{
+    let path = fixture_dir().join(name);
+    let committed = fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "{name} is missing ({error}). It is produced by the TypeScript side; \
+             run `bun test` in `extension/` and commit the result."
+        )
+    });
+
+    let decoded: T = protocol::decode(&committed).unwrap_or_else(|error| {
+        panic!(
+            "{name} ({} bytes) did not decode as a protocol frame: {error}. \
+             Risk no longer covered: {risk}",
+            committed.len()
+        )
+    });
+    assert_eq!(
+        &decoded, expected,
+        "{name} decoded to a different value than the contract documents, so {risk} \
+         is no longer covered"
+    );
+
+    println!(
+        "{name}: {} bytes from the TypeScript implementation, covering {risk}",
+        committed.len()
+    );
+}
+
+#[test]
+fn typescript_hello_fixture_carries_a_nested_room_map() {
+    check_foreign_fixture(
+        "ts-hello.msgpack",
+        &ClientFrame::Hello {
+            protocol: PROTOCOL_VERSION,
+            room: RoomId::new("omp-relayd", "implement-relay-client-library"),
+            peer: "macbook-reviewer".to_owned(),
+        },
+        "a nested room map, decoded through RoomId's map-only deserializer",
+    );
+
+    // [`RoomId`] rejects a positional room, and `deny_unknown_fields` on
+    // [`NestedRoomOnly`] rejects a flattened one, so decoding through that type
+    // proves the shape rather than only the values -- exactly as the
+    // Rust-produced hello fixture is checked.
+    let committed = fs::read(fixture_dir().join("ts-hello.msgpack")).expect("read the fixture");
+    let hello: NestedRoomOnly = protocol::decode(&committed).expect(
+        "the TypeScript hello fixture must decode as a map carrying `room` as a nested map",
+    );
+    assert_eq!(hello.r#type, "hello");
+    assert_eq!(hello.protocol, PROTOCOL_VERSION);
+    assert_eq!(hello.peer, "macbook-reviewer");
+    assert_eq!(
+        (hello.room.project.as_str(), hello.room.task.as_str()),
+        ("omp-relayd", "implement-relay-client-library")
+    );
+}
+
+#[test]
+fn typescript_send_fixture_yields_reply_to_as_none() {
+    check_foreign_fixture(
+        "ts-send.msgpack",
+        &ClientFrame::Send {
+            id: "msg-1".to_owned(),
+            to: "windows-main".to_owned(),
+            body: "review the diff".to_owned(),
+            reply_to: None,
+        },
+        "an absent optional field omitted by the TypeScript encoder, not sent as nil",
+    );
+
+    // `reply_to: None` above would also be satisfied by an explicit nil, which
+    // the decoder accepts on purpose. The key's absence is the property this
+    // fixture exists to pin, so it is asserted over the bytes.
+    let committed = fs::read(fixture_dir().join("ts-send.msgpack")).expect("read the fixture");
+    assert!(
+        !committed
+            .windows(b"reply_to".len())
+            .any(|window| window == b"reply_to"),
+        "the TypeScript send fixture must contain no reply_to key: {committed:02x?}"
+    );
+}
+
+#[test]
+fn typescript_receipt_fixture_decodes_its_status_from_a_string() {
+    check_foreign_fixture(
+        "ts-receipt.msgpack",
+        &ServerFrame::Receipt {
+            id: "msg-1".to_owned(),
+            to: "windows-main".to_owned(),
+            status: ReceiptStatus::RecipientBackpressure,
+        },
+        "an enum the TypeScript side spells as a snake_case string",
+    );
+}
