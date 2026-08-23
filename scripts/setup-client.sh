@@ -85,8 +85,9 @@ Files written:
   <project-root>/.omp/${CONFIG_FILE_NAME}         room
   <agent-dir>/skills/${SKILL_NAME}/          the collaboration skill (always refreshed)
 
-Neither configuration file is replaced without --force: the global file may hold
-a purpose you wrote, and the project file may hold a room a colleague committed.
+The global file is refused without --force; it may hold a purpose you wrote. An
+existing project file is instead kept and named: it holds the room a colleague
+committed, so --project and --task decide nothing, and --force replaces it.
 
 What this script will not do:
   * It installs no toolchain. A missing bun is reported with the version this
@@ -109,6 +110,20 @@ byte_length() {
   printf '%s' "$1" | wc -c | tr -d ' '
 }
 
+# A double-quoted YAML scalar, because the identifier rules permit '#', ': ', a
+# leading '!', and newlines, none of which survive an unquoted plain scalar:
+# `task: #471` is a comment, `task: a: b` is not YAML at all, and a newline
+# composes whatever the operator's value says next. Shell quoting quotes the
+# shell, not the file this writes.
+yaml_scalar() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "$value"
+}
+
 # The `wire-protocol` identifier rules, refused by name and by value so the
 # operator sees which of their inputs was rejected.
 validate_identifier() {
@@ -125,6 +140,52 @@ validate_identifier() {
   bytes="$(byte_length "$value")"
   if [ "$bytes" -gt "$MAX_IDENTIFIER_BYTES" ]; then
     fail "$label \"$value\" is $bytes UTF-8 bytes, above the $MAX_IDENTIFIER_BYTES-byte limit"
+  fi
+}
+
+# Mirrors `parseAddress` in `extension/src/config.ts`, which asks more than a
+# colon and a number: an IPv6 literal must be bracketed, the host may not be
+# empty, and an unbracketed second colon is the ambiguity the brackets exist to
+# remove. A weaker grammar here accepts `host:80:90` and `:7788` and writes a
+# file the extension then rejects.
+validate_address() {
+  local value="$1" host port_text after digits
+
+  case "$value" in
+    '['*)
+      case "$value" in
+        *']:'*) ;;
+        *) fail "--address \"$value\" opens a bracketed host but is not [host]:port" ;;
+      esac
+      host="${value#\[}"
+      host="${host%%]*}"
+      after="${value#*]}"
+      port_text="${after#:}"
+      [ -n "$host" ] || fail "--address \"$value\" has an empty bracketed host"
+      ;;
+    *)
+      case "$value" in
+        *:*) ;;
+        *) fail "--address \"$value\" is not a host:port pair" ;;
+      esac
+      host="${value%:*}"
+      port_text="${value##*:}"
+      [ -n "$host" ] || fail "--address \"$value\" has an empty host"
+      case "$host" in
+        *:*) fail "--address \"$value\" has an unbracketed colon in the host; an IPv6 literal is written as [::1]:7788" ;;
+      esac
+      ;;
+  esac
+
+  case "$port_text" in
+    '' | *[!0-9]*) fail "--address \"$value\" has no numeric port" ;;
+  esac
+  # Leading zeros are removed before comparing, because a long run of digits
+  # overflows the shell's integers where the extension's Number() is merely out
+  # of range, and both sides must reach the same verdict.
+  digits="${port_text#"${port_text%%[!0]*}"}"
+  if [ "${#digits}" -gt 5 ] || [ "${digits:-0}" -lt 1 ] || [ "${digits:-0}" -gt 65535 ]; then
+    fail "--address \"$value\" has port $port_text, outside 1-65535"
   fi
 }
 
@@ -223,17 +284,7 @@ case "$startup" in
   *) fail "--startup must be \"manual\" or \"auto\", not \"$startup\"" ;;
 esac
 
-case "$address" in
-  *:*) ;;
-  *) fail "--address \"$address\" is not a host:port pair" ;;
-esac
-address_port="${address##*:}"
-case "$address_port" in
-  '' | *[!0-9]*) fail "--address \"$address\" has no numeric port" ;;
-esac
-if [ "$address_port" -lt 1 ] || [ "$address_port" -gt 65535 ]; then
-  fail "--address \"$address\" has port $address_port, outside 1-65535"
-fi
+validate_address "$address"
 
 # --- Resolution, reported before anything is written -------------------------
 
@@ -276,32 +327,62 @@ if [ -n "$purpose_file" ]; then
   purpose="$(cat -- "$purpose_file")"
   [ -n "$(printf '%s' "$purpose" | tr -d '[:space:]')" ] ||
     fail "--purpose-file \"$purpose_file\" is empty; omit the flag rather than writing nothing"
-  purpose_bytes="$(byte_length "$purpose")"
+  # Not the bytes of this variable: `cat` stripped the trailing newlines and the
+  # literal block below puts exactly one back, so what YAML parses is this text
+  # plus that newline. Measured here, a 4096-byte purpose passes and is then
+  # emitted as 4097 bytes, which the extension rejects.
+  purpose_bytes="$(($(byte_length "$purpose") + 1))"
   if [ "$purpose_bytes" -gt "$MAX_PURPOSE_BYTES" ]; then
-    fail "--purpose-file \"$purpose_file\" is $purpose_bytes UTF-8 bytes, above the $MAX_PURPOSE_BYTES-byte budget"
+    fail "--purpose-file \"$purpose_file\" becomes $purpose_bytes UTF-8 bytes of YAML, its text plus the newline the literal block keeps, above the $MAX_PURPOSE_BYTES-byte budget"
   fi
 fi
 
 [ -d "$skill_source" ] || fail "the skill source $skill_source is missing from this checkout"
 
-# Both refusals are decided before either file is written, so a run that would
-# have declined the second file does not leave the first one replaced.
-if [ "$force" -eq 0 ]; then
-  for existing in "$global_path" "$project_path"; do
-    if [ -e "$existing" ]; then
-      fail "$existing already exists; pass --force to replace it, or move it aside"
-    fi
-  done
+# `[ -L ]` is lstat-based where `[ -e ]` is not: it sees a dangling link, and it
+# is the only test that refuses before `mkdir -p` and `>` follow one. A
+# repository can track `.omp` or the project file as a symlink, and following it
+# writes outside the checkout or truncates whatever it points at, so every
+# destination and every directory this creates is refused by name.
+for linked in "$agent_dir" "$global_path" "$agent_dir/skills" "$skill_target" \
+  "$project_root/.omp" "$project_path"; do
+  if [ -L "$linked" ]; then
+    fail "$linked is a symbolic link; this writes regular files into real directories, so move the link aside and re-run"
+  fi
+done
+
+# The same preflight, for the other precondition `mkdir -p` and `>` discover
+# only once they reach it: a regular-file `.omp` failed the second parent
+# creation after the global file had already been replaced. Every type here is
+# knowable before the first write, so each wrong one is refused by name.
+for must_be_dir in "$agent_dir" "$agent_dir/skills" "$skill_target" "$project_root/.omp"; do
+  if [ -e "$must_be_dir" ] && [ ! -d "$must_be_dir" ]; then
+    fail "$must_be_dir exists and is not a directory; this creates a directory there, so move it aside and re-run"
+  fi
+done
+for must_be_file in "$global_path" "$project_path"; do
+  if [ -e "$must_be_file" ] && [ ! -f "$must_be_file" ]; then
+    fail "$must_be_file exists and is not a regular file; this writes a configuration file there, so move it aside and re-run"
+  fi
+done
+
+# Before the first write rather than after it: the contract for a missing
+# toolchain is that nothing is installed, and a check that runs once both files
+# and the skill are in place cannot keep it.
+if [ "$do_build" -eq 1 ]; then
+  expected_bun="$(sed -n 's/.*"@types\/bun": "\([^"]*\)".*/\1/p' "$REPO_ROOT/extension/package.json" | head -n1)"
+  command -v bun >/dev/null 2>&1 ||
+    fail "bun is not on PATH and this script installs no toolchain; install bun ${expected_bun:-see extension/package.json} and re-run with --build"
 fi
 
 # --- Composition --------------------------------------------------------------
 
 compose_global() {
-  printf 'transport:\n  mode: local\n  address: %s\n' "$address"
+  printf 'transport:\n  mode: local\n  address: %s\n' "$(yaml_scalar "$address")"
   printf 'startup: %s\n' "$startup"
   if [ -n "$peer" ] || [ -n "$purpose" ]; then
     printf 'peer:\n'
-    [ -z "$peer" ] || printf '  name: %s\n' "$peer"
+    [ -z "$peer" ] || printf '  name: %s\n' "$(yaml_scalar "$peer")"
     if [ -n "$purpose" ]; then
       printf '  purpose: |\n'
       printf '%s\n' "$purpose" | sed 's/^/    /'
@@ -310,15 +391,40 @@ compose_global() {
 }
 
 compose_project() {
-  printf 'room:\n  project: %s\n  task: %s\n' "$project" "$task"
+  printf 'room:\n  project: %s\n  task: %s\n' "$(yaml_scalar "$project")" "$(yaml_scalar "$task")"
 }
+
+# The global refusal is decided before anything is written, so a declined run
+# leaves both files as it found them.
+#
+# An existing project file is kept whatever room it names, and this run's
+# --project and --task then decide nothing. It is the repository's own statement
+# of the room -- the two-machine procedure has both ends resolve the room from
+# this one committed file -- so the helper has no standing to overrule it.
+# Judging it is not available to a shell script anyway: a hand-written
+# `project: shared` and the quoted scalar composed above are the same room, and
+# no comparison short of the parser the extension has tells that from a real
+# disagreement -- so comparing refuses exactly the hand-written file this keep
+# exists for. It is kept and reported instead, and --force still replaces it.
+project_keep=0
+if [ "$force" -eq 0 ]; then
+  if [ -e "$global_path" ]; then
+    fail "$global_path already exists; pass --force to replace it, or move it aside"
+  fi
+  [ ! -e "$project_path" ] || project_keep=1
+fi
 
 if [ "$dry_run" -eq 1 ]; then
   printf 'setup-client: dry run; nothing below is performed.\n'
   printf '  would write %s:\n' "$global_path"
   compose_global | sed 's/^/    | /'
-  printf '  would write %s:\n' "$project_path"
-  compose_project | sed 's/^/    | /'
+  if [ "$project_keep" -eq 1 ]; then
+    printf '  would keep %s; the room would come from that file, not from --project/--task:\n' "$project_path"
+    sed 's/^/    | /' <"$project_path"
+  else
+    printf '  would write %s:\n' "$project_path"
+    compose_project | sed 's/^/    | /'
+  fi
   printf '  would install %s/ to %s/\n' "$skill_source" "$skill_target"
   if [ "$do_build" -eq 1 ]; then
     printf '  would run: bun run build (in %s/extension)\n' "$REPO_ROOT"
@@ -333,9 +439,14 @@ mkdir -p -- "$agent_dir"
 compose_global >"$global_path"
 printf 'setup-client: wrote %s\n' "$global_path"
 
-mkdir -p -- "$project_root/.omp"
-compose_project >"$project_path"
-printf 'setup-client: wrote %s\n' "$project_path"
+if [ "$project_keep" -eq 1 ]; then
+  printf 'setup-client: kept %s; the room comes from that file, not from --project/--task:\n' "$project_path"
+  sed 's/^/setup-client:   | /' <"$project_path"
+else
+  mkdir -p -- "$project_root/.omp"
+  compose_project >"$project_path"
+  printf 'setup-client: wrote %s\n' "$project_path"
+fi
 
 # The skill is a shipped artifact rather than operator text, so it is refreshed
 # rather than preserved: an installation carrying last release's workflow beside
@@ -347,10 +458,6 @@ printf 'setup-client: installed the %s skill to %s\n' "$SKILL_NAME" "$skill_targ
 # --- Optional build --------------------------------------------------------------
 
 if [ "$do_build" -eq 1 ]; then
-  expected_bun="$(sed -n 's/.*"@types\/bun": "\([^"]*\)".*/\1/p' "$REPO_ROOT/extension/package.json" | head -n1)"
-  if ! command -v bun >/dev/null 2>&1; then
-    fail "bun is not on PATH and this script installs no toolchain; install bun ${expected_bun:-see extension/package.json} and re-run with --build"
-  fi
   printf 'setup-client: building the bundle with bun %s (this project expects %s)\n' \
     "$(bun --version)" "${expected_bun:-see extension/package.json}"
   (cd -- "$REPO_ROOT/extension" && bun run build)
