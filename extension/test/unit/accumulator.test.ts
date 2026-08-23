@@ -187,14 +187,17 @@ describe("malformed declarations fail the connection", () => {
 
   test("a declaration at exactly the cap is accepted", () => {
     // The cap is inclusive on both sides. An off-by-one here would reject
-    // frames the relay considers legal.
-    const payload = rawEncode({
-      type: "message",
-      id: "msg-1",
-      from: "windows-main",
-      body: "x".repeat(MAX_FRAME_BYTES - 64),
-    });
-    expect(payload.length).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+    // frames the relay considers legal — so the payload has to sit *on* the
+    // boundary rather than merely under it. At 65,521 bytes this test stayed
+    // green against a `>=` guard, which is the off-by-one it exists to catch.
+    const shell = { type: "message", id: "msg-1", from: "windows-main" };
+    // A `str16` body header is three bytes for every length from 256 to 65535,
+    // so the overhead measured at one such length is the overhead at the one
+    // that lands the payload exactly on the cap.
+    const probe = "x".repeat(1024);
+    const overhead = rawEncode({ ...shell, body: probe }).length - probe.length;
+    const payload = rawEncode({ ...shell, body: "x".repeat(MAX_FRAME_BYTES - overhead) });
+    expect(payload.length).toBe(MAX_FRAME_BYTES);
 
     const accumulator = new FrameAccumulator();
     const outcome = accumulator.push(declaring(payload.length, payload));

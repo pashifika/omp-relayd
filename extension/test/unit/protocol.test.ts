@@ -161,6 +161,79 @@ describe("codec", () => {
 
     expect(decodePayload(padded).ok).toBe(false);
   });
+
+  test.each([
+    ["bin8", new Uint8Array([0xc4, 0x01, 0x00])],
+    ["timestamp32", new Uint8Array([0xd6, 0xff, 0x00, 0x00, 0x00, 0x00])],
+  ])("a %s value carrying bytes is refused by its size bound", (kind, payload) => {
+    // `spec.md:126` puts binary, extension-codec, and timestamp values outside
+    // the compatibility profile. Both of these decoded into a value before the
+    // decoder was bounded — a `Uint8Array` and a `Date` respectively — leaving
+    // a rule stated in prose as the only thing keeping them off the wire. The
+    // bound is on size, not on the marker: a zero-length `bin` or `ext` still
+    // decodes and is discarded by validation like any other unknown field.
+    const decoded = decodePayload(payload);
+    expect(decoded.ok).toBe(false);
+    if (decoded.ok) return;
+    console.log(`refused a ${kind} value: ${decoded.detail}`);
+  });
+
+  test("an unknown extra field decodes and leaves the known fields intact", () => {
+    // Schema evolution within one major version: "receivers must ignore unknown
+    // map fields", and the Rust side is forbidden `deny_unknown_fields` for the
+    // same reason (design record:253-260). A decoder bounded on map entries
+    // would fail the whole connection on exactly this input, so the additive
+    // case is asserted here rather than left to Serde's default on one side.
+    const decoded = decodePayload(
+      rawEncode({
+        type: "message",
+        id: "msg-1",
+        from: "windows-main",
+        body: "hello",
+        reply_to: "msg-0",
+        priority: 7, // what a later minor version adds
+      }),
+    );
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    const outcome = validateServerFrame(decoded.value);
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame).toEqual({
+      type: "message",
+      id: "msg-1",
+      from: "windows-main",
+      body: "hello",
+      reply_to: "msg-0",
+    });
+    expect("priority" in outcome.frame).toBe(false);
+    console.log(
+      `decoded a 6-field message and kept all 5 known fields, dropping "priority"`,
+    );
+  });
+
+  test("a peer roster far past any plausible room still decodes", () => {
+    // The bounds above must not have become a peer ceiling. The design record
+    // leaves `peers` unbounded on purpose (:1047-1054), so a roster larger than
+    // any real room has to survive decoding rather than be refused by policy
+    // this client invented.
+    const frame = {
+      type: "peers",
+      request_id: "req-1",
+      peers: Array.from({ length: 4096 }, (_, at) => `peer-${at}`),
+    };
+    const payload = rawEncode(frame);
+    expect(payload.length).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+
+    const decoded = decodePayload(payload);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.value).toEqual(frame);
+    console.log(
+      `decoded a ${frame.peers.length}-peer roster from ${payload.length} bytes`,
+    );
+  });
 });
 
 describe("server frame validation", () => {
@@ -309,6 +382,21 @@ describe("identifier rules", () => {
       expect(identifierProblem(value)).toEqual({ kind: "surrounding_whitespace" });
     },
   );
+
+  test("U+0085 is refused at either end, where trim() would have accepted it", () => {
+    // Rust's `char::is_whitespace` uses the Unicode `White_Space` property,
+    // which includes U+0085 NEXT LINE; JavaScript's `trim()` does not. Accepting
+    // one of these turns a configuration error reportable once at startup into
+    // a connect-reject-reconnect loop against the relay's own `hello` check.
+    for (const value of ["\u0085peer", "peer\u0085"]) {
+      expect(value.trim()).toBe(value);
+      expect(identifierProblem(value)).toEqual({ kind: "surrounding_whitespace" });
+      console.log(
+        `refused code points [${[...value].map((c) => c.codePointAt(0)).join(", ")}] ` +
+          `that trim() left unchanged`,
+      );
+    }
+  });
 
   test("an empty identifier is refused", () => {
     expect(identifierProblem("")).toEqual({ kind: "empty" });

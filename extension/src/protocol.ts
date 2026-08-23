@@ -218,9 +218,50 @@ function isServerFrameType(value: string): value is ServerFrame["type"] {
  * system forbids constructing such a frame, but a value crossing an `unknown`
  * boundary can still carry one, and the wire contract is not a place to rely
  * on a single line of defense.
+ *
+ * Every decoder bound below is mechanization of a rule this client is already
+ * held to, not a new limit. `specs/relay-client/spec.md:126` puts binary,
+ * extension-codec, and timestamp values outside the compatibility profile, and
+ * the design record adds that this contract specifies `str`, that "The relay
+ * never emits `bin`", and that a `bin` the relay does accept is "re-encoded as
+ * `str` before it reaches any peer"
+ * (`rasen/docs/omp-relay-messagepack-protocol-design.md:232-241`), so no
+ * conforming relay can trip either bound. Note precisely what they buy: the
+ * option compares `size > max`, so a maximum of zero is a resource bound and
+ * not a type ban — a zero-length `bin` or `ext` still decodes, and is then
+ * discarded by validation like any other unknown field. Rejecting the markers
+ * themselves would mean hand-rolling marker checks for a value that reaches no
+ * caller. A string, likewise, cannot be longer than the frame carrying it.
+ *
+ * Neither container count is bounded, and both omissions are decisions.
+ *
+ * Map entries are unbounded because capping them would break schema evolution.
+ * Within one major version "receivers must ignore unknown map fields" and "new
+ * fields must be optional", and the Rust side is forbidden
+ * `#[serde(deny_unknown_fields)]` for that same reason (design
+ * record:253-260). A cap at today's field count would fail the whole
+ * connection on the one input the other implementation of this protocol may
+ * not reject — the asymmetry the cross-language fixtures exist to catch. It
+ * would also buy almost nothing: a map header allocates no backing store, so a
+ * 65,536-byte payload of nothing but nested map headers costs 2.6 ms and about
+ * 12 MB of resident memory before it is refused for running out of bytes.
+ *
+ * Array elements are unbounded because `peers.peers` is the one array v1
+ * contains and the design record leaves it uncapped with its arithmetic shown
+ * — a room of 7264 eight-byte names is a legitimate roster (design
+ * record:1047-1054, "No peer-count limit is imposed... Recorded so the absence
+ * reads as a decision"). Unlike a map header, an array header does allocate
+ * for everything it declares, so nested array headers are genuinely expensive.
+ * No cap both admits that roster and bounds that cost, so the cost is measured
+ * and accepted as a known limitation rather than closed by guessing a peer
+ * ceiling here.
  */
 const encoder = new Encoder({ ignoreUndefined: true });
-const decoder = new Decoder();
+const decoder = new Decoder({
+  maxStrLength: MAX_FRAME_BYTES,
+  maxBinLength: 0,
+  maxExtLength: 0,
+});
 
 const textEncoder = new TextEncoder();
 
@@ -294,9 +335,28 @@ export function decodePayload(payload: Uint8Array): DecodeResult {
   }
 }
 
-/** Diagnostic text for a caught value, which need not be an `Error`. */
+/**
+ * Diagnostic text for a caught value, which need not be an `Error`.
+ *
+ * Never throws, and always returns an actual string. Both halves are
+ * load-bearing rather than defensive: every caller is a containment path — a
+ * socket callback's `catch`, a detached rejection handler, a host-callback
+ * guard — so a throw from here, or a non-string escaping into a caller's
+ * template literal, would defeat the very guard that called it.
+ *
+ * The conversion is inside the guard because the value being converted is host
+ * code. `message` is declared `string` but may be a getter that throws or that
+ * returns something else entirely, and converting a null-prototype object
+ * throws. Note it is the interpolation that raises on a symbol; `String` itself
+ * accepts one, which is why the conversion is spelled out here rather than left
+ * to the caller's `${}`.
+ */
 export function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return "an error that could not be described";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,12 +755,13 @@ export function describeIdentifierProblem(problem: IdentifierProblem): string {
  * Rules are checked in the same order as the relay's `validate_identifier`, so
  * a value breaking two of them is diagnosed the same way on both sides.
  *
- * The whitespace test is `trim()`, whose character set is ECMAScript
- * `WhiteSpace` plus `LineTerminator`, against the relay's Unicode
- * `White_Space`. The two agree on every character a human types and diverge
- * only on a handful of exotic code points; closing that gap would mean shipping
- * a Unicode table to police peer names, and a value either side rejects is
- * refused before it reaches the wire either way.
+ * The whitespace test is the Unicode `White_Space` property on the first and
+ * last code point, which is exactly what the relay's `char::is_whitespace`
+ * uses. `trim()` would be the obvious spelling and is the wrong one: its
+ * character set is ECMAScript `WhiteSpace` plus `LineTerminator`, which omits
+ * U+0085 NEXT LINE. A client that accepted a peer name the relay rejects at
+ * `hello` would turn one configuration error, reportable once at startup, into
+ * a connect-reject-reconnect loop.
  *
  * @returns the first rule broken, or `null` when the value is acceptable.
  */
@@ -717,7 +778,7 @@ export function identifierProblem(value: string): IdentifierProblem | null {
       return { kind: "reserved_separator", separator: character };
     }
   }
-  if (value !== value.trim()) {
+  if (/^\p{White_Space}|\p{White_Space}$/u.test(value)) {
     return { kind: "surrounding_whitespace" };
   }
   return null;
