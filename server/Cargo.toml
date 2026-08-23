@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "In-memory TCP relay routing MessagePack frames between named OMP peers"
-license = "MPL-2.0"
+license = "MIT"
 publish = false
 
 [lib]
