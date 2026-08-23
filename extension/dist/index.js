@@ -2656,10 +2656,21 @@ var SOURCE_LABEL = {
   "global-file": "the global file",
   derivation: "the host name"
 };
+function joinHeadline(report) {
+  const room = `${singleLine(report.room.project)}/${singleLine(report.room.task)}`;
+  const as = `as ${singleLine(report.peer)}`;
+  if (report.rosterFailure === null) {
+    return report.unchanged ? `Already joined ${room} ${as}; the connection was left open.` : `Joined ${room} ${as}.`;
+  }
+  if (report.confirmed !== true) {
+    return report.unchanged ? `The connection to ${room} ${as} was left open, but the relay has not confirmed this join, so nothing can be sent yet.` : `Opened a connection to ${room} ${as}, but the relay has not confirmed the join, so nothing can be sent yet.`;
+  }
+  return report.unchanged ? `Already joined ${room} ${as}; the connection was left open, but this join did not learn who else is in the room.` : `Joined ${room} ${as}, but this join did not learn who else is in the room.`;
+}
 function joinResult(report) {
   const others = report.peers.filter((name) => name !== report.peer);
   const lines = [
-    report.unchanged ? `Already joined ${singleLine(report.room.project)}/${singleLine(report.room.task)} as ${singleLine(report.peer)}; the connection was left open.` : `Joined ${singleLine(report.room.project)}/${singleLine(report.room.task)} as ${singleLine(report.peer)}.`,
+    joinHeadline(report),
     `Room project came from ${SOURCE_LABEL[report.sources.project]}, task from ${SOURCE_LABEL[report.sources.task]}, peer name from ${SOURCE_LABEL[report.sources.peer]}.`,
     report.rosterFailure !== null ? `The roster is unknown: ${report.rosterFailure}` : others.length === 0 ? "No other peer is in this room; nobody will receive a message sent now." : `Other peers in this room: ${others.map(singleLine).join(", ")}`
   ];
@@ -2676,7 +2687,10 @@ function joinResult(report) {
     peers: [...report.peers],
     unchanged: report.unchanged,
     ...report.purpose === null ? {} : { purpose: report.purpose },
-    ...report.rosterFailure === null ? {} : { roster_failure: report.rosterFailure }
+    ...report.rosterFailure === null ? {} : {
+      status: report.confirmed === true ? "roster_unknown" : "unconfirmed",
+      roster_failure: report.rosterFailure
+    }
   });
 }
 function joinParameter(value, name) {
@@ -2825,6 +2839,12 @@ function ompRelay(pi) {
   let generation = 0;
   const notified = new Set;
   let pendingPurpose = null;
+  let purposeDelivered = false;
+  const armPurpose = (resolved) => {
+    if (resolved.startup !== "auto")
+      return;
+    pendingPurpose = purposeDelivered ? null : resolved.purpose;
+  };
   const notifyOnce = (ctx, message, type) => {
     if (notified.has(message))
       return;
@@ -2844,6 +2864,9 @@ function ompRelay(pi) {
         onMessage(message) {
           const purpose = pendingPurpose;
           pendingPurpose = null;
+          if (purpose !== null) {
+            purposeDelivered = true;
+          }
           const injection = buildInboundInjection(message, config.room, purpose);
           pi.appendEntry(INBOUND_MESSAGE_TYPE, injection.details);
           pi.sendUserMessage(injection.text, { deliverAs: "steer" });
@@ -2872,8 +2895,9 @@ function ompRelay(pi) {
       return { ok: false, problem: outcome.problem };
     }
     const resolved = outcome.resolved;
+    armPurpose(resolved);
     const current = live;
-    const unchanged = current !== null && client !== null && current.config.room.project === resolved.config.room.project && current.config.room.task === resolved.config.room.task && current.config.peer === resolved.config.peer;
+    const unchanged = current !== null && client !== null && client.state === "ready" && current.config.room.project === resolved.config.room.project && current.config.room.task === resolved.config.room.task && current.config.peer === resolved.config.peer;
     let active;
     if (unchanged) {
       active = client;
@@ -2899,11 +2923,20 @@ function ompRelay(pi) {
     } catch (error) {
       rosterFailure = error instanceof RequestFailed ? `the relay did not answer the roster request (${error.reason})` : `the roster request failed: ${describe(error)}`;
     }
+    const confirmed = active.state === "ready";
     if (thisGeneration !== generation) {
       return {
         ok: false,
         problem: { field: null, reason: "a newer join superseded this one before it completed" }
       };
+    }
+    let purpose = null;
+    if (resolved.startup !== "auto") {
+      purpose = purposeDelivered ? null : resolved.purpose;
+      pendingPurpose = null;
+      if (purpose !== null) {
+        purposeDelivered = true;
+      }
     }
     return {
       ok: true,
@@ -2912,9 +2945,10 @@ function ompRelay(pi) {
         peer: resolved.config.peer,
         sources: resolved.sources,
         peers,
-        purpose: resolved.startup === "manual" ? resolved.purpose : null,
+        purpose,
         unchanged,
-        rosterFailure
+        rosterFailure,
+        confirmed
       }
     };
   };
@@ -2947,6 +2981,7 @@ function ompRelay(pi) {
     const thisGeneration = ++generation;
     notified.clear();
     pendingPurpose = null;
+    purposeDelivered = false;
     const previous = client;
     client = null;
     live = null;
@@ -2980,7 +3015,7 @@ function ompRelay(pi) {
       notifyOnce(ctx, outcome.problem.reason, "error");
       return;
     }
-    pendingPurpose = outcome.resolved.purpose;
+    armPurpose(outcome.resolved);
     connect2(ctx, outcome.resolved);
   });
   pi.on("session_shutdown", async () => {

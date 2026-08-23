@@ -13,7 +13,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -209,6 +209,11 @@ interface SessionHarness {
   readonly contextTimers: ContextTimers;
   readonly ctx: ExtensionContext;
   readonly notifications: string[];
+  /**
+   * Fires on every `ctx.ui.notify`, so a test can wait for a report the client
+   * raised on its own instead of polling for it.
+   */
+  readonly notified: Signal<string>;
   /** Invokes the registered `mesh` tool exactly as the runtime would. */
   mesh(args: Record<string, unknown>, ctx?: ExtensionContext): Promise<MeshToolResult>;
 }
@@ -223,6 +228,7 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   };
   const contextTimers: ContextTimers = { timeouts: [], intervals: [] };
   const notifications: string[] = [];
+  const notified = new Signal<string>();
   let execute: ToolExecute | null = null;
 
   const chain = {
@@ -273,6 +279,7 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
     ui: {
       notify(message: string) {
         notifications.push(message);
+        notified.fire(message);
       },
     },
     setTimeout(callback: () => void, milliseconds: number) {
@@ -296,6 +303,7 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
     contextTimers,
     ctx,
     notifications,
+    notified,
     mesh(args, override) {
       if (execute === null) throw new Error("the extension registered no tool");
       return execute("call-1", args, undefined, undefined, override ?? ctx);
@@ -322,16 +330,15 @@ interface Layers {
   readonly projectRoot: string;
 }
 
-function layers(
-  options: {
-    readonly port: number;
-    readonly startup?: "manual" | "auto";
-    readonly purpose?: string;
-    readonly task?: string;
-  },
-): Layers {
-  const agentDir = mkdtempSync(join(tmpdir(), "omp-relay-agent-"));
-  const projectRoot = mkdtempSync(join(tmpdir(), "omp-relay-root-"));
+/** What the global layer says. The only layer a test ever rewrites in place. */
+interface GlobalLayer {
+  readonly port: number;
+  readonly startup?: "manual" | "auto";
+  readonly purpose?: string;
+}
+
+/** Writes the global layer into `agentDir`, replacing whatever is there. */
+function writeGlobal(agentDir: string, options: GlobalLayer): void {
   writeFileSync(
     join(agentDir, CONFIG_FILE_NAME),
     [
@@ -346,12 +353,29 @@ function layers(
     ].join("\n"),
     "utf8",
   );
-  mkdirSync(join(projectRoot, ".omp"), { recursive: true });
-  writeFileSync(
-    projectConfigPath(projectRoot),
-    ["room:", `  project: ${ROOM.project}`, `  task: ${options.task ?? ROOM.task}`, ""].join("\n"),
-    "utf8",
-  );
+}
+
+function layers(
+  options: GlobalLayer & {
+    readonly task?: string;
+    /**
+     * Whether to write the project layer at all. Omitting it is a checkout that
+     * never committed one, which is what leaves `auto` startup with no room.
+     */
+    readonly projectFile?: boolean;
+  },
+): Layers {
+  const agentDir = mkdtempSync(join(tmpdir(), "omp-relay-agent-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "omp-relay-root-"));
+  writeGlobal(agentDir, options);
+  if (options.projectFile !== false) {
+    mkdirSync(join(projectRoot, ".omp"), { recursive: true });
+    writeFileSync(
+      projectConfigPath(projectRoot),
+      ["room:", `  project: ${ROOM.project}`, `  task: ${options.task ?? ROOM.task}`, ""].join("\n"),
+      "utf8",
+    );
+  }
 
   process.env[AGENT_DIR_ENV] = agentDir;
   process.env[PROJECT_ROOT_ENV] = projectRoot;
@@ -459,11 +483,16 @@ const ADMIT_AND_DELIVER: Script = (frame, session) => {
   session.send(INBOUND);
 };
 
-/** Starts an `auto` session against a scripted relay and returns its harness. */
+/**
+ * Starts an `auto` session against a scripted relay.
+ *
+ * The layers are returned as well, because the startup mode is re-read on every
+ * join: a test that flips the file mid-session needs the directory it is in.
+ */
 async function startAutoSession(
   relay: ScriptedRelay,
   options: { purpose?: string } = {},
-): Promise<{ harness: SessionHarness; shutdown: () => Promise<void> }> {
+): Promise<{ harness: SessionHarness; shutdown: () => Promise<void>; written: Layers }> {
   const written = layers({
     port: relay.port,
     startup: "auto",
@@ -476,6 +505,7 @@ async function startAutoSession(
 
   return {
     harness,
+    written,
     shutdown: async () => {
       await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
     },
@@ -737,6 +767,145 @@ describe("joining a live session", () => {
       await relay.close();
     }
   });
+
+  test("a rejoin after the relay displaced this peer reconnects", async () => {
+    // `peer_replaced` is terminal by design: the displaced client stops for
+    // good rather than fighting for the name. The identical rejoin is then the
+    // operator's one recovery move, and answering it from the retained object
+    // would report an open connection while nothing is connected and nothing
+    // is trying to be.
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      await harness.mesh({ action: "join" });
+
+      recorder.deliver({
+        type: "error",
+        code: "peer_replaced",
+        message: "a newer connection registered this peer name",
+      });
+      // The client's own report, raised where it abandons the connection for
+      // good, so this waits on the state change rather than on a sleep.
+      await harness.notified.until(1);
+      expect(harness.notifications).toEqual([PEER_REPLACED_REPORT]);
+
+      const again = await harness.mesh({ action: "join", task: ROOM.task });
+
+      // The decisive assertion: the relay saw a second `hello`, so the room was
+      // rejoined rather than reported from a client that had stopped.
+      expect(relay.connections).toBe(2);
+      expect(recorder.hellos).toEqual([
+        { ...ROOM, peer: PEER },
+        { ...ROOM, peer: PEER },
+      ]);
+      expect(again.details["unchanged"]).toBe(false);
+      expect(again.details["status"]).toBeUndefined();
+      expect(again.content[0]?.text).toStartWith(
+        `Joined ${ROOM.project}/${ROOM.task} as ${PEER}`,
+      );
+      console.log(
+        `after displacement: relay saw ${recorder.hellos.length} hello(s), rejoin unchanged=${again.details["unchanged"]}, ${relay.open} connection open`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+});
+
+describe("a join the relay never answered", () => {
+  test("reports an unconfirmed connection rather than a completed join", async () => {
+    // The common first run: the operator has not started the relay yet. The
+    // connect is refused, the roster request fails with it, and a first line
+    // saying `Joined` is read as permission to send.
+    const listener = await ScriptedRelay.start(() => {});
+    const port = listener.port;
+    await listener.close();
+
+    const written = layers({ port });
+    const harness = sessionHarness(written.projectRoot);
+    ompRelay(harness.api);
+    await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+    try {
+      const joined = await harness.mesh({ action: "join" });
+      const lines = (joined.content[0]?.text ?? "").split("\n");
+
+      // Neither headline that asserts a join happened.
+      expect(lines[0]).not.toStartWith("Joined ");
+      expect(lines[0]).not.toStartWith("Already joined ");
+      expect(lines[0]).toContain("has not confirmed");
+      expect(joined.details["status"]).toBe("unconfirmed");
+      expect(String(joined.details["roster_failure"])).toContain("roster request");
+
+      // What was resolved is still reported: which room this client will be in
+      // once the relay is up is exactly what the operator has to be able to see.
+      expect(joined.details["project"]).toBe(ROOM.project);
+      expect(joined.details["task"]).toBe(ROOM.task);
+      expect(joined.details["peer"]).toBe(PEER);
+      expect(joined.details["sources"]).toEqual({
+        project: "project-file",
+        task: "project-file",
+        peer: "global-file",
+      });
+      console.log(`unreachable relay: status=${joined.details["status"]}, first line "${lines[0]}"`);
+    } finally {
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    }
+  });
+
+  test("a roster the relay refused reports an unknown roster, not an unconfirmed join", async () => {
+    // `ready` arrived, so the relay registered this peer and a send can go out;
+    // only the roster is missing. Reporting that as an unconfirmed join sends
+    // the caller to recover a connection that is fine, instead of retrying the
+    // one request that failed.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      const type = frameField(frame, "type");
+      if (type === "hello") {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        return;
+      }
+      if (type === "list") {
+        // `wire-protocol` obliges the relay to echo the correlation token of a
+        // recoverable rejection, so this settles the roster request and leaves
+        // the connection exactly as ready as it already was.
+        session.send({
+          type: "error",
+          code: "malformed_frame",
+          message: "the roster is unavailable",
+          request_id: String(frameField(frame, "request_id")),
+        });
+      }
+    });
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      const joined = await harness.mesh({ action: "join" });
+      const lines = (joined.content[0]?.text ?? "").split("\n");
+
+      expect(lines[0]).toStartWith(`Joined ${ROOM.project}/${ROOM.task} as ${PEER}`);
+      expect(lines[0]).not.toContain("has not confirmed");
+      expect(joined.details["status"]).toBe("roster_unknown");
+      expect(String(joined.details["roster_failure"])).toContain("roster request");
+      // The roster is still reported as unknown rather than as an empty room.
+      expect(joined.content[0]?.text).toContain("The roster is unknown");
+      console.log(
+        `ready connection, refused roster: status=${joined.details["status"]}, first line "${lines[0]}"`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
 });
 
 describe("the machine's purpose under automatic startup", () => {
@@ -851,6 +1020,418 @@ describe("the machine's purpose under automatic startup", () => {
       );
 
       await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a join recovering a failed auto start still owes the session's purpose", async () => {
+    // The plausible failure this covers: an `auto` machine in a checkout that
+    // never committed a project file. Session start resolves no room, so the
+    // first connection the session gets is the one the operator's parameterized
+    // join opens -- and the purpose has still never been delivered.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({
+        port: relay.port,
+        startup: "auto",
+        purpose,
+        projectFile: false,
+      });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      // The precondition, asserted rather than assumed: auto startup resolved
+      // nothing and opened no socket.
+      expect(relay.connections).toBe(0);
+      expect(harness.notifications[0]).toContain("room.project");
+
+      const joined = await harness.mesh({
+        action: "join",
+        project: ROOM.project,
+        task: ROOM.task,
+      });
+      expect(joined.details["status"]).toBeUndefined();
+      // Under `auto` the result does not carry the text; the first message does.
+      expect(joined.details["purpose"]).toBeUndefined();
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-2" });
+      await harness.calls.injected.until(2);
+
+      const first = String(harness.calls.userMessages[0]?.content);
+      const second = String(harness.calls.userMessages[1]?.content);
+      expect(first.split("\n").slice(0, 3)).toEqual([
+        "This terminal's configured purpose, from its own operator:",
+        purpose,
+        "",
+      ]);
+      expect(second).not.toContain(purpose);
+      console.log(
+        `auto start that resolved no room: the recovering join's session carried the purpose on message 1 (${first.split("\n").length} lines) and not on message 2 (${second.split("\n").length} lines)`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a purpose the join result carried is not re-owed when the mode flips to auto", async () => {
+    // "Once per session" counts deliveries, not connections: the manual join
+    // handed this text to the caller that asked for it, so flipping the machine
+    // to `auto` and rejoining must not queue it again for the first message.
+    const purpose = "Answer review requests only.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port, purpose });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      const joined = await harness.mesh({ action: "join" });
+      expect(joined.details["purpose"]).toBe(purpose);
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "auto", purpose });
+      await harness.mesh({ action: "join", task: "another-room" });
+
+      recorder.deliver(PLAIN_INBOUND);
+      await harness.calls.injected.until(1);
+
+      const text = String(harness.calls.userMessages[0]?.content);
+      expect(text).not.toContain(purpose);
+      expect(text.split("\n")[0]).toBe("Remote message from alpha");
+      console.log(
+        `mode flipped to auto after a manual join carried the purpose: the ${text.split("\n").length}-line injection repeats none of it`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("flipping to manual before the first inbound pays the purpose exactly once", async () => {
+    // The debt an `auto` start armed is owed to the first inbound message. An
+    // operator who flips the file to `manual` moves that obligation to the join
+    // result, and leaving both standing paid the same operator text twice --
+    // the one thing "once per session" forbids.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { purpose });
+      // A join whose roster came back is the readiness barrier: the no-op branch
+      // this test needs is reachable only from a `ready` client.
+      await harness.mesh({ action: "join" });
+      const hellos = recorder.hellos.length;
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "manual", purpose });
+      const joined = await harness.mesh({ action: "join" });
+
+      // The path under test: nothing changed, so no handshake and no `connect`.
+      expect(recorder.hellos).toHaveLength(hellos);
+      expect(joined.details["unchanged"]).toBe(true);
+      const inResult = joined.details["purpose"] === purpose;
+
+      recorder.deliver(PLAIN_INBOUND);
+      await harness.calls.injected.until(1);
+      const inMessage = String(harness.calls.userMessages[0]?.content).includes(purpose);
+
+      expect([inResult, inMessage]).toEqual([true, false]);
+      console.log(
+        `auto then manual on an identical rejoin: join result carried the purpose: ${inResult}; first inbound ALSO carried the purpose: ${inMessage}; deliveries in one session: ${[inResult, inMessage].filter(Boolean).length}`,
+      );
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("flipping to auto owes the purpose even when the rejoin changes nothing", async () => {
+    // The mirror. Arming at `connect` covered no identical rejoin, because that
+    // is the one join that opens no connection -- so a machine the operator
+    // turned on mid-session, stating why in the same edit, was never told.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      // Manual and silent: nothing has been owed or paid yet.
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      const first = await harness.mesh({ action: "join" });
+      expect(first.details["purpose"]).toBeUndefined();
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "auto", purpose });
+      const again = await harness.mesh({ action: "join" });
+
+      expect(recorder.hellos).toHaveLength(1);
+      expect(again.details["unchanged"]).toBe(true);
+      // Under `auto` the result must not carry it; the first message must.
+      expect(again.details["purpose"]).toBeUndefined();
+
+      recorder.deliver(PLAIN_INBOUND);
+      await harness.calls.injected.until(1);
+      const text = String(harness.calls.userMessages[0]?.content);
+      expect(text.split("\n").slice(0, 3)).toEqual([
+        "This terminal's configured purpose, from its own operator:",
+        purpose,
+        "",
+      ]);
+      console.log(
+        `manual then auto on an identical rejoin (${recorder.hellos.length} hello, unchanged=${again.details["unchanged"]}): the first inbound carried the purpose`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a manual join superseded before it reported leaves the purpose owed", async () => {
+    // The delivery is the report, not the resolution. A `manual` join that
+    // resolved the text and was then superseded before it could return handed
+    // it to nobody, so recording the delivery at resolution lost it for the
+    // rest of the session: the join that actually landed saw a debt already
+    // paid and armed nothing.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    // The first roster request is withheld, which is the window the second join
+    // supersedes the first in. It is settled all the same, and without a timer,
+    // by the stop the winning join performs on the connection it replaces.
+    let rosterRequests = 0;
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (frameField(frame, "type") === "list") {
+        rosterRequests += 1;
+        if (rosterRequests === 1) return;
+      }
+      recorder.script(frame, session);
+    });
+    try {
+      const written = layers({ port: relay.port, purpose });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      // Not awaited: the hello and the roster request are the two frames that
+      // prove it is parked inside the window, past resolving the purpose.
+      const parked = harness.mesh({ action: "join" });
+      await relay.awaitReceived(2);
+
+      // The operator flips the machine to `auto` and joins another room, which
+      // stops the connection the parked join is still waiting on.
+      writeGlobal(written.agentDir, { port: relay.port, startup: "auto", purpose });
+      const [superseded, winner] = await Promise.all([
+        parked,
+        harness.mesh({ action: "join", task: "second-room" }),
+      ]);
+
+      expect(String(superseded.content[0]?.text)).toContain("superseded");
+      // Neither report carried the text: the loser returned nothing, and `auto`
+      // never carries it. So it is still the session's debt, owed to the first
+      // message the connection that survived receives -- exactly once.
+      expect(superseded.details["purpose"]).toBeUndefined();
+      expect(winner.details["status"]).toBeUndefined();
+      expect(winner.details["purpose"]).toBeUndefined();
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-2" });
+      await harness.calls.injected.until(2);
+      const [paid, next] = harness.calls.userMessages.map((entry) => String(entry.content));
+
+      expect(paid?.split("\n").slice(0, 3)).toEqual([
+        "This terminal's configured purpose, from its own operator:",
+        purpose,
+        "",
+      ]);
+      expect(next).not.toContain(purpose);
+      console.log(
+        `manual join superseded at the roster (${relay.connections} connections, loser reported "${superseded.content[0]?.text}"): no report carried the purpose, and the surviving auto connection paid it on message 1 only`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a purpose an inbound message already paid is not re-carried by a later manual join", async () => {
+    // The mirror of the flip covered above, and the last path out of "once per
+    // session" (spec.md: "The machine's purpose reaches the agent once per
+    // session"). The `auto` debt was paid by the first message; an operator who
+    // then flips the file to `manual` and rejoins must not be handed the same
+    // operator text a second time as a tool result. The manual branch therefore
+    // consults the flag it does not set.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { purpose });
+      await relay.awaitReceived(1);
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+      const inMessage = String(harness.calls.userMessages[0]?.content).includes(purpose);
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "manual", purpose });
+      const joined = await harness.mesh({ action: "join" });
+      const inResult = joined.details["purpose"] === purpose;
+
+      // Nothing reconnected, so this is the same session and the same debt.
+      expect(recorder.hellos).toHaveLength(1);
+      expect(joined.details["unchanged"]).toBe(true);
+      expect([inMessage, inResult]).toEqual([true, false]);
+      console.log(
+        `auto paid then flipped to manual (${recorder.hellos.length} hello, unchanged=${joined.details["unchanged"]}): first inbound carried the purpose: ${inMessage}; the later manual join result ALSO carried it: ${inResult}; deliveries in one session: ${[inMessage, inResult].filter(Boolean).length}`,
+      );
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a superseded join does not erase the purpose the live connection still owes", async () => {
+    // The same defect in the write rather than the read: the `manual` branch
+    // used to clear the debt at resolution, and the join that resolved may not
+    // be the join that wins. Arming under `auto` is idempotent, so a loser
+    // doing it is harmless; erasing a debt is not, and here the loser is the
+    // only join that ever reconciled — the join that superseded it failed to
+    // resolve a room, so it reconciled nothing, and the connection both of them
+    // left running still owed the text.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    let held: { readonly frame: unknown; readonly session: RelaySession } | null = null;
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, written } = await startAutoSession(relay, { purpose });
+      // A join whose roster came back is the readiness barrier: the no-op branch
+      // this test needs is reachable only from a `ready` client.
+      await harness.mesh({ action: "join" });
+
+      // From here the roster is withheld rather than refused, so the next join
+      // parks inside its own generation window. It is released by hand below:
+      // nothing else will settle it, because the join that supersedes it stops
+      // no connection.
+      relay.rescript((frame, session) => {
+        if (frameField(frame, "type") === "list" && held === null) {
+          held = { frame, session };
+          return;
+        }
+        recorder.script(frame, session);
+      });
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "manual", purpose });
+      const parkedAt = relay.received.length + 1;
+      const parked = harness.mesh({ action: "join" });
+      await relay.awaitReceived(parkedAt);
+
+      // The superseding join resolves nothing: the room it would have needed is
+      // no longer committed. It still took the generation, which is the whole
+      // race -- it bumps the counter before it reads a single file.
+      rmSync(projectConfigPath(written.projectRoot));
+      const failed = await harness.mesh({ action: "join" });
+      expect(failed.details["status"]).toBe("failed");
+
+      if (held === null) throw new Error("no roster request was withheld");
+      const withheld = held as { readonly frame: unknown; readonly session: RelaySession };
+      withheld.session.send({
+        type: "peers",
+        request_id: String(frameField(withheld.frame, "request_id")),
+        peers: [PEER],
+      });
+      const superseded = await parked;
+      expect(String(superseded.content[0]?.text)).toContain("superseded");
+      expect(superseded.details["purpose"]).toBeUndefined();
+
+      // Nothing reconnected and nothing was reported, so the debt is exactly
+      // where it was: owed to the next message this connection receives.
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+      const text = String(harness.calls.userMessages[0]?.content);
+      expect(text.split("\n").slice(0, 3)).toEqual([
+        "This terminal's configured purpose, from its own operator:",
+        purpose,
+        "",
+      ]);
+      console.log(
+        `manual no-op join superseded by a join that resolved nothing (${relay.connections} connections, loser reported "${superseded.content[0]?.text}"): the surviving connection still paid the purpose on its next message`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a purpose paid while a manual join waited is not handed back by its result", async () => {
+    // The defect in the read: the text a `manual` join returns used to be
+    // decided at resolution and then carried across the roster await. An
+    // inbound message arriving inside that window pays the debt, so the result
+    // that settles afterwards hands back text this session has already been
+    // given -- two deliveries, which is the one thing "once per session"
+    // forbids. The flag is therefore read at the instant the report is built.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    let held: { readonly frame: unknown; readonly session: RelaySession } | null = null;
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { purpose });
+      // A join whose roster came back is the readiness barrier: the no-op branch
+      // this test needs is reachable only from a `ready` client.
+      await harness.mesh({ action: "join" });
+
+      // The next roster answer is withheld, which parks the join under test
+      // exactly where the inbound message can overtake it.
+      relay.rescript((frame, session) => {
+        if (frameField(frame, "type") === "list" && held === null) {
+          held = { frame, session };
+          return;
+        }
+        recorder.script(frame, session);
+      });
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "manual", purpose });
+      const parkedAt = relay.received.length + 1;
+      const parked = harness.mesh({ action: "join" });
+      await relay.awaitReceived(parkedAt);
+
+      // Paid, while the join that would have paid it is still waiting. The
+      // injection is what proves the handler ran and took the debt with it.
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+      const inMessage = String(harness.calls.userMessages[0]?.content).includes(purpose);
+
+      if (held === null) throw new Error("no roster request was withheld");
+      const withheld = held as { readonly frame: unknown; readonly session: RelaySession };
+      withheld.session.send({
+        type: "peers",
+        request_id: String(frameField(withheld.frame, "request_id")),
+        peers: [PEER],
+      });
+      const joined = await parked;
+      const inResult = joined.details["purpose"] === purpose;
+
+      // A successful no-op join: it reported, so it would have committed the
+      // delivery -- and it must find there is nothing left to deliver.
+      expect(joined.details["status"]).toBeUndefined();
+      expect(joined.details["unchanged"]).toBe(true);
+      expect([inMessage, inResult]).toEqual([true, false]);
+      console.log(
+        `inbound overtook a parked manual join (unchanged=${joined.details["unchanged"]}): message carried the purpose: ${inMessage}; the join result ALSO carried it: ${inResult}; deliveries in one session: ${[inMessage, inResult].filter(Boolean).length}`,
+      );
+
+      await shutdown();
     } finally {
       await relay.close();
     }

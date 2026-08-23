@@ -109,6 +109,17 @@ export interface JoinReport {
   readonly unchanged: boolean;
   /** Present when the connection opened but the roster request did not settle. */
   readonly rosterFailure: string | null;
+  /**
+   * Whether the relay confirmed this join: the connection was still `ready`
+   * when the roster request settled.
+   *
+   * Read only alongside {@link rosterFailure}, which does not decide it. A
+   * request the relay never answered on a `ready` connection leaves a
+   * registered peer with an unknown roster; a connection that never reached
+   * `ready` leaves a join nothing has acknowledged. Absent reads as the second,
+   * the conservative of the two.
+   */
+  readonly confirmed?: boolean;
 }
 
 /** Outcome of one join. A failure names the field responsible where there is one. */
@@ -251,6 +262,36 @@ const SOURCE_LABEL: Record<ValueSource, string> = {
 };
 
 /**
+ * The first line of a join result: what happened, and never more than happened.
+ *
+ * Three states rather than two, because a roster that did not come back does
+ * not say which of them this is. On a connection the relay never confirmed --
+ * the common first run, where the operator has not started it yet -- `Joined`
+ * would assert a handshake that did not happen, and a model reading it would go
+ * on to send. On a `ready` connection the peer is registered and can send, and
+ * only the roster is unknown; calling that unconfirmed sends the caller to
+ * recover a connection that is fine. The failure is named on its own line in
+ * both cases; this is what keeps the headline from contradicting it.
+ */
+function joinHeadline(report: JoinReport): string {
+  const room = `${singleLine(report.room.project)}/${singleLine(report.room.task)}`;
+  const as = `as ${singleLine(report.peer)}`;
+  if (report.rosterFailure === null) {
+    return report.unchanged
+      ? `Already joined ${room} ${as}; the connection was left open.`
+      : `Joined ${room} ${as}.`;
+  }
+  if (report.confirmed !== true) {
+    return report.unchanged
+      ? `The connection to ${room} ${as} was left open, but the relay has not confirmed this join, so nothing can be sent yet.`
+      : `Opened a connection to ${room} ${as}, but the relay has not confirmed the join, so nothing can be sent yet.`;
+  }
+  return report.unchanged
+    ? `Already joined ${room} ${as}; the connection was left open, but this join did not learn who else is in the room.`
+    : `Joined ${room} ${as}, but this join did not learn who else is in the room.`;
+}
+
+/**
  * Renders a join report.
  *
  * The sources and the roster are the substance rather than decoration. Join
@@ -262,9 +303,7 @@ const SOURCE_LABEL: Record<ValueSource, string> = {
 function joinResult(report: JoinReport): MeshToolResult {
   const others = report.peers.filter((name) => name !== report.peer);
   const lines = [
-    report.unchanged
-      ? `Already joined ${singleLine(report.room.project)}/${singleLine(report.room.task)} as ${singleLine(report.peer)}; the connection was left open.`
-      : `Joined ${singleLine(report.room.project)}/${singleLine(report.room.task)} as ${singleLine(report.peer)}.`,
+    joinHeadline(report),
     `Room project came from ${SOURCE_LABEL[report.sources.project]}, task from ${SOURCE_LABEL[report.sources.task]}, peer name from ${SOURCE_LABEL[report.sources.peer]}.`,
     report.rosterFailure !== null
       ? `The roster is unknown: ${report.rosterFailure}`
@@ -285,7 +324,17 @@ function joinResult(report: JoinReport): MeshToolResult {
     peers: [...report.peers],
     unchanged: report.unchanged,
     ...(report.purpose === null ? {} : { purpose: report.purpose }),
-    ...(report.rosterFailure === null ? {} : { roster_failure: report.rosterFailure }),
+    // Carried as a status, the same way a refusal and a failure are, because
+    // `details` is what a caller dispatches on: an unconfirmed connection read
+    // as an unqualified success is the text defect again, one layer down. The
+    // two are separate statuses because they are separate dispatches: one
+    // retries a request, the other recovers a connection.
+    ...(report.rosterFailure === null
+      ? {}
+      : {
+          status: report.confirmed === true ? "roster_unknown" : "unconfirmed",
+          roster_failure: report.rosterFailure,
+        }),
   });
 }
 
@@ -496,19 +545,71 @@ export default function ompRelay(pi: ExtensionAPI): void {
   /**
    * The purpose still owed to this session, under `auto` only.
    *
-   * Armed once, where the session begins, and cleared by the first inbound
-   * message. Deliberately not armed in {@link connect}: a `join` is a new
-   * connection but the same session, so arming there would re-owe a debt the
-   * session had already been paid and deliver the same operator text twice —
-   * which the capability forbids in as many words.
-   *
    * Under `manual` nothing is ever owed, because the join result carries the
    * text to the caller that asked. Under `auto` there is no call to return it
    * from and no operator present at connect time, so it rides the first
    * message: the moment work arrives is the moment the policy matters, and once
    * is enough because the text is then in the transcript.
+   *
+   * Armed by {@link armPurpose} under `auto`, and cleared only where it is
+   * settled: by the inbound handler that pays it, or by a `manual` join at the
+   * point its own report carries the text instead. Never at resolution time —
+   * a join that resolved is not yet a join that reported.
    */
   let pendingPurpose: string | null = null;
+
+  /**
+   * Whether this session has already been given its purpose text, through
+   * either channel.
+   *
+   * The debt belongs to the session, not to the connection: a rejoin is a new
+   * connection within one session, so re-arming there would deliver the same
+   * operator text twice — which the capability forbids in as many words.
+   *
+   * A flag rather than "arm at session start only", because the connection that
+   * starts a session is not always the one `session_start` opened. An `auto`
+   * start that cannot resolve a room — a checkout with no committed project
+   * file — leaves the session's first successful connection to the join that
+   * recovers it, and that join owes the purpose exactly as much.
+   *
+   * It is set where a delivery actually happens, and nowhere earlier: by the
+   * inbound handler that consumes the preamble, and by a `manual` join at the
+   * point it returns a report carrying the text. Setting it at resolution
+   * instead claimed a delivery a later generation check could still cancel,
+   * turning the join into a `superseded` return that handed the text to
+   * nobody and left the session owing a debt it believed paid.
+   */
+  let purposeDelivered = false;
+
+  /**
+   * Arms the debt an `auto` resolution incurs, ahead of the socket that pays it.
+   *
+   * It runs at every successful resolution rather than inside `connect`,
+   * because the mode is re-read from the file on every join and an identical
+   * `manual` -> `auto` rejoin opens no connection at all, so nothing in
+   * `connect` would ever arm it. It runs before `connect` rather than after the
+   * roster, because a relay may push a message on the very handshake `connect`
+   * opens.
+   *
+   * This is the only purpose write left that happens before a join has won, and
+   * the only one that may: it is idempotent, so a join that goes on to be
+   * superseded writes the value the winner would write anyway, and the winner
+   * re-runs it regardless.
+   *
+   * Everything the `manual` path does — reading {@link purposeDelivered},
+   * deciding the text, clearing the debt, recording the delivery — happens at
+   * the commit site in {@link performJoin}, past the final generation check.
+   * That split is the load-bearing property here, not an arrangement of
+   * convenience: state read early and acted on late is what put four separate
+   * lost- and double-delivery races in this file, because the join that
+   * resolves is not always the join that reports, and `purposeDelivered` can
+   * flip under any await in between. Under `manual` the text is decided at the
+   * instant the report that carries it is built, and nowhere else.
+   */
+  const armPurpose = (resolved: ResolvedClient): void => {
+    if (resolved.startup !== "auto") return;
+    pendingPurpose = purposeDelivered ? null : resolved.purpose;
+  };
 
   const notifyOnce = (
     ctx: ExtensionContext,
@@ -541,6 +642,9 @@ export default function ompRelay(pi: ExtensionAPI): void {
         onMessage(message) {
           const purpose = pendingPurpose;
           pendingPurpose = null;
+          if (purpose !== null) {
+            purposeDelivered = true;
+          }
           const injection = buildInboundInjection(message, config.room, purpose);
           // A session entry, which the runtime documents as state persistence
           // that never reaches the LLM. It is where the exact frame values live,
@@ -568,8 +672,6 @@ export default function ompRelay(pi: ExtensionAPI): void {
     });
     client = next;
     live = { config, startup: resolved.startup };
-    // Not armed here. See {@link pendingPurpose}: a rejoin is a new connection
-    // within one session, and the debt belongs to the session.
     next.start();
     return next;
   };
@@ -601,10 +703,24 @@ export default function ompRelay(pi: ExtensionAPI): void {
     }
 
     const resolved = outcome.resolved;
+    // Armed before the branch below rather than after the roster, for the two
+    // reasons that put it here at all: the no-op branch opens no connection to
+    // arm it in, and under `auto` a relay may push a message on the same
+    // handshake, so the debt has to exist before the socket starts.
+    armPurpose(resolved);
     const current = live;
     const unchanged =
       current !== null &&
       client !== null &&
+      // Liveness, not object existence. A client the relay displaced with
+      // `peer_replaced` is `stopped` for good, and one between reconnect
+      // attempts holds no registration either, so answering an identical
+      // join — the operator's one recovery move — from either would report a
+      // connection nobody can reach. Only `ready` is the live connection the
+      // no-op is scoped to; anything else reconnects, which costs a handshake
+      // and no roster churn, because a client that is not ready is in no
+      // roster to churn.
+      client.state === "ready" &&
       current.config.room.project === resolved.config.room.project &&
       current.config.room.task === resolved.config.room.task &&
       current.config.peer === resolved.config.peer;
@@ -645,11 +761,36 @@ export default function ompRelay(pi: ExtensionAPI): void {
           ? `the relay did not answer the roster request (${error.reason})`
           : `the roster request failed: ${describe(error)}`;
     }
+    // What the roster failure above does not say: whether the relay confirmed
+    // the join. A client still in `ready` completed its handshake and holds a
+    // registration, so only the roster is missing; one that is not never got
+    // that far. See {@link joinHeadline}.
+    const confirmed = active.state === "ready";
     if (thisGeneration !== generation) {
       return {
         ok: false,
         problem: { field: null, reason: "a newer join superseded this one before it completed" },
       };
+    }
+
+    // The purpose, decided here and only here under `manual`. Every generation
+    // check above can still end this join as a `superseded` return that reports
+    // nothing, and `purposeDelivered` can flip under any await above — the
+    // roster request most of all, which an inbound message paying the debt can
+    // land inside. So the flag is read, the text chosen, the debt cleared and
+    // the delivery recorded together, at the instant the report below is built.
+    // Deciding it at resolution time instead lost the debt to a join that was
+    // superseded, erased it for the connection that survived, and handed back
+    // text a message that arrived while this join waited had already paid.
+    let purpose: string | null = null;
+    if (resolved.startup !== "auto") {
+      purpose = purposeDelivered ? null : resolved.purpose;
+      // Under `manual` nothing rides an inbound message: this report is the
+      // delivery, and it is this join's report, so it is now a fact.
+      pendingPurpose = null;
+      if (purpose !== null) {
+        purposeDelivered = true;
+      }
     }
 
     return {
@@ -659,9 +800,10 @@ export default function ompRelay(pi: ExtensionAPI): void {
         peer: resolved.config.peer,
         sources: resolved.sources,
         peers,
-        purpose: resolved.startup === "manual" ? resolved.purpose : null,
+        purpose,
         unchanged,
         rosterFailure,
+        confirmed,
       },
     };
   };
@@ -706,6 +848,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
     const thisGeneration = ++generation;
     notified.clear();
     pendingPurpose = null;
+    purposeDelivered = false;
 
     const previous = client;
     client = null;
@@ -750,9 +893,10 @@ export default function ompRelay(pi: ExtensionAPI): void {
       notifyOnce(ctx, outcome.problem.reason, "error");
       return;
     }
-    // The session's one debt, incurred where the session begins. `startup` is
-    // `auto` on this path by construction, so no mode test is needed.
-    pendingPurpose = outcome.resolved.purpose;
+    // The debt this start incurs. `session_start` reaches here only under
+    // `auto`, so this arms it and never delivers it, and it is armed before the
+    // socket that pays it opens.
+    armPurpose(outcome.resolved);
     connect(ctx, outcome.resolved);
   });
 

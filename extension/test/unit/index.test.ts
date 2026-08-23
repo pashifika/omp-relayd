@@ -177,20 +177,32 @@ describe("extension registration", () => {
     // configured the relay would otherwise open with the same complaint, and
     // there is no requester to answer: a join reports the absence to whoever
     // asked, which is where it belongs.
+    //
+    // The directory is empty, and pointed at: under ambient
+    // `PI_CODING_AGENT_DIR` and `HOME` a developer machine holding a real
+    // global file would pass this without reaching the absent-file branch.
+    const directory = agentDir(null);
     const notifications: string[] = [];
     const harness = factoryHarness();
     ompRelay(harness.api);
 
-    await harness.handlers.get("session_start")?.(
-      { type: "session_start" },
-      context({
-        ui: {
-          notify(message) {
-            notifications.push(message);
-          },
-        } as ExtensionContext["ui"],
-      }),
-    );
+    const previous = process.env[AGENT_DIR_ENV];
+    process.env[AGENT_DIR_ENV] = directory;
+    try {
+      await harness.handlers.get("session_start")?.(
+        { type: "session_start" },
+        context({
+          ui: {
+            notify(message) {
+              notifications.push(message);
+            },
+          } as ExtensionContext["ui"],
+        }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env[AGENT_DIR_ENV];
+      else process.env[AGENT_DIR_ENV] = previous;
+    }
 
     expect(notifications).toEqual([]);
   });
@@ -391,7 +403,10 @@ describe("mesh join", () => {
     expect(output.details).toEqual({ action: "join", status: "failed", field: "room.task" });
   });
 
-  test("a connection whose roster request did not settle says the roster is unknown", async () => {
+  test("a connection whose roster request did not settle is not reported as a completed join", async () => {
+    // The relay acknowledged nothing, so the first line must not be one a model
+    // reads as permission to send. The failure is named on its own line either
+    // way; what this pins is that the headline agrees with it.
     const host = new RecordingHost();
     host.outcome = {
       ok: true,
@@ -402,9 +417,34 @@ describe("mesh join", () => {
     };
 
     const output = await executeMesh(host, { action: "join" });
+    const lines = (output.content[0]?.text ?? "").split("\n");
 
+    expect(lines[0]).not.toStartWith("Joined ");
+    expect(lines[0]).toContain("has not confirmed");
     expect(output.content[0]?.text).toContain("The roster is unknown");
     expect(output.content[0]?.text).not.toContain("No other peer");
+    expect(output.details["status"]).toBe("unconfirmed");
+  });
+
+  test("an unchanged join whose roster request failed does not claim the room either", async () => {
+    // The live connection was kept, so it is not the unreachable-relay case --
+    // but the relay still answered nothing, and `unchanged: true` alone would
+    // read as a healthy connection to anything dispatching on `details`.
+    const host = new RecordingHost();
+    host.outcome = {
+      ok: true,
+      report: report({
+        unchanged: true,
+        peers: [],
+        rosterFailure: "the relay did not answer the roster request (timeout)",
+      }),
+    };
+
+    const output = await executeMesh(host, { action: "join" });
+
+    expect(output.content[0]?.text).not.toStartWith("Already joined");
+    expect(output.details["status"]).toBe("unconfirmed");
+    expect(output.details["unchanged"]).toBe(true);
   });
 });
 
