@@ -362,22 +362,42 @@ async fn an_oversized_target_is_answered_with_a_receipt_rather_than_a_bare_close
     let relay = Relay::start().await;
     let mut sender = Client::join(&relay, &room("oversized-targets"), "sender").await;
 
-    // The largest `to` a client can put on the wire: grown until the inbound
-    // `send` frame would exceed the cap, then stepped back one byte.
-    let mut to = String::new();
-    loop {
-        to.push('x');
-        let candidate = ClientFrame::Send {
+    // The largest `to` a client can put on the wire. Still measured rather than
+    // hard-coded, because the boundary moves with any envelope change -- but
+    // bracketed by binary search instead of grown a byte at a time. Encoded
+    // length is non-decreasing in `to.len()`, so seventeen encodes settle what
+    // sixty-five thousand re-encodes of a growing 64 KiB frame settled with
+    // over two gigabytes of target-string work.
+    let inbound_bytes = |target_len: usize| {
+        protocol::encode(&ClientFrame::Send {
             id: "m1".to_owned(),
-            to: to.clone(),
+            to: "x".repeat(target_len),
             body: String::new(),
             reply_to: None,
-        };
-        if protocol::encode(&candidate).expect("encodes").len() > MAX_FRAME_BYTES {
-            to.pop();
-            break;
+        })
+        .expect("encodes")
+        .len()
+    };
+
+    // The bracket the search assumes, asserted rather than presumed.
+    let (mut fits, mut overflows) = (0usize, MAX_FRAME_BYTES + 1);
+    assert!(
+        inbound_bytes(fits) <= MAX_FRAME_BYTES,
+        "an empty target must fit, or the search has no lower bound"
+    );
+    assert!(
+        inbound_bytes(overflows) > MAX_FRAME_BYTES,
+        "a target longer than the cap must not fit, or the search has no upper bound"
+    );
+    while overflows - fits > 1 {
+        let probe = fits + (overflows - fits) / 2;
+        if inbound_bytes(probe) > MAX_FRAME_BYTES {
+            overflows = probe;
+        } else {
+            fits = probe;
         }
     }
+    let to = "x".repeat(fits);
 
     let naive = protocol::encode(&ServerFrame::Receipt {
         id: "m1".to_owned(),
@@ -387,8 +407,16 @@ async fn an_oversized_target_is_answered_with_a_receipt_rather_than_a_bare_close
     .expect("encodes")
     .len();
     println!(
-        "to = {} bytes; unclamped receipt = {naive} bytes; frame cap = {MAX_FRAME_BYTES}",
-        to.len()
+        "to = {fits} bytes; inbound send = {} bytes; unclamped receipt = {naive} bytes; \
+         frame cap = {MAX_FRAME_BYTES}",
+        inbound_bytes(fits)
+    );
+    assert!(
+        inbound_bytes(fits + 1) > MAX_FRAME_BYTES,
+        "the search must land on the boundary itself, or this is not the largest \
+         target a client can send: {} bytes at {} fits too",
+        inbound_bytes(fits + 1),
+        fits + 1
     );
     assert!(
         naive > MAX_FRAME_BYTES,

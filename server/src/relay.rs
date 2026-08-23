@@ -1161,7 +1161,7 @@ fn handle_send(
 /// the value that just failed that check -- including because it was too long.
 ///
 /// Unclamped, that reopens the class of bug the body budget exists to close. A
-/// `send` whose `to` is 65508 bytes fits the inbound frame cap exactly, and the
+/// `send` whose `to` is 65507 bytes fills the inbound frame cap exactly, and the
 /// receipt built from it is 65555 bytes: `LengthDelimitedCodec::encode` refuses
 /// it, `write_or_break` breaks on the `Err`, and the sender's connection closes
 /// having received neither the receipt `peer-relay` requires for every valid
