@@ -780,17 +780,36 @@ async fn a_superseded_connection_is_told_before_its_backlog_is_drained() {
         "the fixture needs a non-empty backlog to be meaningful"
     );
 
-    // Supersede it, then read. Eviction must overtake the *backlog*; it cannot
-    // un-send bytes already committed to the socket or to the codec's write
-    // buffer, so some frames still precede the diagnostic. That residue is
-    // bounded by socket buffer sizes and does not scale with queue depth --
-    // observed between 2 and 17 frames depending on load, against a 145-frame
-    // backlog. What must not happen is the diagnostic arriving behind the whole
-    // backlog, which is what the queue-closure signal did: measured at 145 of
-    // 145 before the eviction flag existed.
+    // Supersede it, then read. Eviction cannot un-send bytes already committed to
+    // the socket or to the codec's write buffer, so some frames still precede the
+    // diagnostic.
     //
-    // So the assertion is proportional rather than absolute. An exact count
-    // would be asserting the kernel's buffer sizes, which is not the contract.
+    // The bound is deliberately the weakest one that is airtight, and it is worth
+    // saying what it does and does not prove. Under the old queue-closure signal
+    // the receiver yields every buffered frame before reporting closure, and only
+    // then is `peer_replaced` written -- so the residue is the entire backlog,
+    // exactly, on every successful run. Measured at 145 of 145. Any overtaking at
+    // all is therefore a strict inequality, and this assertion is the exact
+    // negative control for that mechanism on every platform, with no threshold to
+    // choose.
+    //
+    // It does *not* prove the stronger property that the residue is transport-only
+    // and independent of queue depth. No black-box count of frames read over TCP
+    // can: the residue tracks how much the kernel absorbed, which is
+    // operator-tunable with no code-level cap -- 17 frames against a 145-frame
+    // backlog on macOS, 53 against 210 on Linux CI, at a 32 KiB body. The stronger
+    // property is established instead by the writer's structure, where the nested
+    // biased select cancels the in-flight write, breaks straight to `close_with`,
+    // and never polls `outbound.recv()` again.
+    //
+    // Two earlier bounds are recorded because both looked principled and neither
+    // was. `residue * 4 < backlog` reads as a scale-invariance claim but is a
+    // fraction of a backlog that itself contains the socket-absorbed frames, so a
+    // larger kernel buffer moves both terms; it passed on macOS and failed on
+    // Linux at 25.2%, on this branch's first run outside Docker Desktop's VM.
+    // `residue < OUTBOUND_QUEUE_CAPACITY` then replaced one platform-derived
+    // threshold with another -- weaker than the fraction for any backlog below
+    // 512, and still flaky on a host buffering more than the queue's 4 MiB.
     let _fresh = Client::join(&relay, &here, "target").await;
 
     let mut ahead_of_diagnostic = 0usize;
@@ -808,11 +827,10 @@ async fn a_superseded_connection_is_told_before_its_backlog_is_drained() {
             other => panic!("unexpected frame on a superseded connection: {other:?}"),
         }
         assert!(
-            ahead_of_diagnostic * 4 < backlog,
-            "eviction must overtake the {backlog}-frame backlog rather than queue behind \
-             it: only frames already committed to the socket may precede the diagnostic, \
-             and that residue must not scale with queue depth, but {ahead_of_diagnostic} \
-             frames arrived first"
+            ahead_of_diagnostic < backlog,
+            "the diagnostic must not arrive last: {ahead_of_diagnostic} of a \
+             {backlog}-frame backlog preceded it, which is the whole backlog and so \
+             exactly what closing the outbound queue used to do"
         );
     }
     println!(
