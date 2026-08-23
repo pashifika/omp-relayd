@@ -379,7 +379,7 @@ export class FrameAccumulator {
         buffer.buffer,
         buffer.byteOffset + offset,
         LENGTH_PREFIX_BYTES,
-      ).getUint32(0, false);
+      ).getUint32(0, true);
 
       // Both checks precede the availability test on purpose: an oversized
       // declaration must fail without waiting for, or buffering, the payload it
