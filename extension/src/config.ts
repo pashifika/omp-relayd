@@ -44,8 +44,13 @@ import {
  */
 export const CONFIG_PATH_ENV = "OMP_RELAY_CONFIG";
 
-/** Path segments appended to the user's home directory by default. */
-const DEFAULT_CONFIG_SEGMENTS = [".config", "omp-relay", "client.yaml"] as const;
+/**
+ * Path segments appended to the user's home directory by default.
+ *
+ * This is the location the protocol design record documents (§10.2), and the
+ * only one `specs/client-configuration` permits the client to read.
+ */
+const DEFAULT_CONFIG_SEGMENTS = [".omp", "agent", "omp-relay.yml"] as const;
 
 /** The one transport mode this release implements. */
 export type TransportMode = "local";
@@ -202,7 +207,7 @@ export function validateConfig(
   if (mode !== "local") {
     return problem(
       "transport.mode",
-      `transport.mode must be "local", found ${JSON.stringify(mode) ?? typeName(mode)}`,
+      `transport.mode must be "local", found ${describeValue(mode)}`,
     );
   }
 
@@ -217,7 +222,7 @@ export function validateConfig(
   if (address === null) {
     return problem(
       "transport.address",
-      `transport.address ${JSON.stringify(rawAddress)} is not a "host:port" pair with a port in 1-65535`,
+      `transport.address ${describeValue(rawAddress)} is not a "host:port" pair with a port in 1-65535`,
     );
   }
 
@@ -311,6 +316,38 @@ function problem(
   reason: string,
 ): { readonly ok: false; readonly problem: ConfigProblem } {
   return { ok: false, problem: { field, reason } };
+}
+
+/** Characters of an untrusted scalar a diagnostic will echo. */
+const DIAGNOSTIC_VALUE_CHARS = 40;
+
+/**
+ * Renders a value from the parsed document for a diagnostic: type first, then
+ * bounded.
+ *
+ * `JSON.stringify` must not be reached for by reflex here. Bun's YAML preserves
+ * aliases, so the serializer walks the expanded graph: a 405-byte document of
+ * nested aliases rendered one `transport.mode` diagnostic as 10,271,832
+ * characters in 29 ms, and it grows exponentially with alias depth. Guarding
+ * the *result* cannot help, because the cost is paid producing it — so only a
+ * scalar is ever formatted, and a container contributes its type name alone.
+ *
+ * A scalar is clipped as well. Every caller compares the value against one
+ * short literal or one short grammar, so a long prefix carries no diagnostic
+ * information a short one does not.
+ */
+function describeValue(value: unknown): string {
+  if (typeof value === "string") {
+    return JSON.stringify(
+      value.length > DIAGNOSTIC_VALUE_CHARS
+        ? `${value.slice(0, DIAGNOSTIC_VALUE_CHARS)}…`
+        : value,
+    );
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return typeName(value);
 }
 
 function typeName(value: unknown): string {

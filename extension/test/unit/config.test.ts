@@ -43,7 +43,7 @@ async function scratch(): Promise<string> {
 
 /** Writes `body` to a scratch file and returns an env pointing the loader at it. */
 async function configuredWith(body: string): Promise<Environment> {
-  const path = join(await scratch(), "client.yaml");
+  const path = join(await scratch(), "override.yaml");
   await writeFile(path, body, "utf8");
   return { [CONFIG_PATH_ENV]: path };
 }
@@ -61,33 +61,57 @@ describe("path resolution", () => {
     const resolved = resolveConfigPath({ HOME: "/home/dev" });
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;
-    expect(resolved.path).toBe("/home/dev/.config/omp-relay/client.yaml");
+    expect(resolved.path).toBe("/home/dev/.omp/agent/omp-relay.yml");
   });
 
   test("the override replaces the default entirely rather than layering on it", async () => {
-    // Both a HOME default and an override exist, and each names a *different*
-    // valid configuration. Reading the override's values proves there was no
-    // merge and no fallback.
+    // Two complete configurations prove neither prohibition in
+    // `client-configuration/spec.md:41`: a merging implementation and a
+    // falling-back implementation both return the override's values. Each
+    // prohibition needs the case that separates it from correct behavior.
     const home = await scratch();
-    await mkdir(join(home, ".config", "omp-relay"), { recursive: true });
+    await mkdir(join(home, ".omp", "agent"), { recursive: true });
     await writeFile(
-      join(home, ".config", "omp-relay", "client.yaml"),
+      join(home, ".omp", "agent", "omp-relay.yml"),
       VALID.replace("macbook-reviewer", "from-the-default-path"),
       "utf8",
     );
 
-    const overridePath = join(await scratch(), "elsewhere.yaml");
+    // The control, so the rest is not passing on a blind harness: a complete
+    // override is read, and its values are the ones used.
+    const overridePath = join(await scratch(), "override.yaml");
     await writeFile(
       overridePath,
       VALID.replace("macbook-reviewer", "from-the-override"),
       "utf8",
     );
-
     const outcome = await loadConfig({ HOME: home, [CONFIG_PATH_ENV]: overridePath });
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
     expect(outcome.path).toBe(overridePath);
     expect(outcome.config.peer).toBe("from-the-override");
+
+    // No merge: the override omits `peer`, which the default supplies. A merge
+    // fills it in and succeeds; the correct behavior names the missing field.
+    const partialPath = join(await scratch(), "override.yaml");
+    await writeFile(partialPath, VALID.replace(/^peer:.*\n/m, ""), "utf8");
+    const partial = await loadConfig({ HOME: home, [CONFIG_PATH_ENV]: partialPath });
+    expect(partial.ok).toBe(false);
+    if (partial.ok) return;
+    expect(partial.problem.field).toBe("peer");
+
+    // No fallback: the override does not exist, beside a default that is
+    // perfectly valid. A fallback succeeds and reports the default's path.
+    const absentPath = join(await scratch(), "absent.yaml");
+    const absent = await loadConfig({ HOME: home, [CONFIG_PATH_ENV]: absentPath });
+    expect(absent.ok).toBe(false);
+    if (absent.ok) return;
+    expect(absent.path).toBe(absentPath);
+
+    console.log(
+      `override missing peer refused at "${partial.problem.field}"; ` +
+        `absent override refused instead of falling back to a valid default`,
+    );
   });
 
   test("with neither the override nor HOME there is no path to read", async () => {
