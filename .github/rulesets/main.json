@@ -19,9 +19,10 @@
         "dismiss_stale_reviews_on_push": false,
         "require_code_owner_review": false,
         "require_last_push_approval": false,
+        "require_extra_approval_for_unattributed_changes": true,
         "required_review_thread_resolution": true,
         "required_reviewers": [],
-        "allowed_merge_methods": ["rebase", "squash"]
+        "allowed_merge_methods": ["rebase", "squash", "merge"]
       }
     },
     {

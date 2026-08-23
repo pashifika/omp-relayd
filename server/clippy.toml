@@ -1,0 +1,4 @@
+# `MessagePack` is a proper noun in this project's prose, not a code item, so
+# `doc_markdown` must not demand backticks around it. `".."` keeps clippy's own
+# default identifier list in place rather than replacing it.
+doc-valid-idents = ["MessagePack", ".."]

@@ -1,0 +1,18 @@
+# The image build needs exactly three inputs, so this file is a whitelist
+# rather than a list of things to skip. A blocklist rots: it goes stale the
+# first time someone adds a top-level directory, and the failure is silent --
+# the build still succeeds, just with more context than it needed.
+#
+# Without this file the context is the whole repository. Measured before adding
+# it: 1163.9 MiB sent to the daemon against 0.09 MiB the Dockerfile actually
+# copies, because `server/target/` is 1160 MiB after any local `cargo build`.
+# `.gitignore` does not help here; Docker does not read it.
+#
+# It also kept `rasen/` out of the build context. That directory is a separate
+# Git repository with its own remote, and nothing about the image build should
+# be able to see it.
+*
+
+!server/Cargo.toml
+!server/Cargo.lock
+!server/src

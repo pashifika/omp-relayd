@@ -59,9 +59,11 @@ so discovering this late only wastes the work of rewinding.
 
 Name the branch `<type>/<short-slug>` using the Conventional Commits type that
 will dominate the change — `feat/relay-handshake`, `fix/frame-length-guard`,
-`ci/rust-job`. Land it through a pull request; only rebase and squash merges are
-offered, and unresolved review threads block the merge. Write commit messages as
-Conventional Commits. The agent chooses coherent commit boundaries.
+`ci/rust-job`. Land it through a pull request; rebase, squash and merge commits
+are all offered, and unresolved review threads block the merge. Prefer a merge
+commit when the branch's own commits are worth keeping as history, and a squash
+when they are not. Write commit messages as Conventional Commits. The agent
+chooses coherent commit boundaries.
 
 ## CI conventions
 

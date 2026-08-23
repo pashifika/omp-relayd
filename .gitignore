@@ -1,6 +1,9 @@
 # Local rasen run state and throwaway probes.
 .rasen/
 
+# Cargo build output.
+/server/target/
+
 # Agent tooling installed into this checkout, not project content: rasen mirrors
 # the same workflow skills into both directories on every install.
 .claude/
