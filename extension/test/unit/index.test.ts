@@ -7,7 +7,7 @@ import type {
   ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 
-import type { ClientState, SendRequest } from "../../src/client.ts";
+import { RequestFailed, type ClientState, type SendRequest } from "../../src/client.ts";
 import { CONFIG_PATH_ENV } from "../../src/config.ts";
 import ompRelay, {
   buildInboundPayload,
@@ -238,6 +238,27 @@ describe("mesh tool", () => {
 
     expect(output.details["status"]).toBe("unavailable");
     expect(client.listCalls).toBe(0);
+  });
+
+  test("connection loss while awaiting a receipt returns a stated failure", async () => {
+    const client = new RecordingClient();
+    client.send = async () => {
+      throw new RequestFailed("disconnected", "the relay connection closed");
+    };
+
+    const output = await executeMesh(client, {
+      action: "send",
+      to: "beta",
+      message: "review this",
+    });
+
+    expect(output.content[0]?.text).toBe(
+      "OMP Relay disconnected before the request completed.",
+    );
+    expect(output.details).toEqual({
+      status: "request_failed",
+      reason: "disconnected",
+    });
   });
 });
 
