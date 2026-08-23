@@ -1,18 +1,19 @@
 /**
- * The extension's runtime half, and the one connection failure that must not be
- * retried.
+ * The extension's runtime half: which start path opens a socket, what a join
+ * does to a live connection, and where an inbound message lands.
  *
  * `index.test.ts` covers registration and the pure helpers. What is exercised
  * here is everything that only exists once a session is running: which
  * scheduler the client is handed, which injection API an inbound message
- * reaches, and what happens when shutdown races session start. Those are claims
- * about wiring, so they are driven through the registered handlers against a
- * real socket rather than by calling the helpers directly — a helper called
- * directly proves nothing about whether the runtime ever calls it.
+ * reaches, whether `manual` really opens nothing, and what happens when a
+ * shutdown or a second join races the first. Those are claims about wiring, so
+ * they are driven through the registered handlers and the registered tool
+ * against a real socket rather than by calling the helpers directly — a helper
+ * called directly proves nothing about whether the runtime ever calls it.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,8 +27,18 @@ import {
   REQUEST_TIMEOUT_MS,
   type Report,
 } from "../../src/client.ts";
-import { CONFIG_PATH_ENV, type RelayConfig } from "../../src/config.ts";
-import ompRelay, { INBOUND_MESSAGE_TYPE } from "../../src/index.ts";
+import {
+  AGENT_DIR_ENV,
+  CONFIG_FILE_NAME,
+  PROJECT_ROOT_ENV,
+  projectConfigPath,
+  type RelayConfig,
+} from "../../src/config.ts";
+import ompRelay, {
+  INBOUND_MESSAGE_TYPE,
+  OUTBOUND_MESSAGE_TYPE,
+  type MeshToolResult,
+} from "../../src/index.ts";
 import { PROTOCOL_VERSION } from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
 import { ScriptedRelay, type RelaySession, type Script } from "../support/scripted-relay.ts";
@@ -51,6 +62,12 @@ function isHello(value: unknown): boolean {
     value !== null &&
     (value as Record<string, unknown>)["type"] === "hello"
   );
+}
+
+function frameField(value: unknown, field: string): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)[field]
+    : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +194,14 @@ interface ContextTimers {
   readonly intervals: number[];
 }
 
+type ToolExecute = (
+  toolCallId: string,
+  args: Record<string, unknown>,
+  signal: undefined,
+  onUpdate: undefined,
+  ctx: ExtensionContext,
+) => Promise<MeshToolResult>;
+
 interface SessionHarness {
   readonly api: ExtensionAPI;
   readonly handlers: Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>;
@@ -184,9 +209,11 @@ interface SessionHarness {
   readonly contextTimers: ContextTimers;
   readonly ctx: ExtensionContext;
   readonly notifications: string[];
+  /** Invokes the registered `mesh` tool exactly as the runtime would. */
+  mesh(args: Record<string, unknown>, ctx?: ExtensionContext): Promise<MeshToolResult>;
 }
 
-function sessionHarness(): SessionHarness {
+function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
   const calls: RuntimeCalls = {
     customMessages: [],
@@ -196,6 +223,7 @@ function sessionHarness(): SessionHarness {
   };
   const contextTimers: ContextTimers = { timeouts: [], intervals: [] };
   const notifications: string[] = [];
+  let execute: ToolExecute | null = null;
 
   const chain = {
     describe() {
@@ -218,7 +246,9 @@ function sessionHarness(): SessionHarness {
       },
     },
     logger: { error() {} },
-    registerTool() {},
+    registerTool(tool: { execute: ToolExecute }) {
+      execute = tool.execute;
+    },
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
       handlers.set(event, handler);
     },
@@ -238,7 +268,8 @@ function sessionHarness(): SessionHarness {
   // The real ambient timers, captured at module load, so replacing the globals
   // in a test does not turn the context's own delegation into an ambient call.
   const ctx = {
-    mode: "tui",
+    mode,
+    cwd,
     ui: {
       notify(message: string) {
         notifications.push(message);
@@ -258,37 +289,73 @@ function sessionHarness(): SessionHarness {
     },
   } as unknown as ExtensionContext;
 
-  return { api, handlers, calls, contextTimers, ctx, notifications };
+  return {
+    api,
+    handlers,
+    calls,
+    contextTimers,
+    ctx,
+    notifications,
+    mesh(args, override) {
+      if (execute === null) throw new Error("the extension registered no tool");
+      return execute("call-1", args, undefined, undefined, override ?? ctx);
+    },
+  };
 }
 
-const originalConfigPath = process.env[CONFIG_PATH_ENV];
+const originalAgentDir = process.env[AGENT_DIR_ENV];
+const originalProjectRoot = process.env[PROJECT_ROOT_ENV];
 
 afterEach(() => {
-  if (originalConfigPath === undefined) {
-    delete process.env[CONFIG_PATH_ENV];
-  } else {
-    process.env[CONFIG_PATH_ENV] = originalConfigPath;
+  for (const [key, value] of [
+    [AGENT_DIR_ENV, originalAgentDir],
+    [PROJECT_ROOT_ENV, originalProjectRoot],
+  ] as const) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
 });
 
-/** Writes a configuration the loader accepts, pointing at `port`. */
-function configFileFor(port: number): string {
-  const path = join(mkdtempSync(join(tmpdir(), "omp-relay-runtime-")), "omp-relay.yml");
+/** One scratch machine: both layers written, and `process.env` pointed at them. */
+interface Layers {
+  readonly agentDir: string;
+  readonly projectRoot: string;
+}
+
+function layers(
+  options: {
+    readonly port: number;
+    readonly startup?: "manual" | "auto";
+    readonly purpose?: string;
+    readonly task?: string;
+  },
+): Layers {
+  const agentDir = mkdtempSync(join(tmpdir(), "omp-relay-agent-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "omp-relay-root-"));
   writeFileSync(
-    path,
+    join(agentDir, CONFIG_FILE_NAME),
     [
       "transport:",
       "  mode: local",
-      `  address: 127.0.0.1:${port}`,
-      "room:",
-      `  project: ${ROOM.project}`,
-      `  task: ${ROOM.task}`,
-      `peer: ${PEER}`,
+      `  address: 127.0.0.1:${options.port}`,
+      ...(options.startup === undefined ? [] : [`startup: ${options.startup}`]),
+      "peer:",
+      `  name: ${PEER}`,
+      ...(options.purpose === undefined ? [] : [`  purpose: ${JSON.stringify(options.purpose)}`]),
       "",
     ].join("\n"),
     "utf8",
   );
-  return path;
+  mkdirSync(join(projectRoot, ".omp"), { recursive: true });
+  writeFileSync(
+    projectConfigPath(projectRoot),
+    ["room:", `  project: ${ROOM.project}`, `  task: ${options.task ?? ROOM.task}`, ""].join("\n"),
+    "utf8",
+  );
+
+  process.env[AGENT_DIR_ENV] = agentDir;
+  process.env[PROJECT_ROOT_ENV] = projectRoot;
+  return { agentDir, projectRoot };
 }
 
 /** The one inbound frame these tests deliver, and the text it must render to. */
@@ -298,6 +365,14 @@ const INBOUND = {
   from: "alpha",
   body: "Please review the parser.",
   reply_to: "message-3",
+} as const;
+
+/** The same message with no correlation, for the preamble tests. */
+const PLAIN_INBOUND = {
+  type: "message",
+  id: "message-42",
+  from: "alpha",
+  body: "Please review the parser.",
 } as const;
 
 const INBOUND_TEXT = [
@@ -311,25 +386,91 @@ const INBOUND_TEXT = [
 ].join("\n");
 
 /**
- * Admits the connection and delivers {@link INBOUND} on the same handshake.
+ * A relay that admits every connection, answers `list`, and can deliver
+ * messages on demand.
  *
- * Both frames are written in `ready`-then-`message` order, which is what makes
- * the delivery deterministic: the client dispatches a chunk's frames in order,
- * so the connection is ready by the time the message is routed.
+ * `list` is answered because a join is not complete until the roster comes
+ * back, so every join-driven test needs it; the hellos are recorded because
+ * "the relay saw the new room" is what makes a rejoin observable from the far
+ * side rather than only from the caller's own report.
  */
+interface Recorder {
+  readonly script: Script;
+  readonly hellos: Array<{ project: string; task: string; peer: string }>;
+  readonly sends: unknown[];
+  /** Delivers a frame on the most recent connection. */
+  deliver(frame: Parameters<RelaySession["send"]>[0]): void;
+  peers: readonly string[];
+}
+
+function recordingRelay(options: { deliverOnReady?: readonly unknown[] } = {}): Recorder {
+  const hellos: Array<{ project: string; task: string; peer: string }> = [];
+  const sends: unknown[] = [];
+  let latest: RelaySession | null = null;
+  const recorder: Recorder = {
+    hellos,
+    sends,
+    peers: [PEER],
+    deliver(frame) {
+      latest?.send(frame);
+    },
+    script: (frame, session) => {
+      latest = session;
+      const type = frameField(frame, "type");
+      if (type === "hello") {
+        const room = frameField(frame, "room") as Record<string, unknown> | undefined;
+        hellos.push({
+          project: String(room?.["project"]),
+          task: String(room?.["task"]),
+          peer: String(frameField(frame, "peer")),
+        });
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        for (const extra of options.deliverOnReady ?? []) {
+          session.send(extra as Parameters<RelaySession["send"]>[0]);
+        }
+        return;
+      }
+      if (type === "list") {
+        session.send({
+          type: "peers",
+          request_id: String(frameField(frame, "request_id")),
+          peers: recorder.peers,
+        });
+        return;
+      }
+      if (type === "send") {
+        sends.push(frame);
+        session.send({
+          type: "receipt",
+          id: String(frameField(frame, "id")),
+          to: String(frameField(frame, "to")),
+          status: "routed",
+        });
+      }
+    },
+  };
+  return recorder;
+}
+
+/** Admits the connection and delivers {@link INBOUND} on the same handshake. */
 const ADMIT_AND_DELIVER: Script = (frame, session) => {
   if (!isHello(frame)) return;
   session.send({ type: "ready", protocol: PROTOCOL_VERSION });
   session.send(INBOUND);
 };
 
-/** Starts a session against a scripted relay and returns its harness. */
-async function startSession(
+/** Starts an `auto` session against a scripted relay and returns its harness. */
+async function startAutoSession(
   relay: ScriptedRelay,
+  options: { purpose?: string } = {},
 ): Promise<{ harness: SessionHarness; shutdown: () => Promise<void> }> {
-  const harness = sessionHarness();
+  const written = layers({
+    port: relay.port,
+    startup: "auto",
+    ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
+  });
+  const harness = sessionHarness(written.projectRoot);
   ompRelay(harness.api);
-  process.env[CONFIG_PATH_ENV] = configFileFor(relay.port);
 
   await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
 
@@ -340,6 +481,305 @@ async function startSession(
     },
   };
 }
+
+describe("the startup mode decides whether session start connects", () => {
+  test("manual opens no socket at session start, and exactly one after a join", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      // Nothing resolved and nothing opened: not a timing claim but a state
+      // one, because `session_start` has already returned.
+      expect(relay.connections).toBe(0);
+      expect(harness.contextTimers.timeouts).toEqual([]);
+      expect(harness.notifications).toEqual([]);
+
+      const joined = await harness.mesh({ action: "join" });
+
+      expect(relay.connections).toBe(1);
+      expect(recorder.hellos).toEqual([{ ...ROOM, peer: PEER }]);
+      expect(joined.details["status"]).toBeUndefined();
+      expect(joined.content[0]?.text).toContain(`Joined ${ROOM.project}/${ROOM.task} as ${PEER}`);
+      console.log(
+        `manual startup: ${0} connection(s) at session start, ${relay.connections} after join; relay saw room ${recorder.hellos[0]?.project}/${recorder.hellos[0]?.task}`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("auto connects at session start with no tool call at all", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await relay.awaitReceived(1);
+
+      expect(relay.connections).toBe(1);
+      expect(recorder.hellos).toEqual([{ ...ROOM, peer: PEER }]);
+      console.log(
+        `auto startup: relay saw ${recorder.hellos.length} hello with no tool invocation`,
+      );
+
+      await shutdown();
+      void harness;
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a non-interactive session neither connects at start nor may join", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port, startup: "auto" });
+      const harness = sessionHarness(written.projectRoot, "rpc");
+      ompRelay(harness.api);
+
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      const refused = await harness.mesh({ action: "join" });
+
+      expect(relay.connections).toBe(0);
+      expect(refused.details["reason"]).toBe("not_interactive");
+      console.log(
+        `rpc session: ${relay.connections} connection(s), join refused as ${refused.details["reason"]}`,
+      );
+    } finally {
+      await relay.close();
+    }
+  });
+});
+
+describe("joining a live session", () => {
+  test("a different task reconnects, and the relay sees the new room", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      await harness.mesh({ action: "join" });
+      const rejoined = await harness.mesh({ action: "join", task: "pr-471-review" });
+
+      expect(relay.connections).toBe(2);
+      expect(relay.open).toBe(1);
+      expect(recorder.hellos).toEqual([
+        { ...ROOM, peer: PEER },
+        { project: ROOM.project, task: "pr-471-review", peer: PEER },
+      ]);
+      expect(rejoined.content[0]?.text).toContain(`Joined ${ROOM.project}/pr-471-review`);
+      expect(rejoined.details["sources"]).toEqual({
+        project: "project-file",
+        task: "parameter",
+        peer: "global-file",
+      });
+      console.log(
+        `rejoin: relay saw rooms ${recorder.hellos.map((h) => `${h.project}/${h.task}`).join(" then ")}; ${relay.open} connection open of ${relay.connections} accepted`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("the room already held is a no-op that does not close the socket", async () => {
+    // Reconnecting would make this peer briefly vanish from every other roster
+    // for no gain, so the identical case is answered from the live connection.
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      await harness.mesh({ action: "join" });
+      const again = await harness.mesh({ action: "join", task: ROOM.task });
+
+      expect(relay.connections).toBe(1);
+      expect(relay.open).toBe(1);
+      expect(recorder.hellos).toHaveLength(1);
+      expect(again.details["unchanged"]).toBe(true);
+      expect(again.content[0]?.text).toStartWith("Already joined");
+      console.log(
+        `identical rejoin: ${recorder.hellos.length} hello total, unchanged=${again.details["unchanged"]}`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("two concurrent joins leave exactly one client", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      // Not awaited in turn: the generation counter exists for exactly this
+      // window, and awaiting the first would close it.
+      const [first, second] = await Promise.all([
+        harness.mesh({ action: "join", task: "first-room" }),
+        harness.mesh({ action: "join", task: "second-room" }),
+      ]);
+
+      const superseded = [first, second].filter((r) =>
+        (r.content[0]?.text ?? "").includes("superseded"),
+      );
+      const succeeded = [first, second].filter((r) => r.details["action"] === "join" && r.details["status"] === undefined);
+
+      expect(superseded).toHaveLength(1);
+      expect(succeeded).toHaveLength(1);
+      expect(relay.open).toBe(1);
+      expect(recorder.hellos).toHaveLength(relay.connections);
+      expect(succeeded[0]?.details["task"]).toBe("second-room");
+      console.log(
+        `concurrent joins: ${relay.connections} connection(s) accepted, ${relay.open} open; winner joined ${succeeded[0]?.details["task"]}, loser reported "${superseded[0]?.content[0]?.text}"`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a routed send through the tool leaves a session entry beside the receipt", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      await harness.mesh({ action: "join" });
+
+      const sent = await harness.mesh({
+        action: "send",
+        to: "alpha",
+        message: "Run the suite and report.",
+        reply_to: "message-3",
+      });
+
+      expect(sent.details["status"]).toBe("routed");
+      expect(harness.calls.entries).toEqual([
+        {
+          customType: OUTBOUND_MESSAGE_TYPE,
+          data: {
+            id: sent.details["id"],
+            to: "alpha",
+            project: ROOM.project,
+            task: ROOM.task,
+            body: "Run the suite and report.",
+            status: "routed",
+            reply_to: "message-3",
+          },
+        },
+      ]);
+      console.log(`outbound entry persisted: ${JSON.stringify(harness.calls.entries[0])}`);
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+});
+
+describe("the machine's purpose under automatic startup", () => {
+  test("rides the first inbound message and is not repeated on the second", async () => {
+    // There is no join result to carry it and no operator present at connect
+    // time, so the moment work arrives is the moment the policy matters. Once
+    // is enough: the text is then in the transcript.
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { purpose });
+      await relay.awaitReceived(1);
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-1" });
+      await harness.calls.injected.until(1);
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-2" });
+      await harness.calls.injected.until(2);
+
+      const first = String(harness.calls.userMessages[0]?.content);
+      const second = String(harness.calls.userMessages[1]?.content);
+      expect(first.split("\n").slice(0, 3)).toEqual([
+        "This terminal's configured purpose, from its own operator:",
+        purpose,
+        "",
+      ]);
+      expect(second).not.toContain(purpose);
+      expect(second.split("\n")[0]).toBe("Remote message from alpha");
+      console.log(
+        `auto session: message 1 carried the purpose preamble (${first.split("\n").length} lines), message 2 did not (${second.split("\n").length} lines)`,
+      );
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("no configured purpose injects no preamble", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await relay.awaitReceived(1);
+
+      recorder.deliver(PLAIN_INBOUND);
+      await harness.calls.injected.until(1);
+
+      const text = String(harness.calls.userMessages[0]?.content);
+      expect(text.split("\n")[0]).toBe("Remote message from alpha");
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a manual join returns the purpose instead of injecting it later", async () => {
+    const purpose = "Answer review requests only.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port, purpose });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+
+      const joined = await harness.mesh({ action: "join" });
+      expect(joined.details["purpose"]).toBe(purpose);
+
+      recorder.deliver(PLAIN_INBOUND);
+      await harness.calls.injected.until(1);
+      const text = String(harness.calls.userMessages[0]?.content);
+      expect(text).not.toContain(purpose);
+      console.log(
+        `manual startup: purpose delivered in the join result, and absent from the ${text.split("\n").length}-line inbound injection`,
+      );
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+});
 
 describe("the session runtime", () => {
   test("schedules every client timer through the context, never the ambient timers", async () => {
@@ -360,7 +800,7 @@ describe("the session runtime", () => {
     };
 
     try {
-      const { harness, shutdown } = await startSession(relay);
+      const { harness, shutdown } = await startAutoSession(relay);
       // Waiting on the injection is waiting on readiness: the heartbeat is armed
       // by the same `ready` that admits the message.
       await harness.calls.injected.until(1);
@@ -395,7 +835,7 @@ describe("the session runtime", () => {
   test("delivers an inbound message as a user prompt and persists its provenance", async () => {
     const relay = await ScriptedRelay.start(ADMIT_AND_DELIVER);
     try {
-      const { harness, shutdown } = await startSession(relay);
+      const { harness, shutdown } = await startAutoSession(relay);
       await harness.calls.injected.until(1);
 
       // The delivery option is asserted, not treated as incidental: it is the
@@ -442,7 +882,7 @@ describe("the session runtime", () => {
     // package this project does not depend on.
     const relay = await ScriptedRelay.start(ADMIT_AND_DELIVER);
     try {
-      const { harness, shutdown } = await startSession(relay);
+      const { harness, shutdown } = await startAutoSession(relay);
       await harness.calls.injected.until(1);
 
       expect(harness.calls.customMessages).toEqual([]);
@@ -457,9 +897,9 @@ describe("the session runtime", () => {
   test("a shutdown arriving while session start reads configuration opens no socket", async () => {
     const relay = await ScriptedRelay.start(ADMIT_AND_DELIVER);
     try {
-      const harness = sessionHarness();
+      const written = layers({ port: relay.port, startup: "auto" });
+      const harness = sessionHarness(written.projectRoot);
       ompRelay(harness.api);
-      process.env[CONFIG_PATH_ENV] = configFileFor(relay.port);
 
       // Not awaited: the handler suspends on the configuration read, which is
       // the window the generation guard exists for.
@@ -477,7 +917,7 @@ describe("the session runtime", () => {
       // listener strictly after the raced handler resumed, so once that session
       // has been admitted, a socket the raced handler had opened would already
       // be counted ahead of it.
-      const second = await startSession(relay);
+      const second = await startAutoSession(relay);
       await second.harness.calls.injected.until(1);
 
       expect(relay.connections).toBe(1);

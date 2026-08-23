@@ -97,6 +97,17 @@ export class ScriptedRelay {
     return this.#connections;
   }
 
+  /**
+   * Connections still open right now.
+   *
+   * Distinct from {@link connections}, which only grows: a rejoin is a stop and
+   * a fresh handshake, so "two connections were accepted" and "two clients are
+   * live" are different claims and only the second is a defect.
+   */
+  get open(): number {
+    return this.#sockets.size;
+  }
+
   /** Replaces the script, so one test can change the relay's behavior mid-run. */
   rescript(script: Script): void {
     this.#script = script;

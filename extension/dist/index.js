@@ -2215,14 +2215,62 @@ class RelayClient {
 }
 
 // src/config.ts
+import { existsSync } from "fs";
 import { readFile } from "fs/promises";
-import { join } from "path";
-var CONFIG_PATH_ENV = "OMP_RELAY_CONFIG";
-var DEFAULT_CONFIG_SEGMENTS = [".omp", "agent", "omp-relay.yml"];
-function resolveConfigPath(env) {
-  const override = env[CONFIG_PATH_ENV];
+import { hostname } from "os";
+import { dirname, join, resolve } from "path";
+var AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+var PROJECT_ROOT_ENV = "OMP_PROJECT_ROOT";
+var AGENT_DIR_SEGMENTS = [".omp", "agent"];
+var CONFIG_FILE_NAME = "omp-relay.yml";
+var PROJECT_CONFIG_SEGMENTS = [".omp", CONFIG_FILE_NAME];
+var PROJECT_MARKERS = [
+  "package.json",
+  "Cargo.toml",
+  "go.mod",
+  "pyproject.toml",
+  "deno.json",
+  "Gemfile",
+  "composer.json",
+  "pom.xml",
+  "build.gradle",
+  "mix.exs"
+];
+var MAX_PURPOSE_BYTES = 4096;
+function resolveProjectRoot(env, cwd) {
+  const override = env[PROJECT_ROOT_ENV];
   if (override !== undefined && override.length > 0) {
-    return { ok: true, path: override };
+    return { path: resolve(override), marker: PROJECT_ROOT_ENV };
+  }
+  const home = env["HOME"];
+  const ancestors = [];
+  for (let current = resolve(cwd);; ) {
+    if (home !== undefined && home.length > 0 && current === resolve(home))
+      break;
+    ancestors.push(current);
+    const parent = dirname(current);
+    if (parent === current)
+      break;
+    current = parent;
+  }
+  for (const candidate of ancestors) {
+    if (existsSync(join(candidate, ".git"))) {
+      return { path: candidate, marker: ".git" };
+    }
+  }
+  for (const candidate of ancestors) {
+    for (const marker of PROJECT_MARKERS) {
+      if (existsSync(join(candidate, marker))) {
+        return { path: candidate, marker };
+      }
+    }
+  }
+  return { path: resolve(cwd), marker: "working directory" };
+}
+function globalConfigPath(env) {
+  const override = env[AGENT_DIR_ENV];
+  if (override !== undefined && override.length > 0) {
+    return { ok: true, path: join(override, CONFIG_FILE_NAME) };
   }
   const home = env["HOME"];
   if (home === undefined || home.length === 0) {
@@ -2230,91 +2278,244 @@ function resolveConfigPath(env) {
       ok: false,
       problem: {
         field: null,
-        reason: `neither ${CONFIG_PATH_ENV} nor HOME is set, so there is no configuration path to read`
+        reason: `neither ${AGENT_DIR_ENV} nor HOME is set, so there is no agent directory to read ${CONFIG_FILE_NAME} from`
       }
     };
   }
-  return { ok: true, path: join(home, ...DEFAULT_CONFIG_SEGMENTS) };
+  return { ok: true, path: join(home, ...AGENT_DIR_SEGMENTS, CONFIG_FILE_NAME) };
 }
-async function loadConfig(env) {
-  const resolved = resolveConfigPath(env);
-  if (!resolved.ok) {
-    return { ok: false, path: null, problem: resolved.problem };
-  }
-  const path = resolved.path;
+function projectConfigPath(root) {
+  return join(root, ...PROJECT_CONFIG_SEGMENTS);
+}
+async function parseFile(path) {
   let text;
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
     const missing = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-    return {
-      ok: false,
-      path,
-      problem: {
-        field: null,
-        reason: missing ? `configuration file ${path} does not exist` : `configuration file ${path} could not be read: ${describe(error)}`
-      }
-    };
+    return missing ? { kind: "absent" } : { kind: "unreadable", reason: `configuration file ${path} could not be read: ${describe(error)}` };
   }
-  let parsed;
   try {
-    parsed = Bun.YAML.parse(text);
+    return { kind: "document", document: Bun.YAML.parse(text) };
   } catch (error) {
     return {
-      ok: false,
-      path,
-      problem: {
-        field: null,
-        reason: `configuration file ${path} is not valid YAML: ${describe(error)}`
-      }
+      kind: "unreadable",
+      reason: `configuration file ${path} is not valid YAML: ${describe(error)}`
     };
   }
-  const validated = validateConfig(parsed);
+}
+async function loadGlobalConfig(env) {
+  const resolved = globalConfigPath(env);
+  if (!resolved.ok) {
+    return { ok: false, path: null, absent: false, problem: resolved.problem };
+  }
+  const path = resolved.path;
+  const parsed = await parseFile(path);
+  if (parsed.kind === "absent") {
+    return {
+      ok: false,
+      path,
+      absent: true,
+      problem: { field: null, reason: `global configuration file ${path} does not exist` }
+    };
+  }
+  if (parsed.kind === "unreadable") {
+    return { ok: false, path, absent: false, problem: { field: null, reason: parsed.reason } };
+  }
+  const validated = validateGlobalConfig(parsed.document, path);
+  if (!validated.ok) {
+    return { ok: false, path, absent: false, problem: validated.problem };
+  }
+  return { ok: true, path, config: validated.config };
+}
+async function loadProjectConfig(path) {
+  const parsed = await parseFile(path);
+  if (parsed.kind === "absent") {
+    return { ok: true, path: null, config: { project: null, task: null } };
+  }
+  if (parsed.kind === "unreadable") {
+    return { ok: false, path, problem: { field: null, reason: parsed.reason } };
+  }
+  const validated = validateProjectConfig(parsed.document, path);
   if (!validated.ok) {
     return { ok: false, path, problem: validated.problem };
   }
   return { ok: true, path, config: validated.config };
 }
-function validateConfig(document) {
+var GLOBAL_ONLY_FIELDS = ["transport", "startup", "peer", "purpose"];
+function validateGlobalConfig(document, path) {
   const root = asRecord(document);
   if (root === null) {
-    return problem(null, `configuration must be a mapping, found ${typeName(document)}`);
+    return problem(null, `${path} must contain a mapping, found ${typeName(document)}`);
+  }
+  if (root["room"] !== undefined) {
+    return problem("room", `room may not appear in the global file ${path}; a room belongs to the work, so it is read only from the project file`);
   }
   const transport = asRecord(root["transport"]);
   if (transport === null) {
-    return problem("transport", `transport must be a mapping, found ${typeName(root["transport"])}`);
+    return problem("transport", `transport must be a mapping in ${path}, found ${typeName(root["transport"])}`);
   }
   const mode = transport["mode"];
   if (mode !== "local") {
-    return problem("transport.mode", `transport.mode must be "local", found ${describeValue(mode)}`);
+    return problem("transport.mode", `transport.mode must be "local" in ${path}, found ${describeValue(mode)}`);
   }
   const rawAddress = transport["address"];
   if (typeof rawAddress !== "string" || rawAddress.length === 0) {
-    return problem("transport.address", `transport.address must be a "host:port" string, found ${typeName(rawAddress)}`);
+    return problem("transport.address", `transport.address must be a "host:port" string in ${path}, found ${typeName(rawAddress)}`);
   }
   const address = parseAddress(rawAddress);
   if (address === null) {
-    return problem("transport.address", `transport.address ${describeValue(rawAddress)} is not a "host:port" pair with a port in 1-65535`);
+    return problem("transport.address", `transport.address ${describeValue(rawAddress)} in ${path} is not a "host:port" pair with a port in 1-65535`);
   }
-  const room = asRecord(root["room"]);
-  if (room === null) {
-    return problem("room", `room must be a mapping, found ${typeName(root["room"])}`);
+  const rawStartup = root["startup"];
+  let startup = "manual";
+  if (rawStartup !== undefined && rawStartup !== null) {
+    if (rawStartup !== "manual" && rawStartup !== "auto") {
+      return problem("startup", `startup must be "manual" or "auto" in ${path}, found ${describeValue(rawStartup)}`);
+    }
+    startup = rawStartup;
   }
-  const project = checkIdentifier(room["project"], "room.project");
-  if (!project.ok)
-    return project;
-  const task = checkIdentifier(room["task"], "room.task");
-  if (!task.ok)
-    return task;
-  const peer = checkIdentifier(root["peer"], "peer");
-  if (!peer.ok)
-    return peer;
+  let peerName = null;
+  let purpose = null;
+  const rawPeer = root["peer"];
+  if (rawPeer !== undefined && rawPeer !== null) {
+    const peer = asRecord(rawPeer);
+    if (peer === null) {
+      return problem("peer", `peer must be a mapping with optional name and purpose in ${path}, found ${typeName(rawPeer)}`);
+    }
+    if (peer["name"] !== undefined && peer["name"] !== null) {
+      const checked = checkIdentifier(peer["name"], "peer.name", path);
+      if (!checked.ok)
+        return checked;
+      peerName = checked.value;
+    }
+    if (peer["purpose"] !== undefined && peer["purpose"] !== null) {
+      const checked = checkPurpose(peer["purpose"], path);
+      if (!checked.ok)
+        return checked;
+      purpose = checked.value;
+    }
+  }
   return {
     ok: true,
     config: {
       transport: { mode: "local", host: address.host, port: address.port },
-      room: { project: project.value, task: task.value },
-      peer: peer.value
+      startup,
+      peer: peerName,
+      purpose
+    }
+  };
+}
+function validateProjectConfig(document, path) {
+  const root = asRecord(document);
+  if (root === null) {
+    return problem(null, `${path} must contain a mapping, found ${typeName(document)}`);
+  }
+  for (const field of GLOBAL_ONLY_FIELDS) {
+    if (root[field] !== undefined) {
+      return problem(field, `${field} may not appear in the project file ${path}; a committed file may name only the room, ` + `because a checkout able to name ${field} would decide something about the machine that cloned it`);
+    }
+  }
+  const rawRoom = root["room"];
+  if (rawRoom === undefined || rawRoom === null) {
+    return { ok: true, config: { project: null, task: null } };
+  }
+  const room = asRecord(rawRoom);
+  if (room === null) {
+    return problem("room", `room must be a mapping in ${path}, found ${typeName(rawRoom)}`);
+  }
+  let project = null;
+  let task = null;
+  if (room["project"] !== undefined && room["project"] !== null) {
+    const checked = checkIdentifier(room["project"], "room.project", path);
+    if (!checked.ok)
+      return checked;
+    project = checked.value;
+  }
+  if (room["task"] !== undefined && room["task"] !== null) {
+    const checked = checkIdentifier(room["task"], "room.task", path);
+    if (!checked.ok)
+      return checked;
+    task = checked.value;
+  }
+  return { ok: true, config: { project, task } };
+}
+function derivePeerName(raw) {
+  const label = raw.split(".")[0] ?? "";
+  const broken = identifierProblem(label);
+  if (broken !== null) {
+    return problem("peer.name", `no peer name is configured and the host name ${describeValue(raw)} cannot supply one because its first label ` + `${describeIdentifierProblem(broken)}; set peer.name in the global configuration file`);
+  }
+  return { ok: true, value: label };
+}
+async function resolveClient(options) {
+  const global = await loadGlobalConfig(options.env);
+  if (!global.ok) {
+    return { ok: false, path: global.path, absent: global.absent, problem: global.problem };
+  }
+  return resolveWithGlobal(global.config, global.path, options);
+}
+async function resolveWithGlobal(global, globalPath, options) {
+  const parameters = options.parameters ?? {};
+  const projectRoot = resolveProjectRoot(options.env, options.cwd);
+  const needsProjectFile = parameters.project === undefined || parameters.task === undefined;
+  let projectFile = { project: null, task: null };
+  let projectPath = null;
+  if (needsProjectFile) {
+    const loaded = await loadProjectConfig(projectConfigPath(projectRoot.path));
+    if (!loaded.ok) {
+      return { ok: false, path: loaded.path, absent: false, problem: loaded.problem };
+    }
+    projectFile = loaded.config;
+    projectPath = loaded.path;
+  }
+  const project = parameters.project ?? projectFile.project;
+  const task = parameters.task ?? projectFile.task;
+  if (project === null || task === null) {
+    const missing = [
+      ...project === null ? ["room.project"] : [],
+      ...task === null ? ["room.task"] : []
+    ];
+    return {
+      ok: false,
+      path: projectPath,
+      absent: false,
+      problem: {
+        field: missing[0],
+        reason: `${missing.join(" and ")} ${missing.length === 1 ? "has" : "have"} no value: ` + `${projectPath === null ? `no project file exists at ${projectConfigPath(projectRoot.path)}` : `${projectPath} does not name ${missing.join(" or ")}`}` + `, and the join request supplied ${missing.length === 1 ? "no value for it" : "neither"}`
+      }
+    };
+  }
+  let peer;
+  let peerSource;
+  if (parameters.as !== undefined) {
+    peer = parameters.as;
+    peerSource = "parameter";
+  } else if (global.peer !== null) {
+    peer = global.peer;
+    peerSource = "global-file";
+  } else {
+    const derived = derivePeerName(options.hostName ?? hostname());
+    if (!derived.ok) {
+      return { ok: false, path: globalPath, absent: false, problem: derived.problem };
+    }
+    peer = derived.value;
+    peerSource = "derivation";
+  }
+  return {
+    ok: true,
+    resolved: {
+      config: { transport: global.transport, room: { project, task }, peer },
+      startup: global.startup,
+      purpose: global.purpose,
+      sources: {
+        project: parameters.project === undefined ? "project-file" : "parameter",
+        task: parameters.task === undefined ? "project-file" : "parameter",
+        peer: peerSource
+      },
+      globalPath,
+      projectPath,
+      projectRoot
     }
   };
 }
@@ -2348,13 +2549,26 @@ function parseAddress(value) {
   }
   return { host, port };
 }
-function checkIdentifier(value, field) {
+function checkIdentifier(value, field, path) {
   if (typeof value !== "string") {
-    return problem(field, `${field} must be a string, found ${typeName(value)}`);
+    return problem(field, `${field} must be a string in ${path}, found ${typeName(value)}`);
   }
   const broken = identifierProblem(value);
   if (broken !== null) {
-    return problem(field, `${field} ${describeIdentifierProblem(broken)}`);
+    return problem(field, `${field} in ${path} ${describeIdentifierProblem(broken)}`);
+  }
+  return { ok: true, value };
+}
+function checkPurpose(value, path) {
+  if (typeof value !== "string") {
+    return problem("peer.purpose", `peer.purpose must be a string in ${path}, found ${typeName(value)}`);
+  }
+  if (value.trim().length === 0) {
+    return problem("peer.purpose", `peer.purpose in ${path} is empty; remove the field rather than setting it to nothing`);
+  }
+  const found = utf8Length(value);
+  if (found > MAX_PURPOSE_BYTES) {
+    return problem("peer.purpose", `peer.purpose in ${path} is ${found} UTF-8 bytes, above the ${MAX_PURPOSE_BYTES}-byte budget`);
   }
   return { ok: true, value };
 }
@@ -2383,10 +2597,12 @@ function typeName(value) {
 
 // src/index.ts
 var INBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.message";
+var OUTBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.sent";
 var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var CONTROL_CHARACTERS_OUTSIDE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var NEUTRALIZED = "\uFFFD";
 var BODY_QUOTE = "> ";
+var PURPOSE_HEADING = "This terminal's configured purpose, from its own operator:";
 function singleLine(value) {
   return value.replace(CONTROL_CHARACTERS, NEUTRALIZED);
 }
@@ -2439,9 +2655,77 @@ function receiptResult(receipt) {
     status: receipt.status
   });
 }
-async function executeMesh(client, args) {
-  if (args.action !== "list" && args.action !== "send") {
-    return validationFailure('action must be "list" or "send"');
+var SOURCE_LABEL = {
+  parameter: "this join's parameter",
+  "project-file": "the project file",
+  "global-file": "the global file",
+  derivation: "the host name"
+};
+function joinResult(report) {
+  const others = report.peers.filter((name) => name !== report.peer);
+  const lines = [
+    report.unchanged ? `Already joined ${singleLine(report.room.project)}/${singleLine(report.room.task)} as ${singleLine(report.peer)}; the connection was left open.` : `Joined ${singleLine(report.room.project)}/${singleLine(report.room.task)} as ${singleLine(report.peer)}.`,
+    `Room project came from ${SOURCE_LABEL[report.sources.project]}, task from ${SOURCE_LABEL[report.sources.task]}, peer name from ${SOURCE_LABEL[report.sources.peer]}.`,
+    report.rosterFailure !== null ? `The roster is unknown: ${report.rosterFailure}` : others.length === 0 ? "No other peer is in this room; nobody will receive a message sent now." : `Other peers in this room: ${others.map(singleLine).join(", ")}`
+  ];
+  if (report.purpose !== null) {
+    lines.push("", PURPOSE_HEADING, report.purpose);
+  }
+  return result(lines.join(`
+`), {
+    action: "join",
+    project: report.room.project,
+    task: report.room.task,
+    peer: report.peer,
+    sources: { ...report.sources },
+    peers: [...report.peers],
+    unchanged: report.unchanged,
+    ...report.purpose === null ? {} : { purpose: report.purpose },
+    ...report.rosterFailure === null ? {} : { roster_failure: report.rosterFailure }
+  });
+}
+function joinParameter(value, name) {
+  if (value === undefined)
+    return { ok: true, value: undefined };
+  if (typeof value !== "string") {
+    return { ok: false, failure: validationFailure(`${name} must be a string when provided`) };
+  }
+  const broken = identifierProblem(value);
+  if (broken !== null) {
+    return { ok: false, failure: validationFailure(`${name} ${describeIdentifierProblem(broken)}`) };
+  }
+  return { ok: true, value };
+}
+async function executeMesh(host, args) {
+  if (args.action !== "join" && args.action !== "list" && args.action !== "send") {
+    return validationFailure('action must be "join", "list", or "send"');
+  }
+  if (args.action === "join") {
+    const project = joinParameter(args.project, "project");
+    if (!project.ok)
+      return project.failure;
+    const task = joinParameter(args.task, "task");
+    if (!task.ok)
+      return task.failure;
+    const as = joinParameter(args.as, "as");
+    if (!as.ok)
+      return as.failure;
+    if (!host.interactive) {
+      return result("OMP Relay registers only a top-level interactive session as a peer, and this session is not one; no connection was opened.", { action: "join", status: "refused", reason: "not_interactive" });
+    }
+    const outcome = await host.join({
+      ...project.value === undefined ? {} : { project: project.value },
+      ...task.value === undefined ? {} : { task: task.value },
+      ...as.value === undefined ? {} : { as: as.value }
+    });
+    if (!outcome.ok) {
+      return result(`OMP Relay could not join: ${outcome.problem.reason}`, {
+        action: "join",
+        status: "failed",
+        ...outcome.problem.field === null ? {} : { field: outcome.problem.field }
+      });
+    }
+    return joinResult(outcome.report);
   }
   if (args.action === "send") {
     if (typeof args.to !== "string") {
@@ -2464,11 +2748,9 @@ async function executeMesh(client, args) {
       }
     }
   }
+  const client = host.client;
   if (client === null || client.state !== "ready") {
-    return result("OMP Relay is not ready; no request was sent.", {
-      action: args.action,
-      status: "unavailable"
-    });
+    return result('OMP Relay is not ready; no request was sent. Call mesh with action "join" to connect.', { action: args.action, status: "unavailable" });
   }
   try {
     if (args.action === "list") {
@@ -2477,18 +2759,33 @@ async function executeMesh(client, args) {
       return result(text, { action: "list", peers: [...peers.peers] });
     }
     const id = crypto.randomUUID();
+    const to = args.to;
+    const body = args.message;
+    const replyTo = args.reply_to;
     const receipt = await client.send({
       id,
-      to: args.to,
-      body: args.message,
-      ...args.reply_to === undefined ? {} : { replyTo: args.reply_to }
+      to,
+      body,
+      ...replyTo === undefined ? {} : { replyTo }
     });
+    const room = host.room;
+    if (room !== null) {
+      host.recordSend({
+        id: receipt.id,
+        to: receipt.to,
+        project: room.project,
+        task: room.task,
+        body,
+        status: receipt.status,
+        ...replyTo === undefined ? {} : { reply_to: replyTo }
+      });
+    }
     return receiptResult(receipt);
   } catch (error) {
     return requestFailure(error);
   }
 }
-function buildInboundInjection(message, room) {
+function buildInboundInjection(message, room, purpose = null) {
   const details = {
     id: message.id,
     from: message.from,
@@ -2498,6 +2795,7 @@ function buildInboundInjection(message, room) {
     ...message.reply_to === undefined ? {} : { reply_to: message.reply_to }
   };
   const lines = [
+    ...purpose === null ? [] : [PURPOSE_HEADING, purpose, ""],
     `Remote message from ${singleLine(message.from)}`,
     `Project: ${singleLine(room.project)}`,
     `Task: ${singleLine(room.task)}`,
@@ -2525,10 +2823,13 @@ function schedulerFrom(ctx) {
     }
   };
 }
+var INTERACTIVE_MODE = "tui";
 function ompRelay(pi) {
   let client = null;
+  let live = null;
   let generation = 0;
   const notified = new Set;
+  let pendingPurpose = null;
   const notifyOnce = (ctx, message, type) => {
     if (notified.has(message))
       return;
@@ -2539,47 +2840,16 @@ function ompRelay(pi) {
       pi.logger.error("OMP Relay notification failed", { error: describe(error), message });
     }
   };
-  const parameters = pi.zod.object({
-    action: pi.zod.enum(["list", "send"]).describe("List connected peers or send a message"),
-    to: pi.zod.string().optional().describe("Peer name; required for send"),
-    message: pi.zod.string().optional().describe("Message body; required for send"),
-    reply_to: pi.zod.string().optional().describe("Message identifier being answered")
-  });
-  pi.registerTool({
-    name: "mesh",
-    label: "OMP Relay Mesh",
-    description: "List peers in the configured relay room or send work to one. A routed result means the message was queued for the recipient; it does not mean the recipient read, accepted, or answered it.",
-    parameters,
-    async execute(_toolCallId, args) {
-      return executeMesh(client, args);
-    }
-  });
-  pi.on("session_start", async (_event, ctx) => {
-    const thisGeneration = ++generation;
-    notified.clear();
-    const previous = client;
-    client = null;
-    if (previous !== null) {
-      await previous.stop();
-    }
-    if (ctx.mode !== "tui" || thisGeneration !== generation) {
-      return;
-    }
-    const configured = await loadConfig(process.env);
-    if (thisGeneration !== generation) {
-      return;
-    }
-    if (!configured.ok) {
-      notifyOnce(ctx, configured.problem.reason, "error");
-      return;
-    }
-    const config = configured.config;
+  const connect2 = (ctx, resolved) => {
+    const config = resolved.config;
     const next = new RelayClient({
       config,
       scheduler: schedulerFrom(ctx),
       handlers: {
         onMessage(message) {
-          const injection = buildInboundInjection(message, config.room);
+          const purpose = pendingPurpose;
+          pendingPurpose = null;
+          const injection = buildInboundInjection(message, config.room, purpose);
           pi.appendEntry(INBOUND_MESSAGE_TYPE, injection.details);
           pi.sendUserMessage(injection.text, { deliverAs: "steer" });
         },
@@ -2590,12 +2860,140 @@ function ompRelay(pi) {
       }
     });
     client = next;
+    live = { config, startup: resolved.startup };
+    pendingPurpose = resolved.startup === "auto" ? resolved.purpose : null;
     next.start();
+    return next;
+  };
+  const performJoin = async (ctx, parameters2) => {
+    const thisGeneration = ++generation;
+    const outcome = await resolveClient({ env: process.env, cwd: ctx.cwd, parameters: parameters2 });
+    if (thisGeneration !== generation) {
+      return {
+        ok: false,
+        problem: { field: null, reason: "a newer join superseded this one before it connected" }
+      };
+    }
+    if (!outcome.ok) {
+      return { ok: false, problem: outcome.problem };
+    }
+    const resolved = outcome.resolved;
+    const current = live;
+    const unchanged = current !== null && client !== null && current.config.room.project === resolved.config.room.project && current.config.room.task === resolved.config.room.task && current.config.peer === resolved.config.peer;
+    let active;
+    if (unchanged) {
+      active = client;
+    } else {
+      const previous = client;
+      client = null;
+      live = null;
+      if (previous !== null) {
+        await previous.stop();
+        if (thisGeneration !== generation) {
+          return {
+            ok: false,
+            problem: { field: null, reason: "a newer join superseded this one before it connected" }
+          };
+        }
+      }
+      active = connect2(ctx, resolved);
+    }
+    let peers = [];
+    let rosterFailure = null;
+    try {
+      peers = (await active.list()).peers;
+    } catch (error) {
+      rosterFailure = error instanceof RequestFailed ? `the relay did not answer the roster request (${error.reason})` : `the roster request failed: ${describe(error)}`;
+    }
+    if (thisGeneration !== generation) {
+      return {
+        ok: false,
+        problem: { field: null, reason: "a newer join superseded this one before it completed" }
+      };
+    }
+    return {
+      ok: true,
+      report: {
+        room: resolved.config.room,
+        peer: resolved.config.peer,
+        sources: resolved.sources,
+        peers,
+        purpose: resolved.startup === "manual" ? resolved.purpose : null,
+        unchanged,
+        rosterFailure
+      }
+    };
+  };
+  const parameters = pi.zod.object({
+    action: pi.zod.enum(["join", "list", "send"]).describe("Connect to a room, list connected peers, or send a message"),
+    project: pi.zod.string().optional().describe("join only: room project, overriding the project configuration file"),
+    task: pi.zod.string().optional().describe("join only: room task, overriding the project configuration file"),
+    as: pi.zod.string().optional().describe("join only: this session's peer name"),
+    to: pi.zod.string().optional().describe("Peer name; required for send"),
+    message: pi.zod.string().optional().describe("Message body; required for send"),
+    reply_to: pi.zod.string().optional().describe("Message identifier being answered")
+  });
+  pi.registerTool({
+    name: "mesh",
+    label: "OMP Relay Mesh",
+    description: "Join a relay room, list the peers in it, or send work to one of them. Join first: nothing else works until this session has joined, and the join result reports the room it resolved, where each part of it came from, and who else is present. A routed send result means the message was queued for the recipient; it does not mean the recipient read, accepted, or answered it.",
+    parameters,
+    async execute(_toolCallId, args, _signal, _onUpdate, ctx) {
+      const host = {
+        interactive: ctx.mode === INTERACTIVE_MODE,
+        client,
+        room: live?.config.room ?? null,
+        join: (request) => performJoin(ctx, request),
+        recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details)
+      };
+      return executeMesh(host, args);
+    }
+  });
+  pi.on("session_start", async (_event, ctx) => {
+    const thisGeneration = ++generation;
+    notified.clear();
+    pendingPurpose = null;
+    const previous = client;
+    client = null;
+    live = null;
+    if (previous !== null) {
+      await previous.stop();
+    }
+    if (ctx.mode !== INTERACTIVE_MODE || thisGeneration !== generation) {
+      return;
+    }
+    const global = await loadGlobalConfig(process.env);
+    if (thisGeneration !== generation) {
+      return;
+    }
+    if (!global.ok) {
+      if (!global.absent) {
+        notifyOnce(ctx, global.problem.reason, "error");
+      }
+      return;
+    }
+    if (global.config.startup !== "auto") {
+      return;
+    }
+    const outcome = await resolveWithGlobal(global.config, global.path, {
+      env: process.env,
+      cwd: ctx.cwd
+    });
+    if (thisGeneration !== generation) {
+      return;
+    }
+    if (!outcome.ok) {
+      notifyOnce(ctx, outcome.problem.reason, "error");
+      return;
+    }
+    connect2(ctx, outcome.resolved);
   });
   pi.on("session_shutdown", async () => {
     generation += 1;
     const active = client;
     client = null;
+    live = null;
+    pendingPurpose = null;
     if (active !== null) {
       await active.stop();
     }
@@ -2605,5 +3003,6 @@ export {
   executeMesh,
   ompRelay as default,
   buildInboundInjection,
+  OUTBOUND_MESSAGE_TYPE,
   INBOUND_MESSAGE_TYPE
 };
