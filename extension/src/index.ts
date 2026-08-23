@@ -42,6 +42,7 @@ export interface MeshToolResult {
   details: Record<string, unknown>;
 }
 
+/** The exact frame values for one inbound message, kept out of the model's context. */
 export interface InboundDetails {
   readonly id: string;
   readonly from: string;
@@ -51,12 +52,54 @@ export interface InboundDetails {
   readonly reply_to?: string;
 }
 
-export interface InboundPayload {
-  readonly customType: typeof INBOUND_MESSAGE_TYPE;
-  readonly content: string;
-  readonly display: true;
-  readonly attribution: "agent";
+/** What one validated inbound `message` frame contributes to the session. */
+export interface InboundInjection {
+  /** Rendered provenance and quoted body, delivered to the session as a user prompt. */
+  readonly text: string;
+  /** The unmodified frame values, persisted as a session entry rather than sent to the model. */
   readonly details: InboundDetails;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering untrusted text
+// ---------------------------------------------------------------------------
+
+/**
+ * Every character a line-oriented terminal sink must not receive verbatim: C0,
+ * DEL, C1, and the Unicode line and paragraph separators.
+ *
+ * The relay's identifier validation rejects only an empty or overlong name, `/`,
+ * `@`, and outer whitespace, so a protocol-valid peer name may carry an internal
+ * newline or an escape sequence, and a message body is unrestricted apart from
+ * its byte budget. Both end up in a Markdown renderer that deliberately
+ * preserves ANSI, so neutralizing them here is the only place it happens.
+ */
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
+
+/** The same set less `\t` and `\n`, which a body may legitimately contain. */
+const CONTROL_CHARACTERS_OUTSIDE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/gu;
+
+/** Stands in for one neutralized character: visible, inert, one column wide. */
+const NEUTRALIZED = "\uFFFD";
+
+/** Prefix on every rendered body line. See {@link buildInboundInjection}. */
+const BODY_QUOTE = "> ";
+
+/** `value` as one line that can neither move the cursor nor forge a second one. */
+function singleLine(value: string): string {
+  return value.replace(CONTROL_CHARACTERS, NEUTRALIZED);
+}
+
+/**
+ * `value` as quoted body lines: newlines and tabs kept, every other control
+ * character neutralized, and every line prefixed so no body line can occupy
+ * column zero, where the provenance header lives.
+ */
+function quotedBody(value: string): string[] {
+  return value
+    .replace(CONTROL_CHARACTERS_OUTSIDE_TEXT, NEUTRALIZED)
+    .split("\n")
+    .map((line) => `${BODY_QUOTE}${line}`);
 }
 
 function result(text: string, details: Record<string, unknown>): MeshToolResult {
@@ -158,7 +201,11 @@ export async function executeMesh(
       const text =
         peers.peers.length === 0
           ? "No peers are connected in this room."
-          : `Peers in this room: ${peers.peers.join(", ")}`;
+          : // Names come from other peers' own registrations, so they are
+            // neutralized for the same reason inbound provenance is. `details`
+            // keeps them verbatim: the runtime documents it as UI and log data,
+            // not provider content.
+            `Peers in this room: ${peers.peers.map(singleLine).join(", ")}`;
       return result(text, { action: "list", peers: [...peers.peers] });
     }
 
@@ -175,7 +222,17 @@ export async function executeMesh(
   }
 }
 
-export function buildInboundPayload(message: MessageFrame, room: RoomId): InboundPayload {
+/**
+ * Renders one inbound message for delivery, and the frame values to persist.
+ *
+ * The rendered text is what the model and the operator see, so every value
+ * interpolated into it is neutralized first: the provenance fields to a single
+ * line each, the body to text without terminal control sequences. Provenance
+ * occupies column zero and every body line is quoted, which is what makes the
+ * boundary unambiguous — a body line can no longer be read as a provenance
+ * header, whatever it contains.
+ */
+export function buildInboundInjection(message: MessageFrame, room: RoomId): InboundInjection {
   const details: InboundDetails = {
     id: message.id,
     from: message.from,
@@ -185,21 +242,15 @@ export function buildInboundPayload(message: MessageFrame, room: RoomId): Inboun
     ...(message.reply_to === undefined ? {} : { reply_to: message.reply_to }),
   };
   const lines = [
-    `Remote message from ${message.from}`,
-    `Project: ${room.project}`,
-    `Task: ${room.task}`,
-    `Message ID: ${message.id}`,
-    ...(message.reply_to === undefined ? [] : [`Reply to: ${message.reply_to}`]),
+    `Remote message from ${singleLine(message.from)}`,
+    `Project: ${singleLine(room.project)}`,
+    `Task: ${singleLine(room.task)}`,
+    `Message ID: ${singleLine(message.id)}`,
+    ...(message.reply_to === undefined ? [] : [`Reply to: ${singleLine(message.reply_to)}`]),
     "",
-    message.body,
+    ...quotedBody(message.body),
   ];
-  return {
-    customType: INBOUND_MESSAGE_TYPE,
-    content: lines.join("\n"),
-    display: true,
-    attribution: "agent",
-    details,
-  };
+  return { text: lines.join("\n"), details };
 }
 
 function schedulerFrom(ctx: ExtensionContext): Scheduler {
@@ -219,7 +270,6 @@ function schedulerFrom(ctx: ExtensionContext): Scheduler {
     },
   };
 }
-
 
 export default function ompRelay(pi: ExtensionAPI): void {
   let client: RelayClient | null = null;
@@ -286,10 +336,24 @@ export default function ompRelay(pi: ExtensionAPI): void {
       scheduler: schedulerFrom(ctx),
       handlers: {
         onMessage(message) {
-          pi.sendMessage(buildInboundPayload(message, config.room), {
-            deliverAs: "followUp",
-            triggerTurn: true,
-          });
+          const injection = buildInboundInjection(message, config.room);
+          // A session entry, which the runtime documents as state persistence
+          // that never reaches the LLM. It is where the exact frame values live,
+          // so the rendered text can be neutralized without losing them.
+          pi.appendEntry(INBOUND_MESSAGE_TYPE, injection.details);
+          // The call shape is load-bearing in all three of its parts.
+          // Not a custom message: the runtime converts one to provider role
+          // `developer` (compaction/messages.ts:194-211), ranking a remote peer
+          // above the local operator. Not a bare `sendUserMessage`: with no
+          // `deliverAs` it takes the prompt path, which auto-reads `@path` file
+          // mentions out of the remote body (agent-session.ts:5789-5800) — and
+          // neither `expandPromptTemplates: false` nor the `> ` body quoting
+          // stops that, because a preceding space already satisfies the mention
+          // boundary. Not `followUp`: its drain is gated on an
+          // `assistant`/`toolResult` transcript tail (agent-session.ts:6244-6266),
+          // so a fresh session would never start the turn; `steer` passes that
+          // gate from any tail via the steering-queue check.
+          pi.sendUserMessage(injection.text, { deliverAs: "steer" });
         },
         onReport(report) {
           const type = report.level === "warn" ? "warning" : report.level;

@@ -83,6 +83,18 @@ export const RECONNECT_CAP_MS = 30_000;
 export const RECONNECT_JITTER = 0.2;
 
 /**
+ * What the host is told when the relay hands this peer name to another session.
+ *
+ * Phrased as an operator instruction rather than as a relay code, because the
+ * condition is a configuration collision: two sessions were told to register
+ * the same `peer`, and only changing one of them resolves it.
+ */
+export const PEER_REPLACED_REPORT =
+  "another session registered this peer name in this room, so the relay displaced this one; " +
+  "reconnecting would displace that session in turn, so OMP Relay has stopped. " +
+  "Give each session its own peer name in its configuration.";
+
+/**
  * Opaque timer identity: only the scheduler that produced a handle interprets
  * it. `number`, a Node `Timeout`, and an OMP context handle all pass through.
  */
@@ -640,7 +652,7 @@ export class RelayClient {
         break;
 
       case "error":
-        this.#handleError(frame);
+        this.#handleError(socket, frame);
         break;
     }
   }
@@ -657,9 +669,29 @@ export class RelayClient {
    * connection. Every pre-readiness error is one: the relay rejects a handshake
    * and closes, so recording the code here is what turns the imminent close
    * into a stated cause rather than an anonymous disconnect.
+   *
+   * `peer_replaced` is the one code that ends the run rather than the
+   * connection. See the branch below.
    */
-  #handleError(frame: ErrorFrame): void {
+  #handleError(socket: Socket, frame: ErrorFrame): void {
     const detail = frame.message === undefined ? frame.code : `${frame.code}: ${frame.message}`;
+
+    // Displacement is terminal, not an outage. The relay gave this peer name to
+    // a newer connection, so reconnecting would take the name back and displace
+    // that connection in turn: two sessions configured with the same name evict
+    // each other for as long as both run. Entering the stopped state is what
+    // stops `#closeConnection` from arming the next attempt.
+    //
+    // Checked before the request branch because losing the name is never one
+    // request's answer, and the connection is closed here rather than left to
+    // the relay's own close so that `state` stops claiming to be ready while a
+    // half-dead socket accepts requests no one will answer.
+    if (frame.code === "peer_replaced") {
+      this.#stopped = true;
+      this.#report("error", PEER_REPLACED_REPORT);
+      this.#closeConnection(socket, PEER_REPLACED_REPORT);
+      return;
+    }
 
     if (frame.request_id !== undefined && this.#state === "ready") {
       const settled = this.#settleEither(frame.request_id, {

@@ -1717,6 +1717,7 @@ var HANDSHAKE_TIMEOUT_MS = 1e4;
 var RECONNECT_INITIAL_MS = 500;
 var RECONNECT_CAP_MS = 30000;
 var RECONNECT_JITTER = 0.2;
+var PEER_REPLACED_REPORT = "another session registered this peer name in this room, so the relay displaced this one; " + "reconnecting would displace that session in turn, so OMP Relay has stopped. " + "Give each session its own peer name in its configuration.";
 var ambientScheduler = {
   setTimeout,
   clearTimeout,
@@ -1963,12 +1964,18 @@ class RelayClient {
         this.#settle(frame.id, "send", { ok: true, frame });
         break;
       case "error":
-        this.#handleError(frame);
+        this.#handleError(socket, frame);
         break;
     }
   }
-  #handleError(frame) {
+  #handleError(socket, frame) {
     const detail = frame.message === undefined ? frame.code : `${frame.code}: ${frame.message}`;
+    if (frame.code === "peer_replaced") {
+      this.#stopped = true;
+      this.#report("error", PEER_REPLACED_REPORT);
+      this.#closeConnection(socket, PEER_REPLACED_REPORT);
+      return;
+    }
     if (frame.request_id !== undefined && this.#state === "ready") {
       const settled = this.#settleEither(frame.request_id, {
         ok: false,
@@ -2376,6 +2383,17 @@ function typeName(value) {
 
 // src/index.ts
 var INBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.message";
+var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
+var CONTROL_CHARACTERS_OUTSIDE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/gu;
+var NEUTRALIZED = "\uFFFD";
+var BODY_QUOTE = "> ";
+function singleLine(value) {
+  return value.replace(CONTROL_CHARACTERS, NEUTRALIZED);
+}
+function quotedBody(value) {
+  return value.replace(CONTROL_CHARACTERS_OUTSIDE_TEXT, NEUTRALIZED).split(`
+`).map((line) => `${BODY_QUOTE}${line}`);
+}
 function result(text, details) {
   return { content: [{ type: "text", text }], details };
 }
@@ -2455,7 +2473,7 @@ async function executeMesh(client, args) {
   try {
     if (args.action === "list") {
       const peers = await client.list();
-      const text = peers.peers.length === 0 ? "No peers are connected in this room." : `Peers in this room: ${peers.peers.join(", ")}`;
+      const text = peers.peers.length === 0 ? "No peers are connected in this room." : `Peers in this room: ${peers.peers.map(singleLine).join(", ")}`;
       return result(text, { action: "list", peers: [...peers.peers] });
     }
     const id = crypto.randomUUID();
@@ -2470,7 +2488,7 @@ async function executeMesh(client, args) {
     return requestFailure(error);
   }
 }
-function buildInboundPayload(message, room) {
+function buildInboundInjection(message, room) {
   const details = {
     id: message.id,
     from: message.from,
@@ -2480,22 +2498,16 @@ function buildInboundPayload(message, room) {
     ...message.reply_to === undefined ? {} : { reply_to: message.reply_to }
   };
   const lines = [
-    `Remote message from ${message.from}`,
-    `Project: ${room.project}`,
-    `Task: ${room.task}`,
-    `Message ID: ${message.id}`,
-    ...message.reply_to === undefined ? [] : [`Reply to: ${message.reply_to}`],
+    `Remote message from ${singleLine(message.from)}`,
+    `Project: ${singleLine(room.project)}`,
+    `Task: ${singleLine(room.task)}`,
+    `Message ID: ${singleLine(message.id)}`,
+    ...message.reply_to === undefined ? [] : [`Reply to: ${singleLine(message.reply_to)}`],
     "",
-    message.body
+    ...quotedBody(message.body)
   ];
-  return {
-    customType: INBOUND_MESSAGE_TYPE,
-    content: lines.join(`
-`),
-    display: true,
-    attribution: "agent",
-    details
-  };
+  return { text: lines.join(`
+`), details };
 }
 function schedulerFrom(ctx) {
   return {
@@ -2567,10 +2579,9 @@ function ompRelay(pi) {
       scheduler: schedulerFrom(ctx),
       handlers: {
         onMessage(message) {
-          pi.sendMessage(buildInboundPayload(message, config.room), {
-            deliverAs: "followUp",
-            triggerTurn: true
-          });
+          const injection = buildInboundInjection(message, config.room);
+          pi.appendEntry(INBOUND_MESSAGE_TYPE, injection.details);
+          pi.sendUserMessage(injection.text, { deliverAs: "steer" });
         },
         onReport(report) {
           const type = report.level === "warn" ? "warning" : report.level;
@@ -2593,6 +2604,6 @@ function ompRelay(pi) {
 export {
   executeMesh,
   ompRelay as default,
-  buildInboundPayload,
+  buildInboundInjection,
   INBOUND_MESSAGE_TYPE
 };
