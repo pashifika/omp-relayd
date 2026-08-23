@@ -1,0 +1,37 @@
+{
+  // Type checking only: Bun executes TypeScript directly, so this project never
+  // emits. `bunx tsc --noEmit` is the type gate; `bun test` is the behavior gate.
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "types": ["bun"],
+
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+
+    // `strict` alone permits two mistakes this protocol cannot afford.
+    //
+    // `noUncheckedIndexedAccess` matters for the frame accumulator, which
+    // indexes into a byte buffer whose length it has just tested; without it a
+    // wrong test still type-checks.
+    //
+    // `exactOptionalPropertyTypes` matters because `wire-protocol` requires an
+    // absent optional field to be *omitted*, not sent as null. With it,
+    // `reply_to?: string` rejects an explicit `undefined`, so the only way to
+    // express absence is to leave the key out -- which is what the wire needs.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": true,
+
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
