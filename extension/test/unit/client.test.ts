@@ -499,6 +499,33 @@ describe("request correlation", () => {
     await relay.close();
   });
 
+  test("shutdown settles an outstanding request with a stated reason", async () => {
+    // Distinct from the connection-loss case: shutdown is a host action, not a
+    // transport event, and it is the one settlement path whose reason a caller
+    // can act on by not retrying. Previously this was only asserted incidentally
+    // by the duplicate-token test, which names something else.
+    const relay = await ScriptedRelay.start(ADMIT);
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const pending = client.list("req-1");
+    expect(client.pendingRequests).toBe(1);
+
+    const settles = settlement(pending);
+    await client.stop();
+
+    const outcome = await settles;
+    expect(outcome.status).toBe("rejected");
+    if (outcome.status !== "rejected") return;
+    expect(outcome.reason).toBeInstanceOf(RequestFailed);
+    expect((outcome.reason as RequestFailed).reason).toBe("stopped");
+    expect(client.pendingRequests).toBe(0);
+
+    await relay.close();
+  });
+
   test("a reply matching no pending request is discarded without growing the map", async () => {
     const relay = await ScriptedRelay.start((frame, session) => {
       if (isFrame(frame, "hello")) {

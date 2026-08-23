@@ -197,6 +197,12 @@ describe("roster and routing", () => {
     });
     expect(recipient.messages.last && "reply_to" in recipient.messages.last).toBe(false);
 
+    // "Exactly once" needs a barrier rather than a sleep: a completed round
+    // trip through the relay after the message arrived means any duplicate
+    // would already have been delivered by now.
+    await recipient.client.list("delivery-barrier");
+    expect(recipient.messages.count).toBe(1);
+
     await Promise.all([sender.client.stop(), recipient.client.stop()]);
   });
 
