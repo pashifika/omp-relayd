@@ -214,6 +214,13 @@ describe("heartbeat", () => {
       if (isFrame(frame, "ping")) {
         session.send({ type: "pong" });
       }
+      if (isFrame(frame, "list")) {
+        session.send({
+          type: "peers",
+          request_id: String(frame["request_id"]),
+          peers: [PEER],
+        });
+      }
     });
     const { client, scheduler, ready, messages, reports } = harnessFor(
       configFor(relay.port),
@@ -229,8 +236,12 @@ describe("heartbeat", () => {
     await relay.awaitReceived(2);
     expect(relay.received[1]).toEqual({ type: "ping" });
 
-    // The pong is consumed: it is neither a message nor a diagnostic.
-    await Promise.resolve();
+    // Asserting that the pong produced *nothing* needs a barrier, because there
+    // is no signal to await for an event that must not happen. A `list` issued
+    // after the pong resolves only once its `peers` reply has been processed,
+    // and TCP ordering on one connection puts the pong ahead of that reply --
+    // so by this line the pong has definitively been handled.
+    await client.list("after-pong");
     expect(messages.count).toBe(0);
     expect(reports.observed.map((report) => report.message)).toEqual([]);
 
@@ -538,15 +549,15 @@ describe("request correlation", () => {
 
     client.start();
     await ready.until(1);
-    await relay.awaitReceived(1);
-    await Promise.resolve();
+    // Awaiting the discard notice itself, which is the observable. The previous
+    // spelling awaited one microtask and hoped the receipt's chunk had already
+    // been read -- it had not, roughly one run in five.
+    await reports.until(1);
 
+    expect(reports.last?.message).toContain("long-gone");
     expect(client.pendingRequests).toBe(0);
     expect(client.state).toBe("ready");
     expect(disconnects.count).toBe(0);
-    expect(reports.observed.some((report) => report.message.includes("long-gone"))).toBe(
-      true,
-    );
 
     await client.stop();
     await relay.close();
