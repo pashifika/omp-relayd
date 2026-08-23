@@ -992,6 +992,121 @@ async fn a_stalled_peer_that_keeps_pinging_is_not_disconnected() {
     );
 }
 
+/// Regression: a peer that is not draining can saturate its reply channel, and
+/// the `send` that then cannot reserve a receipt is closed rather than routed.
+/// That close used to be the one close in the relay with no stated cause:
+/// `reserve_receipt` failed because the channel was full, and the
+/// `queue_diagnostic` on the next line `try_send`s to that same channel with no
+/// `.await` between them -- so the writer could not have freed a slot and the
+/// diagnostic provably could not land. A slot is now reserved past the usable
+/// depth for exactly that frame.
+///
+/// Both halves are asserted, because either alone is satisfied by a bug: a
+/// stated cause with the message routed is the unacknowledged delivery round 6
+/// removed, and an unrouted message with a bare close is the defect here.
+#[tokio::test]
+async fn a_send_that_cannot_be_acknowledged_is_refused_with_a_stated_cause() {
+    let relay = Relay::start().await;
+    let here = room("saturated-replies");
+
+    let mut filler = Client::join(&relay, &here, "filler").await;
+    let mut witness = Client::join(&relay, &here, "witness").await;
+    // Never read from again: its socket buffer and outbound queue both fill, so
+    // the relay's writer for this peer is blocked for the rest of the test and
+    // nothing it queues can ever be drained.
+    let mut stalled = Client::join(&relay, &here, "stalled").await;
+
+    let backlog = fill_pipeline(&mut filler, "stalled").await;
+    assert!(
+        backlog >= OUTBOUND_QUEUE_CAPACITY,
+        "the premise is a blocked writer: `fill_pipeline` stops on the first \
+         `recipient_backpressure`, which the relay reports only when all \
+         {OUTBOUND_QUEUE_CAPACITY} outbound slots are undrained -- so at least that \
+         many frames must have been accepted first; observed {backlog}"
+    );
+
+    // Walk the reply channel to saturation with sends rather than pings,
+    // because a send is observable at its recipient and a dropped `pong` is
+    // observable nowhere. Each accepted send queues one receipt the blocked
+    // writer cannot take, so the channel fills, and `witness` reports where.
+    //
+    // One at a time, stopping at the refusal, rather than as a burst. A burst
+    // leaves every send after the refused one unread, and closing a socket that
+    // still holds unread inbound data resets the connection rather than ending
+    // it: measured, the close then surfaced only as `ECONNRESET`, and only
+    // after a write. Sending nothing past the refusal leaves nothing unread.
+    //
+    // This loop is also the barrier the test needs. `witness` falling silent
+    // means the relay's reader has stopped, so `stalled` can start reading
+    // without first freeing the reply slots whose absence is under test.
+    let mut delivered = 0usize;
+    for n in 1..=OUTBOUND_QUEUE_CAPACITY {
+        let id = format!("m{n}");
+        stalled
+            .send(&send(&id, "witness", "into a saturating reply queue"))
+            .await;
+
+        match witness.recv_within(QUIET).await {
+            Some(ServerFrame::Message {
+                id: arrived, from, ..
+            }) => {
+                assert_eq!(
+                    from, "stalled",
+                    "message {arrived} came from the wrong peer"
+                );
+                assert_eq!(
+                    arrived, id,
+                    "a blocked writer must not stop the reader routing: every send made \
+                     while the reply channel still had a slot must be delivered, in order"
+                );
+                delivered += 1;
+            }
+            // The relay declined to acknowledge this send, so it declined to
+            // route it. Nothing more is sent, so nothing goes unread.
+            None => break,
+            Some(other) => panic!("expected a relayed message, received {other:?}"),
+        }
+    }
+    assert!(
+        delivered > 0,
+        "the premise failed before the fix was reached: not one send was routed, so \
+         the reply channel was never the thing that refused one"
+    );
+    assert!(
+        delivered < OUTBOUND_QUEUE_CAPACITY,
+        "the reply channel must have saturated for this test to mean anything, and \
+         all {OUTBOUND_QUEUE_CAPACITY} sends were routed instead"
+    );
+    println!("{delivered} sends routed before the reply channel saturated");
+
+    // The fix: `stalled` resumes reading inside the terminal write window and
+    // the close names its cause instead of arriving bare. `idle_timeout` is the
+    // code for "this peer is not reading", which is exactly what happened.
+    match stalled.drain_until_error().await {
+        Some(ServerFrame::Error { code, message, .. }) => assert_eq!(
+            code,
+            ErrorCode::IdleTimeout,
+            "the close must name the saturated reply path; message {message:?}"
+        ),
+        None => panic!(
+            "the relay closed without an `error` frame: the send it declined to \
+             acknowledge is the one close that had no slot left to state its cause"
+        ),
+        Some(other) => panic!("expected an `error` frame, received {other:?}"),
+    }
+    stalled.expect_closed().await;
+
+    // The other half: the refused send was not routed, and did not arrive late
+    // either, so the sender's retry after reconnecting is correct rather than a
+    // duplicate.
+    assert_eq!(
+        witness.recv_within(QUIET).await,
+        None,
+        "a send whose receipt could not be reserved must not be routed: delivering \
+         it unacknowledged is what left the sender unable to tell whether to resend"
+    );
+}
+
 #[tokio::test]
 async fn late_cleanup_of_a_superseded_connection_keeps_the_replacement() {
     let relay = Relay::start().await;

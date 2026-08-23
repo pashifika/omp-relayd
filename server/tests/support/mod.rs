@@ -221,6 +221,40 @@ where
         }
         self.expect_closed().await;
     }
+
+    /// Drains frames until an `error` arrives, returning it, or `None` if the
+    /// relay closed or fell silent without one. Prints how many frames it
+    /// skipped and why it stopped.
+    ///
+    /// For a close that is only observable behind a backlog: a peer that
+    /// stopped reading has queued deliveries and replies ahead of its
+    /// diagnostic, so [`Client::expect_error_then_close`] trips over the first
+    /// of them.
+    pub async fn drain_until_error(&mut self) -> Option<ServerFrame> {
+        let mut skipped = 0usize;
+        loop {
+            match timeout(READ_TIMEOUT, self.framed.next()).await {
+                Ok(Some(Ok(payload))) => {
+                    let frame: ServerFrame =
+                        protocol::decode(&payload).expect("the server sent a decodable frame");
+                    if matches!(frame, ServerFrame::Error { .. }) {
+                        println!("error frame arrived behind {skipped} queued frame(s)");
+                        return Some(frame);
+                    }
+                    skipped += 1;
+                }
+                // An orderly end of stream or a reset: the close named no cause.
+                Ok(None | Some(Err(_))) => {
+                    println!("bare close: {skipped} queued frame(s), then EOF, no error frame");
+                    return None;
+                }
+                Err(_) => {
+                    println!("no frame within {READ_TIMEOUT:?} behind {skipped} queued frame(s)");
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// A room to run a test in.

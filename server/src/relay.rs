@@ -490,13 +490,42 @@ fn register_peer(
     )
 }
 
-/// Capacity of the reply channel between the reader and the writer.
+/// Usable depth of the reply channel between the reader and the writer.
 ///
 /// The reader emits at most one reply per inbound frame and processes frames
 /// serially, so a handful of slots is ample slack for pipelining. If it does
 /// fill, the writer is not draining, which means the peer is not reading its
-/// own replies -- so the connection is closed rather than the reader blocked.
+/// own replies -- so a lossy reply is dropped and a `send` that cannot be
+/// acknowledged closes the connection.
+///
+/// Usable, not allocated: the channel is built [`DIAGNOSTIC_RESERVE`] slots
+/// larger and both [`enqueue_reply`] and [`reserve_receipt`] stop at this
+/// depth.
 const REPLY_QUEUE_CAPACITY: usize = 8;
+
+/// Reply slots held past [`REPLY_QUEUE_CAPACITY`] for [`queue_diagnostic`].
+///
+/// Without the reserve, the one close a saturated reply path forces was the one
+/// close that could not state its cause. [`reserve_receipt`] fails because the
+/// channel is full, and the [`queue_diagnostic`] on the next line `try_send`s
+/// to that same channel with no `.await` in between -- so the writer cannot
+/// have freed a slot and the diagnostic provably cannot land. The peer closed
+/// for not draining its replies received the bare EOF that every other close
+/// path exists to avoid.
+///
+/// Testing capacity and then sending is sound here because of the channel's
+/// shape rather than by luck. There is exactly one sender -- [`pump`] moves
+/// `reply_tx` into [`run_reader`] and nothing clones it -- and the writer only
+/// ever *frees* slots, so [`mpsc::Sender::capacity`] is a lower bound on free
+/// slots that nothing can invalidate between the test and the send.
+///
+/// One slot is enough because every [`queue_diagnostic`] call site is terminal:
+/// duplicate `hello`, decode failure, framing error, over-budget body, receipt
+/// reservation failure, and the idle deadline each yield
+/// [`ControlFlow::Break`] or return from [`run_reader`] on the next line, and
+/// [`run_reader`] runs once per connection. The reserve is consumed at most
+/// once.
+const DIAGNOSTIC_RESERVE: usize = 1;
 
 /// Drives a registered connection until it closes.
 ///
@@ -534,7 +563,7 @@ async fn pump<S>(
 ) where
     S: AsyncRead + AsyncWrite,
 {
-    let (reply_tx, reply_rx) = mpsc::channel(REPLY_QUEUE_CAPACITY);
+    let (reply_tx, reply_rx) = mpsc::channel(REPLY_QUEUE_CAPACITY + DIAGNOSTIC_RESERVE);
     // Both halves watch it: the writer so eviction overtakes the backlog, the
     // reader so a superseded connection stops routing.
     let mut reader_evicted = evicted.clone();
@@ -1202,9 +1231,14 @@ where
 /// writer is not keeping up.
 ///
 /// Non-blocking on purpose: the reader must never wait on the socket, which is
-/// the point of the split. A full channel means the writer has not drained
+/// the point of the split. Refusal means the writer has not drained
 /// [`REPLY_QUEUE_CAPACITY`] replies, which means the peer is not reading even
 /// its own answers -- so this reply could not have reached it either way.
+///
+/// The refusal threshold is the reserve rather than the end of the channel. The
+/// last [`DIAGNOSTIC_RESERVE`] slots belong to [`queue_diagnostic`], so a reply
+/// that finds only those free is dropped as though the channel were full --
+/// which, for every reply that is not the closing diagnostic, it is.
 ///
 /// Dropping rather than closing is what keeps the heartbeat guarantee. A peer
 /// that keeps sending `ping` while not draining generates one `pong` per ping;
@@ -1216,7 +1250,13 @@ where
 /// `pong`, `peers`, and the recoverable `error` frames. A `send` receipt is
 /// contractual and uses [`reserve_receipt`] instead.
 fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> ControlFlow<()> {
-    match replies.try_send(frame) {
+    let queued = if replies.capacity() <= DIAGNOSTIC_RESERVE {
+        Err(TrySendError::Full(frame))
+    } else {
+        replies.try_send(frame)
+    };
+
+    match queued {
         Ok(()) => ControlFlow::Continue(()),
         Err(TrySendError::Full(_)) => {
             tracing::debug!(
@@ -1242,16 +1282,26 @@ fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> Con
 /// Returning `None` therefore means "do not route this frame", and the caller
 /// closes the connection instead. Nothing was delivered, so the sender's retry
 /// after reconnecting is correct rather than a duplicate.
+///
+/// Refuses on the same threshold as [`enqueue_reply`], and for a sharper
+/// reason: the caller's very next act on this path is to queue the `error`
+/// frame naming the close. Reserving the last slot would buy one receipt the
+/// peer cannot read at the price of the one diagnostic it needs.
 fn reserve_receipt(replies: &mpsc::Sender<ServerFrame>) -> Option<mpsc::Permit<'_, ServerFrame>> {
+    if replies.capacity() <= DIAGNOSTIC_RESERVE {
+        return None;
+    }
     replies.try_reserve().ok()
 }
 
 /// Queues the frame that names why the relay is closing this connection.
 ///
 /// A bare EOF is indistinguishable from a crashed relay, a wrong port, or a
-/// version mismatch, so every close the relay initiates states its reason. This
-/// is best-effort in two ways: the queue may be full, and the writer's flush is
-/// bounded by [`TERMINAL_WRITE_TIMEOUT`] once the reader has finished.
+/// version mismatch, so every close the relay initiates states its reason.
+/// [`DIAGNOSTIC_RESERVE`] keeps a slot free for this frame, and every call site
+/// is terminal, so the queue has room for it. It stays best-effort in one way:
+/// the writer's flush is bounded by [`TERMINAL_WRITE_TIMEOUT`] once the reader
+/// has finished.
 fn queue_diagnostic(replies: &mpsc::Sender<ServerFrame>, code: ErrorCode, message: String) {
     let frame = ServerFrame::Error {
         code,
@@ -1358,6 +1408,14 @@ mod tests {
 
     fn peer_queue() -> (mpsc::Sender<ServerFrame>, mpsc::Receiver<ServerFrame>) {
         mpsc::channel(OUTBOUND_QUEUE_CAPACITY)
+    }
+
+    /// Builds the reply channel exactly as [`pump`] does, reserve included. A
+    /// test that sizes it at [`REPLY_QUEUE_CAPACITY`] instead would assert a
+    /// false premise: its last fill would be silently dropped rather than
+    /// queued, and every assertion below it would hold for the wrong reason.
+    fn reply_queue() -> (mpsc::Sender<ServerFrame>, mpsc::Receiver<ServerFrame>) {
+        mpsc::channel(REPLY_QUEUE_CAPACITY + DIAGNOSTIC_RESERVE)
     }
 
     /// Registers a peer the way a connection does, returning the registration
@@ -1600,13 +1658,24 @@ mod tests {
     fn a_full_reply_queue_drops_a_reply_but_never_blocks_the_reader() {
         // The reader must never wait on the socket, so a full reply channel is
         // not something to wait out. What it does instead depends on whether
-        // the reply is contractual.
-        let (replies, _writer_side) = mpsc::channel(REPLY_QUEUE_CAPACITY);
+        // the reply is contractual -- and, since the reserve, on whether it is
+        // the frame that names the close.
+        let (replies, mut writer_side) = reply_queue();
 
+        // Occupancy, not `is_continue()`: a dropped reply also continues, so a
+        // fill loop that only checks the control flow cannot tell "queued" from
+        // "silently discarded" and would pass with the usable depth off by one.
         for slot in 1..=REPLY_QUEUE_CAPACITY {
             assert!(
                 enqueue_reply(&replies, ServerFrame::Pong).is_continue(),
                 "reply slot {slot} of {REPLY_QUEUE_CAPACITY} must accept a frame"
+            );
+            assert_eq!(
+                writer_side.len(),
+                slot,
+                "slot {slot} of {REPLY_QUEUE_CAPACITY} must be queued, not dropped: \
+                 {REPLY_QUEUE_CAPACITY} is the usable depth, and the reserve is held \
+                 past it"
             );
         }
 
@@ -1617,6 +1686,11 @@ mod tests {
              closing here disconnected exactly the heartbeating peer `peer-relay` says \
              must be kept -- measured at 15 pings before this changed"
         );
+        assert_eq!(
+            writer_side.len(),
+            REPLY_QUEUE_CAPACITY,
+            "and the dropped `pong` must not have taken the reserved slot"
+        );
 
         assert!(
             reserve_receipt(&replies).is_none(),
@@ -1624,25 +1698,63 @@ mod tests {
              instead: the caller then declines to route, which is what stops a send being \
              delivered with its receipt dropped"
         );
+
+        // The point of the reserve. `reserve_receipt` has just failed, and the
+        // caller's next act is this call, with no `.await` between them -- so
+        // the writer cannot have freed anything. Before the reserve, this was
+        // the one close in the relay that could not state its cause.
+        queue_diagnostic(&replies, ErrorCode::IdleTimeout, "not draining".to_owned());
+        assert_eq!(
+            writer_side.len(),
+            REPLY_QUEUE_CAPACITY + DIAGNOSTIC_RESERVE,
+            "the closing diagnostic must land on a saturated reply queue"
+        );
+
+        for _ in 0..REPLY_QUEUE_CAPACITY {
+            writer_side.try_recv().expect("a queued reply");
+        }
+        assert!(
+            matches!(
+                writer_side.try_recv(),
+                Ok(ServerFrame::Error {
+                    code: ErrorCode::IdleTimeout,
+                    ..
+                })
+            ),
+            "and it must be the `error` frame itself behind the replies, not a \
+             displaced one of them"
+        );
     }
 
     #[test]
     fn a_reserved_receipt_slot_is_held_until_it_is_used() {
-        let (replies, mut writer_side) = mpsc::channel(REPLY_QUEUE_CAPACITY);
+        let (replies, mut writer_side) = reply_queue();
 
-        // Fill every slot but one, then reserve it.
+        // Fill every usable slot but one, then reserve it. The reserve is not
+        // one of them: it stays free for the diagnostic either way.
         for slot in 1..REPLY_QUEUE_CAPACITY {
             assert!(
                 enqueue_reply(&replies, ServerFrame::Pong).is_continue(),
                 "filling slot {slot} must succeed"
             );
+            assert_eq!(writer_side.len(), slot, "slot {slot} must be queued");
         }
-        let slot = reserve_receipt(&replies).expect("the last slot is free");
+        let slot = reserve_receipt(&replies).expect("the last usable slot is free");
 
         assert!(
             reserve_receipt(&replies).is_none(),
             "the reservation must actually consume capacity, or two sends could both \
              believe they are acknowledged"
+        );
+        assert!(
+            enqueue_reply(&replies, ServerFrame::Pong).is_continue(),
+            "and a lossy reply must not reach past it into the diagnostic's slot"
+        );
+        assert_eq!(
+            writer_side.len(),
+            REPLY_QUEUE_CAPACITY - 1,
+            "the held permit occupies capacity without queueing a frame, and the \
+             refused `pong` queued nothing"
         );
 
         slot.send(ServerFrame::Receipt {
