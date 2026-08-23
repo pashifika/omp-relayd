@@ -4,6 +4,10 @@
 # Cargo build output.
 /server/target/
 
+# Bun install output. `extension/bun.lock` is tracked; the tree it expands to is
+# not.
+/extension/node_modules/
+
 # Agent tooling installed into this checkout, not project content: rasen mirrors
 # the same workflow skills into both directories on every install.
 .claude/

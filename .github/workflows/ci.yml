@@ -18,8 +18,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Runtime job. Language-specific jobs (`rust`, `bun`) are added by the changes
-  # that introduce those toolchains, and each extends the `ci` gate's `needs`.
+  # Runtime job. Language-specific jobs are added by the changes that introduce
+  # those toolchains, and each extends the `ci` gate's `needs`.
   hygiene:
     name: hygiene
     runs-on: ubuntu-24.04
@@ -205,12 +205,122 @@ jobs:
           cargo "+$RUST_MSRV" --version
           cargo "+$RUST_MSRV" check --locked --all-targets --all-features
 
+  # Runtime job. Owns the TypeScript client library under `extension/`, whose
+  # toolchain this change introduces.
+  #
+  # Deliberately Bun-only. The relay-dependent tests live in `interop` below so
+  # that a type error or a broken accumulator is reported without first paying
+  # for a Rust toolchain and a release build, and so a red job names which layer
+  # broke. The two run in parallel, so the split costs no wall time.
+  bun:
+    name: bun
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Bun toolchain
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        timeout-minutes: 5
+        with:
+          # Pinned, not `latest`: a runtime that changes underneath a previously
+          # green build makes a red one unexplainable. Bump deliberately, in
+          # step with `@types/bun` in `extension/package.json`.
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        # `--frozen-lockfile` is the point of committing `bun.lock`: a
+        # dependency resolving differently in CI than locally is a failure, not
+        # an update to perform silently.
+        run: bun install --frozen-lockfile
+
+      - name: Report the toolchain versions
+        timeout-minutes: 5
+        # Printed, not assumed: every result below belongs to these versions.
+        run: |
+          bun --version
+          bunx tsc --version
+
+      - name: Type-check
+        timeout-minutes: 5
+        # Through the package scripts, not the underlying commands: a flag that
+        # lives in only one of the two places is a difference between what a
+        # contributor runs and what the gate runs.
+        run: bun run typecheck
+
+      - name: Unit and fixture tests
+        timeout-minutes: 5
+        run: bun run test:unit
+
+  # Runtime job. Proves the two implementations actually agree, by running the
+  # TypeScript client against the real relay binary rather than against a mock.
+  #
+  # Needs both toolchains, which is why it is its own job: a mock would agree
+  # with whatever the TypeScript side believes, and that agreement is precisely
+  # the thing under test.
+  interop:
+    name: interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Kept in step with the `rust` job above; both build the same crate.
+      RUST_VERSION: 1.97.1
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustc --version
+          cargo --version
+
+      - name: Install the pinned Bun toolchain
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        timeout-minutes: 5
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        working-directory: extension
+        run: bun install --frozen-lockfile
+
+      - name: Build the relay the integration tests spawn
+        timeout-minutes: 15
+        working-directory: server
+        # Built here rather than left to the test helper so that a compilation
+        # failure is reported as a build failure, not as a test timing out while
+        # waiting for a binary that was never going to appear.
+        run: cargo build --locked --release --bin omp-relayd
+
+      - name: Integration tests against the relay binary
+        timeout-minutes: 10
+        working-directory: extension
+        run: bun run test:integration
+
   # The single status check branch protection requires. `.github/rulesets/main.json`
   # names the literal string `ci`; nothing mechanically verifies the two agree, so
   # renaming this job silently blocks every merge with no failing job to point at.
   ci:
     name: ci
-    needs: [hygiene, rust]
+    needs: [hygiene, rust, bun, interop]
     # `always()` is load-bearing. Without it this job is skipped when a dependency
     # fails, and a skipped required check blocks a pull request rather than failing
     # it -- a stuck merge button instead of a red one.
