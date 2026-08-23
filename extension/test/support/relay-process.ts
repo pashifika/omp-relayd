@@ -44,8 +44,47 @@ const SHUTDOWN_TIMEOUT_MS = 5_000;
  */
 export const RELAY_SETUP_TIMEOUT_MS = 300_000;
 
+/**
+ * Every CSI escape sequence, so a colored log line can be read as text.
+ *
+ * Not optional. The relay colors its output under CI, which puts escape
+ * sequences between `local_addr` and `=` and makes a pattern written against
+ * the plain form fail on a line that is plainly there. Stripping is the fix
+ * rather than asking the relay not to color, because the helper should not
+ * depend on the formatting choice of the process it supervises.
+ */
+const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]/g;
+
 /** Matches the relay's `relay listening local_addr=<addr>` startup event. */
-const LISTENING = /relay listening\s+local_addr=(\S+)/;
+const LISTENING = /relay listening\s+local_addr\s*=\s*(\S+)/;
+
+/**
+ * Extracts the bound address from one relay log line.
+ *
+ * @returns the host and port, or `null` when the line is not the startup event.
+ */
+export function parseListeningAddress(
+  line: string,
+): { readonly host: string; readonly port: number } | null {
+  const address = LISTENING.exec(stripAnsi(line))?.[1];
+  if (address === undefined) {
+    return null;
+  }
+  const separator = address.lastIndexOf(":");
+  if (separator <= 0) {
+    return null;
+  }
+  const port = Number(address.slice(separator + 1));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return null;
+  }
+  return { host: address.slice(0, separator), port };
+}
+
+/** Removes terminal coloring so a log line can be matched and read. */
+export function stripAnsi(line: string): string {
+  return line.replace(ANSI, "");
+}
 
 let building: Promise<string> | null = null;
 
@@ -115,15 +154,14 @@ export async function startRelay(port = 0): Promise<RelayProcess> {
       const lines = pending.split("\n");
       pending = lines.pop() ?? "";
       for (const line of lines) {
-        log.push(line);
-        const match = LISTENING.exec(line);
-        const address = match?.[1];
-        if (address === undefined) continue;
-        const separator = address.lastIndexOf(":");
-        bound.resolve({
-          host: address.slice(0, separator),
-          port: Number(address.slice(separator + 1)),
-        });
+        // Stripped before storing, so a failure message is readable rather than
+        // a wall of escape sequences.
+        const clean = stripAnsi(line);
+        log.push(clean);
+        const address = parseListeningAddress(clean);
+        if (address !== null) {
+          bound.resolve(address);
+        }
       }
     }
   };
