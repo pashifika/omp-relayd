@@ -30,7 +30,12 @@ import {
   type MessageFrame,
 } from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
-import { buildRelay, startRelay, type RelayProcess } from "../support/relay-process.ts";
+import {
+  buildRelay,
+  RELAY_SETUP_TIMEOUT_MS,
+  startRelay,
+  type RelayProcess,
+} from "../support/relay-process.ts";
 import { settlement } from "../support/settlement.ts";
 import { Signal } from "../support/signal.ts";
 
@@ -72,7 +77,7 @@ function peerFor(config: RelayConfig, scheduler?: Scheduler): Peer {
 const escaped: unknown[] = [];
 const record = (error: unknown): void => void escaped.push(error);
 
-let relay: RelayProcess;
+let relay: RelayProcess | null = null;
 
 beforeAll(async () => {
   process.on("unhandledRejection", record);
@@ -80,14 +85,24 @@ beforeAll(async () => {
   const binary = await buildRelay();
   relay = await startRelay();
   console.log(`relay: ${binary} bound to 127.0.0.1:${relay.port}`);
-});
+}, RELAY_SETUP_TIMEOUT_MS);
 
 afterAll(async () => {
-  await relay.stop();
+  // Guarded: when setup fails there is no relay to stop, and an unguarded
+  // teardown replaces the real failure with a `TypeError` from this line.
+  await relay?.stop();
   process.off("unhandledRejection", record);
   process.off("uncaughtException", record);
   expect(escaped).toEqual([]);
-});
+}, RELAY_SETUP_TIMEOUT_MS);
+
+/** The shared relay, or a clear failure when setup did not produce one. */
+function shared(): RelayProcess {
+  if (relay === null) {
+    throw new Error("the shared relay is not running; setup failed");
+  }
+  return relay;
+}
 
 describe("handshake", () => {
   test("connect, hello, ready against the real relay", async () => {
@@ -95,7 +110,7 @@ describe("handshake", () => {
     // exercised end to end and not only against a scripted double.
     const ready = new Signal();
     const client = new RelayClient({
-      config: configFor(relay.port, "handshake-peer"),
+      config: configFor(shared().port, "handshake-peer"),
       handlers: { onReady: () => ready.fire(undefined) },
     });
 
@@ -112,7 +127,7 @@ describe("handshake", () => {
     // Constructed from a hand-made config, not a loaded one: `config.ts` would
     // refuse this peer name before a connection existed, which is correct and
     // is exactly why the relay's own rejection needs a way to be reached.
-    const peer = peerFor(configFor(relay.port, "invalid@peer"));
+    const peer = peerFor(configFor(shared().port, "invalid@peer"));
 
     peer.client.start();
     await peer.disconnects.until(1);
@@ -128,7 +143,7 @@ describe("handshake", () => {
     // The boundary both implementations agree on, checked against the relay
     // rather than only against this side's own validator.
     const name = "b".repeat(MAX_IDENTIFIER_BYTES);
-    const peer = peerFor(configFor(relay.port, name));
+    const peer = peerFor(configFor(shared().port, name));
 
     peer.client.start();
     await peer.ready.until(1);
@@ -140,8 +155,8 @@ describe("handshake", () => {
 
 describe("roster and routing", () => {
   test("list returns both peers, correlated by request_id", async () => {
-    const first = peerFor(configFor(relay.port, "list-alpha"));
-    const second = peerFor(configFor(relay.port, "list-beta"));
+    const first = peerFor(configFor(shared().port, "list-alpha"));
+    const second = peerFor(configFor(shared().port, "list-beta"));
 
     first.client.start();
     second.client.start();
@@ -157,8 +172,8 @@ describe("roster and routing", () => {
   });
 
   test("a send is delivered with the sender's registered name and receipted as routed", async () => {
-    const sender = peerFor(configFor(relay.port, "route-sender"));
-    const recipient = peerFor(configFor(relay.port, "route-recipient"));
+    const sender = peerFor(configFor(shared().port, "route-sender"));
+    const recipient = peerFor(configFor(shared().port, "route-recipient"));
 
     sender.client.start();
     recipient.client.start();
@@ -188,8 +203,8 @@ describe("roster and routing", () => {
   test("a reply carries reply_to through to the recipient", async () => {
     // The optional field in its present form, since every other assertion here
     // covers its absent form.
-    const sender = peerFor(configFor(relay.port, "reply-sender"));
-    const recipient = peerFor(configFor(relay.port, "reply-recipient"));
+    const sender = peerFor(configFor(shared().port, "reply-sender"));
+    const recipient = peerFor(configFor(shared().port, "reply-recipient"));
 
     sender.client.start();
     recipient.client.start();
@@ -209,7 +224,7 @@ describe("roster and routing", () => {
   });
 
   test("a self-addressed send is delivered to the sender", async () => {
-    const peer = peerFor(configFor(relay.port, "self-addressed"));
+    const peer = peerFor(configFor(shared().port, "self-addressed"));
 
     peer.client.start();
     await peer.ready.until(1);
@@ -231,7 +246,7 @@ describe("roster and routing", () => {
   test("a send to an absent peer is receipted peer_offline, not an error", async () => {
     // A receipt, so the request resolves rather than rejecting: the relay
     // answered, and the answer is that nobody was there.
-    const peer = peerFor(configFor(relay.port, "offline-sender"));
+    const peer = peerFor(configFor(shared().port, "offline-sender"));
 
     peer.client.start();
     await peer.ready.until(1);
@@ -252,8 +267,8 @@ describe("roster and routing", () => {
   test("a body larger than a single TCP segment survives reassembly intact", async () => {
     // The accumulator's unit tests synthesize chunk boundaries; this one lets
     // the kernel choose them, which is the assumption those tests cannot check.
-    const sender = peerFor(configFor(relay.port, "bulk-sender"));
-    const recipient = peerFor(configFor(relay.port, "bulk-recipient"));
+    const sender = peerFor(configFor(shared().port, "bulk-sender"));
+    const recipient = peerFor(configFor(shared().port, "bulk-recipient"));
 
     sender.client.start();
     recipient.client.start();
@@ -382,7 +397,7 @@ describe("protocol version", () => {
     // the two sides disagree about which contract they are following.
     const observed = Promise.withResolvers<number>();
     const client = new RelayClient({
-      config: configFor(relay.port, "version-peer"),
+      config: configFor(shared().port, "version-peer"),
       scheduler: new FakeScheduler(),
       handlers: {
         onReady: () => observed.resolve(PROTOCOL_VERSION),

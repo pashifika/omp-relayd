@@ -251,11 +251,14 @@ jobs:
 
       - name: Type-check
         timeout-minutes: 5
-        run: bunx tsc --noEmit
+        # Through the package scripts, not the underlying commands: a flag that
+        # lives in only one of the two places is a difference between what a
+        # contributor runs and what the gate runs.
+        run: bun run typecheck
 
       - name: Unit and fixture tests
         timeout-minutes: 5
-        run: bun test test/unit
+        run: bun run test:unit
 
   # Runtime job. Proves the two implementations actually agree, by running the
   # TypeScript client against the real relay binary rather than against a mock.
@@ -310,7 +313,7 @@ jobs:
       - name: Integration tests against the relay binary
         timeout-minutes: 10
         working-directory: extension
-        run: bun test test/integration
+        run: bun run test:integration
 
   # The single status check branch protection requires. `.github/rulesets/main.json`
   # names the literal string `ci`; nothing mechanically verifies the two agree, so

@@ -28,6 +28,22 @@ const STARTUP_TIMEOUT_MS = 10_000;
 /** How long to wait for a terminated relay to exit before escalating. */
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 
+/**
+ * Timeout a test hook must allow for {@link buildRelay} plus {@link startRelay}.
+ *
+ * Exported so the hook's budget is derived from this module rather than left to
+ * the runner's default, which is five seconds — *less* than
+ * `STARTUP_TIMEOUT_MS` alone. A hook on the default budget cannot outlive the
+ * bound this file imposes on itself, so a slow start is reported as "a hook
+ * timed out" with a dangling relay rather than as the startup failure it is.
+ * That is precisely how this first failed in CI.
+ *
+ * Generous because it may cover a cold Rust release build from scratch. It
+ * bounds a hang, not the expected duration: a warm run pays a cargo freshness
+ * check and a process spawn.
+ */
+export const RELAY_SETUP_TIMEOUT_MS = 300_000;
+
 /** Matches the relay's `relay listening local_addr=<addr>` startup event. */
 const LISTENING = /relay listening\s+local_addr=(\S+)/;
 
