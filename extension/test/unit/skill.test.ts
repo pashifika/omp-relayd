@@ -125,7 +125,7 @@ const OBLIGATIONS: readonly Obligation[] = [
   {
     requirement: "A session alone in its room stops instead of sending",
     states: "an offline receipt conflates three causes",
-    pattern: /conflates three different\nsituations:\n\n(?:- [^\n]+\n){3}/,
+    pattern: /conflates three\ndifferent situations:\n\n(?:- [^\n]+\n){3}/,
   },
   {
     requirement: "A briefing sent to a remote agent is self-contained",
@@ -156,12 +156,12 @@ const OBLIGATIONS: readonly Obligation[] = [
   {
     requirement: "The skill states what a receipt does and does not mean",
     states: "routed does not mean read, accepted, or completed",
-    pattern: /It does not mean the recipient read it, accepted it[^\n]*/,
+    pattern: /It does not mean the peer read it, accepted it[^\n]*/,
   },
   {
     requirement: "The skill states what a receipt does and does not mean",
-    states: "a reply arrives later as its own inbound message",
-    pattern: /A reply arrives later as its own inbound message, which starts or interrupts a\nturn[^\n]*/,
+    states: "a reply arrives later as its own directed inbound message",
+    pattern: /A reply arrives later as its own directed inbound message, which starts or\nsteers a turn\./,
   },
   {
     requirement: "The skill states what a receipt does and does not mean",
@@ -169,20 +169,49 @@ const OBLIGATIONS: readonly Obligation[] = [
     pattern: /\*\*Do not wait for a reply\.\*\*[^\n]*\n[^\n]*/,
   },
   {
-    requirement: "Addressing several peers is repeated sending",
-    states: "there is no broadcast; each peer is sent to in turn",
-    pattern: /There is no broadcast\. To reach three peers, send three messages[^\n]*/,
+    requirement: "The skill chooses between announcing and addressing one peer",
+    states: "the two classes are chosen by the content rather than roster size",
+    pattern: /two delivery classes, chosen by what the content is — not by how many\npeers happen to be present:/,
   },
   {
-    requirement: "Addressing several peers is repeated sending",
-    states: "the session decides per message between directed work and shared information",
-    pattern: /- \*\*Work directed at one peer\*\*[\s\S]*?- \*\*Information several peers genuinely need\*\*[^\n]*/,
+    requirement: "The skill chooses between announcing and addressing one peer",
+    states: "directed work names one peer and shared information is announced once",
+    pattern: /Use `send` for work one peer must do\.[\s\S]{0,300}?Use `announce` once for information every peer needs in order not to collide:/,
   },
   {
-    requirement: "Addressing several peers is repeated sending",
-    states: "every delivered message starts or interrupts a turn, at a cost per recipient",
-    pattern:
-      /Every delivered message starts or interrupts a turn on the receiving side\.[\s\S]{0,320}?proportional to the room\./,
+    requirement: "The skill chooses between announcing and addressing one peer",
+    states: "the peer and room address forms are distinct and neither is on the wire",
+    pattern: /`<project>\/<task>@<peer>`[\s\S]{0,260}?`<project>\/<task>`[\s\S]{0,260}?Neither combined address is written on the wire:/,
+  },
+  {
+    requirement: "The skill chooses between announcing and addressing one peer",
+    states: "no peer name is reserved to mean everyone",
+    pattern: /No peer name is reserved\nto mean "everyone"; an announcement carries no target field at all\./,
+  },
+  {
+    requirement: "The skill chooses between announcing and addressing one peer",
+    states: "an announcement excludes its author and is not awaited as confirmation",
+    pattern: /An announcement never reaches its author\.[\s\S]{0,180}?do not wait to see the notice itself/,
+  },
+  {
+    requirement: "The skill states what a receipt does and does not mean",
+    states: "accepted carries delivered and shed queue counts rather than a status",
+    pattern: /An announcement's `accepted` reply carries counts instead of one status:[\s\S]{0,220}?`delivered`[\s\S]{0,160}?`shed`/,
+  },
+  {
+    requirement: "The skill states what a receipt does and does not mean",
+    states: "shed means not reading and must not be retried blindly",
+    pattern: /A shed count is not an invitation to retry blindly\.[\s\S]{0,150}?queue is already full\./,
+  },
+  {
+    requirement: "The skill states what a receipt does and does not mean",
+    states: "zero deliveries is an empty room rather than an error",
+    pattern: /Zero deliveries and\nzero shed means the room held nobody else; it is an empty-room observation, not\nan error\./,
+  },
+  {
+    requirement: "The skill states what a receipt does and does not mean",
+    states: "an inbound announcement starts idle and waits during a run",
+    pattern: /When this\nsession is idle, it starts a turn[\s\S]{0,160}?waits for that run to finish rather than aborting or steering it\./,
   },
 ];
 

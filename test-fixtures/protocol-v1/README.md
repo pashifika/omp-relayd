@@ -28,14 +28,13 @@ disagree. Byte counts are from the committed files.
 | `ts-hello.msgpack` | `hello` | The same nested-map risk, in the other direction. Decoded through a type whose `room` deserializer accepts a map only, so a positional or flattened room fails rather than decoding by accident. |
 | `ts-send.msgpack` | `send` | The same omitted-optional risk, in the other direction: the TypeScript encoder must omit `reply_to` rather than emit nil for it. |
 | `ts-receipt.msgpack` | `receipt` | The same string-enum risk, in the other direction: `rmp-serde` must recover `ReceiptStatus::RecipientBackpressure` from the string the TypeScript side wrote. |
+| `ts-announce.msgpack` | `announce` | The same no-target risk, in the other direction: the TypeScript encoder must write no `to` key, and `rmp-serde` must read the frame as an announcement rather than as something with a missing field. |
+| `ts-notice.msgpack` | `notice` | The same class-in-the-discriminator risk, in the other direction. Both sides assert the same relation over these bytes: the frame is exactly one byte shorter than the identical fields under `message`. |
+| `ts-accepted.msgpack` | `accepted` | The same two-counts risk, in the other direction: `rmp-serde` must recover both `u32` fields from the numbers the TypeScript side wrote, with no `status` anywhere. |
 
 The two `hello` fixtures name different rooms, because each was produced by the
 change that introduced it. Nothing depends on the values matching; the shape is
 what is under test.
-
-The `ts-*` counterparts of the three announcement frames arrive with the client
-library, in the step that teaches it those frames. Until then this direction is
-covered one way only, and the table above says which files exist.
 
 Every payload is also a MessagePack **map**, never a positional array. That is
 the property the whole set depends on, and it is asserted separately in
@@ -64,14 +63,24 @@ breaks nothing.
 
 Where a fixture exists specifically to pin an encoding rather than a value, that
 encoding is asserted directly over the bytes — the absence of a `reply_to` key,
-and the presence of the literal `recipient_backpressure` — because
+the absence of a `to` key on `announce`, the absence of a `status` key on
+`accepted`, and the presence of the literal `recipient_backpressure` — because
 `reply_to: None` alone would also be satisfied by an explicit nil, which both
-decoders accept on purpose.
+decoders accept on purpose, and because both decoders ignore unknown fields, so
+a key that should not exist would decode in silence.
+
+The `notice` pair is asserted as a *relation* rather than a size: each side
+checks that the frame is exactly one byte shorter than the identical fields
+under `message`. That one byte is the difference between the two delivery
+classes, and the shared 65024-byte body budget is computed from it, so a change
+that widened `notice` would fail on both sides rather than silently narrowing
+the margin.
 
 As it happens, `rmp_serde::to_vec_named` and `@msgpack/msgpack` currently emit
-byte-identical payloads for `send` and `receipt`. That is an observation, not a
-requirement, and no test asserts it: either library could change its integer or
-string encoding within the format and still be correct.
+byte-identical payloads for `send`, `receipt`, `announce`, `notice`, and
+`accepted`. That is an observation, not a requirement, and no test asserts it:
+either library could change its integer or string encoding within the format and
+still be correct.
 
 ## Regenerating
 

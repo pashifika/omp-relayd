@@ -32,10 +32,11 @@ import {
   MAX_BODY_BYTES,
   PROTOCOL_VERSION,
   validateServerFrame,
+  type AcceptedFrame,
   type ClientFrame,
+  type DeliveryFrame,
   type ErrorCode,
   type ErrorFrame,
-  type MessageFrame,
   type PeersFrame,
   type ReceiptFrame,
   type ServerFrame,
@@ -132,8 +133,17 @@ export interface Report {
 
 /** Callbacks a host may install. Every one is optional. */
 export interface RelayClientHandlers {
-  /** A message relayed from another peer, already validated. */
-  readonly onMessage?: (message: MessageFrame) => void;
+  /**
+   * A delivery relayed from another peer, already validated.
+   *
+   * Carries both classes, and the class is `type`. One callback rather than two
+   * so that a host cannot drop announcements by forgetting to install a second
+   * handler: `wire-protocol` obliges the client to deliver every validated
+   * `notice`, and an uninstalled callback would satisfy that obligation
+   * nowhere. What the difference *means* is host policy; the client applies
+   * none.
+   */
+  readonly onDelivery?: (delivery: DeliveryFrame) => void;
   /** The connection became usable: `ready` arrived. */
   readonly onReady?: () => void;
   /** The connection ended, with the reason it ended for. */
@@ -211,17 +221,52 @@ export interface SendRequest {
   readonly id?: string;
 }
 
+/**
+ * What an `announce` needs. `id` is generated when the caller does not supply
+ * one.
+ *
+ * No target, and no field where one could go: the room-wide address is the
+ * absence of a peer component.
+ */
+export interface AnnounceRequest {
+  readonly body: string;
+  readonly replyTo?: string;
+  readonly id?: string;
+}
+
+/** Which request a pending entry belongs to, for its diagnostics. */
+export type RequestKind = "list" | "send" | "announce";
+
+/**
+ * Which reply space a request's correlation token occupies.
+ *
+ * `send` and `announce` share one, because their tokens do. The relay validates
+ * length and deduplicates nothing, so it will route a `send` and an `announce`
+ * carrying one `id`; this client is then the only party that could tell the
+ * resulting `receipt` and `accepted` apart. It could, by `type` — but an `error`
+ * frame naming that token could not, and an error is the reply either request
+ * may get. Sharing the space is what turns that ambiguity into a refusal of the
+ * second request instead of a reply settling the wrong caller.
+ *
+ * `list` keeps its own space. Its token is a different field answered by a
+ * different frame, and nothing is gained by forbidding a coincidence there.
+ */
+function replySpace(kind: RequestKind): "list" | "delivery" {
+  return kind === "list" ? "list" : "delivery";
+}
+
 type RequestOutcome =
-  | { readonly ok: true; readonly frame: PeersFrame | ReceiptFrame }
+  | { readonly ok: true; readonly frame: PeersFrame | ReceiptFrame | AcceptedFrame }
   | { readonly ok: false; readonly error: RequestFailed };
 
 interface PendingRequest {
   /**
-   * Which reply this entry accepts. A `list` and a `send` may legitimately
-   * carry the same correlation token — the relay treats both as opaque and
-   * scopes neither — so the token alone does not identify the reply space.
+   * Which request this entry belongs to, for the diagnostic a collision or a
+   * timeout reports. The reply space it occupies is {@link replySpace} of this,
+   * which is coarser: a `list` and a `send` may legitimately carry the same
+   * correlation token, and a `send` and an `announce` may not.
    */
-  readonly kind: "list" | "send";
+  readonly kind: RequestKind;
   readonly settle: (outcome: RequestOutcome) => void;
   timer: TimerHandle | null;
   /**
@@ -501,6 +546,72 @@ export class RelayClient {
     return promise;
   }
 
+  /**
+   * Relays `body` to every other peer in the room.
+   *
+   * Resolves with the relay's acceptance, including two zero counts: an empty
+   * room is a fact about the room, not a failure of the request. The caller
+   * reads the counts.
+   *
+   * The announcer never receives its own announcement, so a caller must not
+   * wait to see one as confirmation.
+   */
+  announce(request: AnnounceRequest): Promise<AcceptedFrame> {
+    const id = request.id ?? crypto.randomUUID();
+    const { promise, resolve, reject } = Promise.withResolvers<AcceptedFrame>();
+
+    const refuse = (message: string): Promise<AcceptedFrame> => {
+      reject(new RequestFailed("invalid_request", message));
+      return promise;
+    };
+
+    const idProblem = correlationProblem(id);
+    if (idProblem !== null) {
+      return refuse(`announce id ${describeIdentifierProblem(idProblem)}`);
+    }
+    if (request.replyTo !== undefined) {
+      const replyProblem = correlationProblem(request.replyTo);
+      if (replyProblem !== null) {
+        return refuse(`announce reply_to ${describeIdentifierProblem(replyProblem)}`);
+      }
+    }
+    // The same budget as `send`, and checked here for the same reason: the relay
+    // answers an over-budget body by closing the connection, which would turn
+    // one bad argument into an outage for every other request on it.
+    const oversized = bodyOverBudget(request.body);
+    if (oversized !== null) {
+      return refuse(
+        `announce body is ${oversized} UTF-8 bytes, over the ${MAX_BODY_BYTES}-byte budget`,
+      );
+    }
+
+    this.#issue(
+      id,
+      "announce",
+      {
+        type: "announce",
+        id,
+        body: request.body,
+        ...(request.replyTo === undefined ? {} : { reply_to: request.replyTo }),
+      },
+      (outcome) => {
+        if (!outcome.ok) {
+          reject(outcome.error);
+        } else if (outcome.frame.type === "accepted") {
+          resolve(outcome.frame);
+        } else {
+          reject(
+            new RequestFailed(
+              "unexpected_reply",
+              `announce ${id} was answered with a ${outcome.frame.type} frame`,
+            ),
+          );
+        }
+      },
+    );
+    return promise;
+  }
+
   // -------------------------------------------------------------------------
   // Connection lifecycle
   // -------------------------------------------------------------------------
@@ -639,8 +750,11 @@ export class RelayClient {
         // Consumed deliberately: a heartbeat answer is not a caller's business.
         break;
 
+      // Both classes reach the host through one callback, carrying `type` as
+      // the class. The client applies no policy to the difference.
       case "message":
-        this.#notify("onMessage", () => this.#handlers.onMessage?.(frame));
+      case "notice":
+        this.#notify("onDelivery", () => this.#handlers.onDelivery?.(frame));
         break;
 
       case "peers":
@@ -649,6 +763,10 @@ export class RelayClient {
 
       case "receipt":
         this.#settle(frame.id, "send", { ok: true, frame });
+        break;
+
+      case "accepted":
+        this.#settle(frame.id, "announce", { ok: true, frame });
         break;
 
       case "error":
@@ -841,7 +959,7 @@ export class RelayClient {
 
   #issue(
     token: string,
-    kind: "list" | "send",
+    kind: RequestKind,
     frame: ClientFrame,
     settle: (outcome: RequestOutcome) => void,
   ): void {
@@ -852,13 +970,18 @@ export class RelayClient {
       });
       return;
     }
-    const key = `${kind}:${token}`;
-    if (this.#pending.has(key)) {
+    const key = `${replySpace(kind)}:${token}`;
+    const outstanding = this.#pending.get(key);
+    if (outstanding !== undefined) {
+      // Names the *outstanding* request rather than this one, because a
+      // cross-class collision is the interesting case: a caller announcing with
+      // the `id` of an unsettled `send` needs to be told which request it
+      // collided with.
       settle({
         ok: false,
         error: new RequestFailed(
           "invalid_request",
-          `a ${kind} with correlation token ${JSON.stringify(token)} is already outstanding`,
+          `a ${outstanding.kind} with correlation token ${JSON.stringify(token)} is already outstanding`,
         ),
       });
       return;
@@ -928,14 +1051,14 @@ export class RelayClient {
   }
 
   /**
-   * Settles the entry `token` names within the `kind` reply space.
+   * Settles the entry `token` names within `kind`'s reply space.
    *
    * A reply matching nothing is discarded rather than treated as an error: a
    * late reply after a timeout is expected and harmless, and the pending map
    * cannot grow from one.
    */
-  #settle(token: string, kind: "list" | "send", outcome: RequestOutcome): void {
-    if (!this.#settleKey(`${kind}:${token}`, outcome)) {
+  #settle(token: string, kind: RequestKind, outcome: RequestOutcome): void {
+    if (!this.#settleKey(`${replySpace(kind)}:${token}`, outcome)) {
       this.#report(
         "info",
         `discarded a ${kind} reply for unknown correlation token ${JSON.stringify(token)}`,
@@ -943,10 +1066,16 @@ export class RelayClient {
     }
   }
 
-  /** Settles whichever reply space holds `token`. Used for `error` frames. */
+  /**
+   * Settles whichever reply space holds `token`. Used for `error` frames.
+   *
+   * An `error` names a token and not a class, which is precisely why `send` and
+   * `announce` share one space: with both outstanding under one token this
+   * function would have to guess, and it would guess in silence.
+   */
   #settleEither(token: string, outcome: RequestOutcome): boolean {
     return (
-      this.#settleKey(`send:${token}`, outcome) ||
+      this.#settleKey(`delivery:${token}`, outcome) ||
       this.#settleKey(`list:${token}`, outcome)
     );
   }

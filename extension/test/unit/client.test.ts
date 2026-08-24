@@ -26,11 +26,16 @@ import {
   encodePayload,
   MAX_BODY_BYTES,
   PROTOCOL_VERSION,
-  type MessageFrame,
+  type DeliveryFrame,
   type ServerFrame,
 } from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
-import { framePayload, ScriptedRelay, type Script } from "../support/scripted-relay.ts";
+import {
+  framePayload,
+  isFrame,
+  ScriptedRelay,
+  type Script,
+} from "../support/scripted-relay.ts";
 import { settlement } from "../support/settlement.ts";
 import { Signal } from "../support/signal.ts";
 
@@ -47,7 +52,7 @@ interface Harness {
   readonly ready: Signal;
   readonly disconnects: Signal<string>;
   readonly reports: Signal<Report>;
-  readonly messages: Signal<MessageFrame>;
+  readonly deliveries: Signal<DeliveryFrame>;
 }
 
 function harnessFor(config: RelayConfig): Harness {
@@ -55,7 +60,7 @@ function harnessFor(config: RelayConfig): Harness {
   const ready = new Signal();
   const disconnects = new Signal<string>();
   const reports = new Signal<Report>();
-  const messages = new Signal<MessageFrame>();
+  const deliveries = new Signal<DeliveryFrame>();
 
   const client = new RelayClient({
     config,
@@ -64,10 +69,10 @@ function harnessFor(config: RelayConfig): Harness {
       onReady: () => ready.fire(undefined),
       onDisconnect: (reason) => disconnects.fire(reason),
       onReport: (report) => reports.fire(report),
-      onMessage: (message) => messages.fire(message),
+      onDelivery: (delivery) => deliveries.fire(delivery),
     },
   });
-  return { client, scheduler, ready, disconnects, reports, messages };
+  return { client, scheduler, ready, disconnects, reports, deliveries };
 }
 
 /** A script that completes the handshake and does nothing else. */
@@ -103,14 +108,6 @@ const COALESCE: Script = (frame, session) => {
     session.sendRaw(coalesced);
   }
 };
-
-function isFrame(value: unknown, type: string): value is Record<string, unknown> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { type?: unknown }).type === type
-  );
-}
 
 /** A port with nothing listening on it: bound, its port noted, then released. */
 async function closedPort(): Promise<number> {
@@ -266,17 +263,63 @@ describe("handshake", () => {
         session.send({ type: "message", id: "after", from: "windows-main", body: "admitted" });
       }
     });
-    const { client, messages, reports } = harnessFor(configFor(relay.port));
+    const { client, deliveries, reports } = harnessFor(configFor(relay.port));
 
     client.start();
-    await messages.until(1);
+    await deliveries.until(1);
 
-    expect(messages.observed.map((message) => message.id)).toEqual(["after"]);
+    expect(deliveries.observed.map((delivery) => delivery.id)).toEqual(["after"]);
     const notices = reports.observed.map((report) => report.message);
     expect(notices.some((message) => message.includes("message"))).toBe(true);
     console.log(
-      `delivered: ${messages.observed.map((message) => message.id).join(", ")}; reported: ${notices.join(" | ")}`,
+      `delivered: ${deliveries.observed.map((delivery) => delivery.id).join(", ")}; reported: ${notices.join(" | ")}`,
     );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a notice reaches the host as its own class, reply_to preserved or absent", async () => {
+    // The class must be a property of the delivery rather than something the
+    // host infers, because the two differ in how the host must deliver them: a
+    // host that could not tell them apart could honour neither rule.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.send({
+          type: "notice",
+          id: "ann-1",
+          from: "macbook-reviewer",
+          body: "the schema landed",
+          reply_to: "ann-0",
+        });
+        session.send({
+          type: "notice",
+          id: "ann-2",
+          from: "macbook-reviewer",
+          body: "unprompted",
+        });
+        session.send({ type: "message", id: "msg-1", from: "windows-main", body: "directed" });
+      }
+    });
+    const { client, deliveries } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await deliveries.until(3);
+
+    expect(deliveries.observed).toEqual([
+      {
+        type: "notice",
+        id: "ann-1",
+        from: "macbook-reviewer",
+        body: "the schema landed",
+        reply_to: "ann-0",
+      },
+      { type: "notice", id: "ann-2", from: "macbook-reviewer", body: "unprompted" },
+      { type: "message", id: "msg-1", from: "windows-main", body: "directed" },
+    ]);
+    // An absent `reply_to` is absent, not a null: the host renders on it.
+    expect(deliveries.observed[1] && "reply_to" in deliveries.observed[1]).toBe(false);
 
     await client.stop();
     await relay.close();
@@ -383,7 +426,7 @@ describe("heartbeat", () => {
         });
       }
     });
-    const { client, scheduler, ready, messages, reports } = harnessFor(
+    const { client, scheduler, ready, deliveries, reports } = harnessFor(
       configFor(relay.port),
     );
 
@@ -403,7 +446,7 @@ describe("heartbeat", () => {
     // and TCP ordering on one connection puts the pong ahead of that reply --
     // so by this line the pong has definitively been handled.
     await client.list("after-pong");
-    expect(messages.count).toBe(0);
+    expect(deliveries.count).toBe(0);
     expect(reports.observed.map((report) => report.message)).toEqual([]);
 
     await client.stop();
@@ -887,6 +930,214 @@ describe("request correlation", () => {
     await client.stop();
     await relay.close();
   });
+
+  test("an acceptance settles its announcement, and a receipt its send", async () => {
+    // Two reply frames in one space, told apart by `type`. Settling either
+    // caller with the other's frame would hand a receipt's status to a caller
+    // waiting for counts.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+      }
+      if (isFrame(frame, "announce")) {
+        session.send({ type: "accepted", id: String(frame["id"]), delivered: 2, shed: 1 });
+      }
+      if (isFrame(frame, "send")) {
+        session.send({ type: "receipt", id: String(frame["id"]), to: "a", status: "routed" });
+      }
+    });
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const [accepted, receipt] = await Promise.all([
+      client.announce({ body: "the schema landed", id: "ann-1" }),
+      client.send({ to: "a", body: "apply it", id: "msg-1" }),
+    ]);
+
+    expect(accepted).toEqual({ type: "accepted", id: "ann-1", delivered: 2, shed: 1 });
+    expect(receipt.status).toBe("routed");
+    expect(client.pendingRequests).toBe(0);
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("a zero-count acceptance resolves rather than rejecting", async () => {
+    // An empty room is a fact about the room. Rejecting here would make the
+    // commonest first announcement look like a failed request.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+      }
+      if (isFrame(frame, "announce")) {
+        session.send({ type: "accepted", id: String(frame["id"]), delivered: 0, shed: 0 });
+      }
+    });
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const accepted = await client.announce({ body: "anyone there", id: "ann-1" });
+    expect(accepted.delivered).toBe(0);
+    expect(accepted.shed).toBe(0);
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("an unmatched acceptance is discarded without growing the pending map", async () => {
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+        session.send({ type: "accepted", id: "nobody-asked", delivered: 3, shed: 0 });
+      }
+      if (isFrame(frame, "list")) {
+        session.send({ type: "peers", request_id: String(frame["request_id"]), peers: [PEER] });
+      }
+    });
+    const { client, ready, reports } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    // A barrier rather than a sleep: a completed round trip after the stray
+    // acceptance means it has definitively been handled.
+    await client.list("after-stray");
+    expect(client.pendingRequests).toBe(0);
+    expect(client.state).toBe("ready");
+    expect(reports.observed.map((report) => report.message).join(" | ")).toContain(
+      "nobody-asked",
+    );
+
+    await client.stop();
+    await relay.close();
+  });
+
+  /**
+   * Admits, answers `list`, and answers nothing else.
+   *
+   * The `list` answer is the barrier these two tests need: a completed round
+   * trip proves every frame written before it has reached the relay, which is
+   * what makes "the refused request wrote nothing" an assertion rather than a
+   * race against the socket.
+   */
+  const ADMIT_AND_LIST: Script = (frame, session) => {
+    if (isFrame(frame, "hello")) {
+      session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+    }
+    if (isFrame(frame, "list")) {
+      session.send({ type: "peers", request_id: String(frame["request_id"]), peers: [PEER] });
+    }
+  };
+
+  test("a token outstanding on the other delivery class is refused unwritten", async () => {
+    // The relay validates length and deduplicates nothing, so it would route
+    // both. An `error` frame naming that token could then not say which request
+    // it answered, and the client would have to guess in silence.
+    const relay = await ScriptedRelay.start(ADMIT_AND_LIST);
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const outstanding = client.send({ to: "a", body: "one", id: "shared" });
+    const outstandingSettled = outstanding.then(
+      () => "resolved" as const,
+      () => "rejected" as const,
+    );
+    const collision = client.announce({ body: "two", id: "shared" });
+
+    await expect(collision).rejects.toThrow(/send with correlation token "shared" is already/);
+    // The outstanding send keeps its own entry: the refusal touched nothing.
+    expect(client.pendingRequests).toBe(1);
+
+    await client.list("barrier");
+    expect(relay.received.filter((frame) => isFrame(frame, "announce"))).toHaveLength(0);
+    expect(relay.received.filter((frame) => isFrame(frame, "send"))).toHaveLength(1);
+
+    // And it still settles, rather than being stranded by the collision.
+    await client.stop();
+    expect(await outstandingSettled).toBe("rejected");
+    await relay.close();
+  });
+
+  test("the reverse collision is refused too, naming the announcement", async () => {
+    const relay = await ScriptedRelay.start(ADMIT_AND_LIST);
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const outstanding = client.announce({ body: "one", id: "shared" });
+    const outstandingSettled = outstanding.then(
+      () => "resolved" as const,
+      () => "rejected" as const,
+    );
+    const collision = client.send({ to: "a", body: "two", id: "shared" });
+
+    await expect(collision).rejects.toThrow(
+      /announce with correlation token "shared" is already/,
+    );
+
+    await client.list("barrier");
+    expect(relay.received.filter((frame) => isFrame(frame, "send"))).toHaveLength(0);
+    expect(relay.received.filter((frame) => isFrame(frame, "announce"))).toHaveLength(1);
+
+    await client.stop();
+    expect(await outstandingSettled).toBe("rejected");
+    await relay.close();
+  });
+
+  test("a list may share a token with a delivery, because their replies differ", async () => {
+    // The two spaces are separate on purpose: a `peers` answers a `list` and
+    // nothing else, so a coincidence there costs nothing and forbidding it
+    // would refuse a legitimate request.
+    const relay = await ScriptedRelay.start((frame, session) => {
+      if (isFrame(frame, "hello")) {
+        session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+      }
+      if (isFrame(frame, "list")) {
+        session.send({ type: "peers", request_id: String(frame["request_id"]), peers: [PEER] });
+      }
+      if (isFrame(frame, "announce")) {
+        session.send({ type: "accepted", id: String(frame["id"]), delivered: 1, shed: 0 });
+      }
+    });
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const [roster, accepted] = await Promise.all([
+      client.list("shared"),
+      client.announce({ body: "one", id: "shared" }),
+    ]);
+    expect(roster.peers).toEqual([PEER]);
+    expect(accepted.delivered).toBe(1);
+
+    await client.stop();
+    await relay.close();
+  });
+
+  test("an over-budget announcement is refused locally, before anything is written", async () => {
+    const relay = await ScriptedRelay.start(ADMIT);
+    const { client, ready } = harnessFor(configFor(relay.port));
+
+    client.start();
+    await ready.until(1);
+
+    const attempt = client.announce({ body: "b".repeat(MAX_BODY_BYTES + 1) });
+    await expect(attempt).rejects.toThrow(`over the ${MAX_BODY_BYTES}-byte budget`);
+
+    expect(relay.received).toHaveLength(1); // the hello, and nothing else
+    expect(client.state).toBe("ready");
+
+    await client.stop();
+    await relay.close();
+  });
 });
 
 describe("failures stay inside the client", () => {
@@ -980,7 +1231,7 @@ describe("failures stay inside the client", () => {
       config: configFor(relay.port),
       scheduler: new FakeScheduler(),
       handlers: {
-        onMessage: () => {
+        onDelivery: () => {
           throw new Error("the host's message handler is broken");
         },
         onReport: (report) => reports.fire(report),
@@ -1013,7 +1264,7 @@ describe("failures stay inside the client", () => {
       config: configFor(relay.port),
       scheduler: new FakeScheduler(),
       handlers: {
-        onMessage: async () => {
+        onDelivery: async () => {
           await Promise.resolve();
           throw new Error("the host's async message handler rejected");
         },
@@ -1048,7 +1299,7 @@ describe("failures stay inside the client", () => {
       scheduler,
       handlers: {
         onReady: () => ready.fire(undefined),
-        onMessage: () => {
+        onDelivery: () => {
           throw new Error("the host's message handler is broken");
         },
         onReport: (report) => reports.fire(report),
@@ -1088,7 +1339,7 @@ describe("failures stay inside the client", () => {
       scheduler,
       handlers: {
         onReady: () => ready.fire(undefined),
-        onMessage: () => ({
+        onDelivery: () => ({
           get then(): never {
             throw new Error("the host's thenable is broken");
           },
@@ -1136,7 +1387,7 @@ describe("failures stay inside the client", () => {
         scheduler,
         handlers: {
           onReady: () => ready.fire(undefined),
-          onMessage: () => {
+          onDelivery: () => {
             throw value;
           },
           onReport: (report) => reports.fire(report),
@@ -1175,7 +1426,7 @@ describe("failures stay inside the client", () => {
       scheduler,
       handlers: {
         onReady: () => ready.fire(undefined),
-        onMessage: () => {
+        onDelivery: () => {
           throw new Error("the host's message handler threw");
         },
         get onReport(): never {
@@ -1228,7 +1479,7 @@ describe("failures stay inside the client", () => {
       scheduler: new FakeScheduler(),
       handlers: {
         onReady: () => ready.fire(undefined),
-        onMessage: () => {
+        onDelivery: () => {
           delivered.fire(undefined);
           return held.promise;
         },
@@ -1276,7 +1527,7 @@ describe("failures stay inside the client", () => {
       config: configFor(relay.port),
       scheduler: new FakeScheduler(),
       handlers: {
-        onMessage: () => {
+        onDelivery: () => {
           delivered.fire(undefined);
           return held.promise;
         },

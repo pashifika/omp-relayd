@@ -50,9 +50,12 @@ Every row includes the string `type` field shown in the first column.
 | `hello` | `protocol: u32`, `room: map`, `room.project: string`, `room.task: string`, `peer: string` | none | Admit protocol version 1, one room, and one peer name |
 | `list` | `request_id: string` | none | Request the sorted peers registered in the sender's room |
 | `send` | `id: string`, `to: string`, `body: string` | `reply_to: string` | Queue one message for a peer in the sender's room |
+| `announce` | `id: string`, `body: string` | `reply_to: string` | Queue one `notice` for every other peer in the sender's room |
 | `ping` | none | none | Reset the idle deadline and request `pong` |
 
-A client-supplied `from` field has no authority. The relay derives `message.from` from the registered connection.
+A client-supplied `from` field has no authority. The relay derives `message.from` and `notice.from` from the registered connection.
+
+`announce` carries no target field. The absence of a peer component is what addresses the sender's whole room, so there is no reserved target value a peer could register under and capture. A frame typed `send` whose `to` is absent is a malformed `send`, never an announcement.
 
 ## Server-to-client frames
 
@@ -62,8 +65,10 @@ Every row includes the string `type` field shown in the first column.
 |---|---|---|---|
 | `ready` | `protocol: u32` | none | Confirm a successful handshake and negotiated version |
 | `peers` | `request_id: string`, `peers: array<string>` | none | Return all peers in the room, including the requester, in bytewise ascending order |
-| `message` | `id: string`, `from: string`, `body: string` | `reply_to: string` | Deliver a sender-authenticated message |
+| `message` | `id: string`, `from: string`, `body: string` | `reply_to: string` | Deliver one directed message from a registered peer |
+| `notice` | `id: string`, `from: string`, `body: string` | `reply_to: string` | Deliver one announcement from a registered peer, addressed to the room rather than to the recipient |
 | `receipt` | `id: string`, `to: string`, `status: string` | none | Report the relay-level outcome of one `send` |
+| `accepted` | `id: string`, `delivered: u32`, `shed: u32` | none | Report the two counts one `announce` produced |
 | `pong` | none | none | Answer `ping` |
 | `error` | `code: string` | `message: string`, `request_id: string` | Report a protocol or connection failure |
 
@@ -79,6 +84,17 @@ Every row includes the string `type` field shown in the first column.
 | `invalid_target` | The target violates the peer identifier rules. The sender remains connected. |
 
 For an overlong invalid target, `receipt.to` contains at most the first 64 UTF-8 bytes, truncated at a character boundary.
+
+## Acceptance counts
+
+`accepted` carries no status field. Its two counts are the outcome of one `announce`, and they sum to the number of peers the fanout addressed — every peer registered in the sender's room except the sender itself.
+
+| Count | Meaning |
+|---|---|
+| `delivered` | Addressed recipients whose outbound queue took the `notice`. It does not mean any of them read, processed, accepted, or answered it. |
+| `shed` | Addressed recipients whose 128-frame outbound queue refused it. Both classes share one queue and one capacity, so a fanout reports a refused enqueue as one increment here instead of as a status. |
+
+`delivered` 0 with `shed` 0 means the sender was alone in its room. That is a fact about the room rather than a failure of the request: no `error` is emitted and the connection stays open. A shed count is not a delivery to retry blindly, because the peer that shed it is a peer that is not reading its connection.
 
 ## Error codes
 
@@ -103,8 +119,8 @@ Handshake, framing, decode, body-budget, timeout, and replacement failures close
 |---|---|
 | Frame payload | 65,536 bytes, excluding the four-byte prefix |
 | `room.project`, `room.task`, `peer`, and valid `send.to` | 1–64 UTF-8 bytes; no `/` or `@`; no leading or trailing whitespace |
-| `send.id`, `list.request_id`, and `send.reply_to` | 1–128 UTF-8 bytes |
-| `send.body` | 65,024 UTF-8 bytes |
+| `send.id`, `announce.id`, `list.request_id`, `send.reply_to`, and `announce.reply_to` | 1–128 UTF-8 bytes |
+| `send.body` and `announce.body` | 65,024 UTF-8 bytes |
 | Per-peer outbound queue | 128 frames |
 | Initial `hello` deadline | 5 seconds after TCP acceptance |
 | Registered connection idle deadline | 90 seconds since the last valid inbound frame |

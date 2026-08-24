@@ -1419,7 +1419,9 @@ var SERVER_FRAME_TYPES = [
   "ready",
   "peers",
   "message",
+  "notice",
   "receipt",
+  "accepted",
   "pong",
   "error"
 ];
@@ -1448,6 +1450,9 @@ function encodePayload(frame) {
   return payload;
 }
 function encodeFrame(frame) {
+  if (frame.type === "announce" && "to" in frame) {
+    throw new EncodeError("an announce carries no target: the absence of a peer component is what addresses " + "the room, so there is no target value to supply");
+  }
   const payload = encodePayload(frame);
   const framed = new Uint8Array(LENGTH_PREFIX_BYTES + payload.length);
   new DataView(framed.buffer).setUint32(0, payload.length, false);
@@ -1564,26 +1569,9 @@ function validateServerFrame(value) {
         }
       };
     }
-    case "message": {
-      const id = map["id"];
-      if (!isNonEmptyString(id))
-        return fieldInvalid("message", "id", id);
-      const from = map["from"];
-      if (!isNonEmptyString(from))
-        return fieldInvalid("message", "from", from);
-      const body = map["body"];
-      if (typeof body !== "string") {
-        return fieldInvalid("message", "body", body, "a string");
-      }
-      const replyTo = optionalString(map, "reply_to");
-      if (replyTo.kind === "invalid") {
-        return fieldInvalid("message", "reply_to", map["reply_to"], "a string");
-      }
-      return {
-        kind: "frame",
-        frame: replyTo.value === null ? { type: "message", id, from, body } : { type: "message", id, from, body, reply_to: replyTo.value }
-      };
-    }
+    case "message":
+    case "notice":
+      return validateDelivery(type, map);
     case "receipt": {
       const id = map["id"];
       if (!isNonEmptyString(id))
@@ -1597,6 +1585,20 @@ function validateServerFrame(value) {
         return fieldInvalid("receipt", "status", status);
       }
       return { kind: "frame", frame: { type: "receipt", id, to, status } };
+    }
+    case "accepted": {
+      const id = map["id"];
+      if (!isNonEmptyString(id))
+        return fieldInvalid("accepted", "id", id);
+      const delivered = map["delivered"];
+      if (typeof delivered !== "number" || !Number.isInteger(delivered) || delivered < 0 || delivered > 4294967295) {
+        return fieldInvalid("accepted", "delivered", delivered, "a u32");
+      }
+      const shed = map["shed"];
+      if (typeof shed !== "number" || !Number.isInteger(shed) || shed < 0 || shed > 4294967295) {
+        return fieldInvalid("accepted", "shed", shed, "a u32");
+      }
+      return { kind: "frame", frame: { type: "accepted", id, delivered, shed } };
     }
     case "error": {
       const code = map["code"];
@@ -1628,6 +1630,32 @@ function validateServerFrame(value) {
       };
     }
   }
+}
+function validateDelivery(type, map) {
+  const id = map["id"];
+  if (!isNonEmptyString(id))
+    return fieldInvalid(type, "id", id);
+  const from = map["from"];
+  if (!isNonEmptyString(from))
+    return fieldInvalid(type, "from", from);
+  const body = map["body"];
+  if (typeof body !== "string") {
+    return fieldInvalid(type, "body", body, "a string");
+  }
+  const replyTo = optionalString(map, "reply_to");
+  if (replyTo.kind === "invalid") {
+    return fieldInvalid(type, "reply_to", map["reply_to"], "a string");
+  }
+  if (type === "notice") {
+    return {
+      kind: "frame",
+      frame: replyTo.value === null ? { type: "notice", id, from, body } : { type: "notice", id, from, body, reply_to: replyTo.value }
+    };
+  }
+  return {
+    kind: "frame",
+    frame: replyTo.value === null ? { type: "message", id, from, body } : { type: "message", id, from, body, reply_to: replyTo.value }
+  };
 }
 function asRecord(value) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -1734,6 +1762,9 @@ class RequestFailed extends Error {
     this.reason = reason;
     this.code = code;
   }
+}
+function replySpace(kind) {
+  return kind === "list" ? "list" : "delivery";
 }
 function backoffDelay(attempt, random) {
   const exponential = RECONNECT_INITIAL_MS * 2 ** Math.max(0, attempt - 1);
@@ -1864,6 +1895,43 @@ class RelayClient {
     });
     return promise;
   }
+  announce(request) {
+    const id = request.id ?? crypto.randomUUID();
+    const { promise, resolve, reject } = Promise.withResolvers();
+    const refuse = (message) => {
+      reject(new RequestFailed("invalid_request", message));
+      return promise;
+    };
+    const idProblem = correlationProblem(id);
+    if (idProblem !== null) {
+      return refuse(`announce id ${describeIdentifierProblem(idProblem)}`);
+    }
+    if (request.replyTo !== undefined) {
+      const replyProblem = correlationProblem(request.replyTo);
+      if (replyProblem !== null) {
+        return refuse(`announce reply_to ${describeIdentifierProblem(replyProblem)}`);
+      }
+    }
+    const oversized = bodyOverBudget(request.body);
+    if (oversized !== null) {
+      return refuse(`announce body is ${oversized} UTF-8 bytes, over the ${MAX_BODY_BYTES}-byte budget`);
+    }
+    this.#issue(id, "announce", {
+      type: "announce",
+      id,
+      body: request.body,
+      ...request.replyTo === undefined ? {} : { reply_to: request.replyTo }
+    }, (outcome) => {
+      if (!outcome.ok) {
+        reject(outcome.error);
+      } else if (outcome.frame.type === "accepted") {
+        resolve(outcome.frame);
+      } else {
+        reject(new RequestFailed("unexpected_reply", `announce ${id} was answered with a ${outcome.frame.type} frame`));
+      }
+    });
+    return promise;
+  }
   #openConnection() {
     this.#cancelReconnect();
     this.#state = "connecting";
@@ -1955,13 +2023,17 @@ class RelayClient {
       case "pong":
         break;
       case "message":
-        this.#notify("onMessage", () => this.#handlers.onMessage?.(frame));
+      case "notice":
+        this.#notify("onDelivery", () => this.#handlers.onDelivery?.(frame));
         break;
       case "peers":
         this.#settle(frame.request_id, "list", { ok: true, frame });
         break;
       case "receipt":
         this.#settle(frame.id, "send", { ok: true, frame });
+        break;
+      case "accepted":
+        this.#settle(frame.id, "announce", { ok: true, frame });
         break;
       case "error":
         this.#handleError(socket, frame);
@@ -2076,11 +2148,12 @@ class RelayClient {
       });
       return;
     }
-    const key = `${kind}:${token}`;
-    if (this.#pending.has(key)) {
+    const key = `${replySpace(kind)}:${token}`;
+    const outstanding = this.#pending.get(key);
+    if (outstanding !== undefined) {
       settle({
         ok: false,
-        error: new RequestFailed("invalid_request", `a ${kind} with correlation token ${JSON.stringify(token)} is already outstanding`)
+        error: new RequestFailed("invalid_request", `a ${outstanding.kind} with correlation token ${JSON.stringify(token)} is already outstanding`)
       });
       return;
     }
@@ -2130,12 +2203,12 @@ class RelayClient {
     }
   }
   #settle(token, kind, outcome) {
-    if (!this.#settleKey(`${kind}:${token}`, outcome)) {
+    if (!this.#settleKey(`${replySpace(kind)}:${token}`, outcome)) {
       this.#report("info", `discarded a ${kind} reply for unknown correlation token ${JSON.stringify(token)}`);
     }
   }
   #settleEither(token, outcome) {
-    return this.#settleKey(`send:${token}`, outcome) || this.#settleKey(`list:${token}`, outcome);
+    return this.#settleKey(`delivery:${token}`, outcome) || this.#settleKey(`list:${token}`, outcome);
   }
   #settleKey(key, outcome) {
     const entry = this.#pending.get(key);
@@ -2592,7 +2665,9 @@ function typeName(value) {
 
 // src/index.ts
 var INBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.message";
+var INBOUND_NOTICE_TYPE = "io.github.pashifika.omp-relay.notice";
 var OUTBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.sent";
+var OUTBOUND_ANNOUNCE_TYPE = "io.github.pashifika.omp-relay.announced";
 var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var CONTROL_CHARACTERS_OUTSIDE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var NEUTRALIZED = "\uFFFD";
@@ -2648,6 +2723,24 @@ function receiptResult(receipt) {
     id: receipt.id,
     to: receipt.to,
     status: receipt.status
+  });
+}
+function acceptedResult(accepted) {
+  const { id, delivered, shed } = accepted;
+  const peers = (count) => count === 1 ? "1 peer" : `${count} peers`;
+  let text;
+  if (delivered === 0 && shed === 0) {
+    text = `Announcement ${id} reached nobody: no other peer is in this room. The room was empty, so this is not a failure.`;
+  } else if (shed === 0) {
+    text = `Announcement ${id} was queued for ${peers(delivered)}; this does not mean any of them has read it.`;
+  } else {
+    text = `Announcement ${id} was queued for ${peers(delivered)} and shed by ${peers(shed)} that is not reading its connection; a shed peer is not reading, so resending would add to a queue that is already full.`;
+  }
+  return result(text, {
+    action: "announce",
+    id,
+    delivered,
+    shed
   });
 }
 var SOURCE_LABEL = {
@@ -2706,8 +2799,8 @@ function joinParameter(value, name) {
   return { ok: true, value };
 }
 async function executeMesh(host, args) {
-  if (args.action !== "join" && args.action !== "list" && args.action !== "send") {
-    return validationFailure('action must be "join", "list", or "send"');
+  if (args.action !== "join" && args.action !== "list" && args.action !== "send" && args.action !== "announce") {
+    return validationFailure('action must be "join", "list", "send", or "announce"');
   }
   if (args.action === "join") {
     const project = joinParameter(args.project, "project");
@@ -2757,6 +2850,28 @@ async function executeMesh(host, args) {
       }
     }
   }
+  if (args.action === "announce") {
+    if (args.to !== undefined) {
+      return validationFailure("announce takes no to: an announcement addresses the whole room, and naming a " + 'peer is what action "send" is for');
+    }
+    for (const field of ["project", "task", "as"]) {
+      if (args[field] !== undefined) {
+        return validationFailure(`announce takes no ${field}: an announcement goes to the room this session already ` + 'joined, and changing the room or peer name of a live session is what action "join" is for');
+      }
+    }
+    if (typeof args.message !== "string") {
+      return validationFailure("announce requires a string message");
+    }
+    if (args.reply_to !== undefined) {
+      if (typeof args.reply_to !== "string") {
+        return validationFailure("reply_to must be a string when provided");
+      }
+      const replyProblem = correlationProblem(args.reply_to);
+      if (replyProblem !== null) {
+        return validationFailure(`reply_to ${describeIdentifierProblem(replyProblem)}`);
+      }
+    }
+  }
   const client = host.client;
   if (client === null || client.state !== "ready") {
     return result('OMP Relay is not ready; no request was sent. Call mesh with action "join" to connect.', { action: args.action, status: "unavailable" });
@@ -2766,6 +2881,29 @@ async function executeMesh(host, args) {
       const peers = await client.list();
       const text = peers.peers.length === 0 ? "No peers are connected in this room." : `Peers in this room: ${peers.peers.map(singleLine).join(", ")}`;
       return result(text, { action: "list", peers: [...peers.peers] });
+    }
+    if (args.action === "announce") {
+      const id2 = crypto.randomUUID();
+      const body2 = args.message;
+      const replyTo2 = args.reply_to;
+      const accepted = await client.announce({
+        id: id2,
+        body: body2,
+        ...replyTo2 === undefined ? {} : { replyTo: replyTo2 }
+      });
+      const announceRoom = host.room;
+      if (announceRoom !== null) {
+        host.recordAnnounce({
+          id: accepted.id,
+          project: announceRoom.project,
+          task: announceRoom.task,
+          body: body2,
+          delivered: accepted.delivered,
+          shed: accepted.shed,
+          ...replyTo2 === undefined ? {} : { reply_to: replyTo2 }
+        });
+      }
+      return acceptedResult(accepted);
     }
     const id = crypto.randomUUID();
     const to = args.to;
@@ -2794,27 +2932,32 @@ async function executeMesh(host, args) {
     return requestFailure(error);
   }
 }
-function buildInboundInjection(message, room, purpose = null) {
+function buildInboundInjection(delivery, room, purpose = null) {
   const details = {
-    id: message.id,
-    from: message.from,
+    id: delivery.id,
+    from: delivery.from,
     project: room.project,
     task: room.task,
-    body: message.body,
-    ...message.reply_to === undefined ? {} : { reply_to: message.reply_to }
+    body: delivery.body,
+    ...delivery.reply_to === undefined ? {} : { reply_to: delivery.reply_to }
   };
+  const announcement = delivery.type === "notice";
   const lines = [
     ...purpose === null ? [] : [PURPOSE_HEADING, purpose, ""],
-    `Remote message from ${singleLine(message.from)}`,
+    announcement ? `Room announcement from ${singleLine(delivery.from)}, addressed to everyone in this room` : `Remote message from ${singleLine(delivery.from)}`,
     `Project: ${singleLine(room.project)}`,
     `Task: ${singleLine(room.task)}`,
-    `Message ID: ${singleLine(message.id)}`,
-    ...message.reply_to === undefined ? [] : [`Reply to: ${singleLine(message.reply_to)}`],
+    `${announcement ? "Announcement" : "Message"} ID: ${singleLine(delivery.id)}`,
+    ...delivery.reply_to === undefined ? [] : [`Reply to: ${singleLine(delivery.reply_to)}`],
     "",
-    ...quotedBody(message.body)
+    ...quotedBody(delivery.body)
   ];
-  return { text: lines.join(`
-`), details };
+  return {
+    text: lines.join(`
+`),
+    details,
+    entryType: announcement ? INBOUND_NOTICE_TYPE : INBOUND_MESSAGE_TYPE
+  };
 }
 function schedulerFrom(ctx) {
   return {
@@ -2861,15 +3004,18 @@ function ompRelay(pi) {
       config,
       scheduler: schedulerFrom(ctx),
       handlers: {
-        onMessage(message) {
-          const purpose = pendingPurpose;
-          pendingPurpose = null;
+        onDelivery(delivery) {
+          const deferred = delivery.type === "notice" && !ctx.isIdle();
+          const purpose = deferred ? null : pendingPurpose;
           if (purpose !== null) {
+            pendingPurpose = null;
             purposeDelivered = true;
           }
-          const injection = buildInboundInjection(message, config.room, purpose);
-          pi.appendEntry(INBOUND_MESSAGE_TYPE, injection.details);
-          pi.sendUserMessage(injection.text, { deliverAs: "steer" });
+          const injection = buildInboundInjection(delivery, config.room, purpose);
+          pi.appendEntry(injection.entryType, injection.details);
+          pi.sendUserMessage(injection.text, {
+            deliverAs: deferred ? "followUp" : "steer"
+          });
         },
         onReport(report) {
           const type = report.level === "warn" ? "warning" : report.level;
@@ -2953,18 +3099,18 @@ function ompRelay(pi) {
     };
   };
   const parameters = pi.zod.object({
-    action: pi.zod.enum(["join", "list", "send"]).describe("Connect to a room, list connected peers, or send a message"),
+    action: pi.zod.enum(["join", "list", "send", "announce"]).describe("Connect to a room, list connected peers, send a message to one peer, or announce to every other peer in the room"),
     project: pi.zod.string().optional().describe("join only: room project, overriding the project configuration file"),
     task: pi.zod.string().optional().describe("join only: room task, overriding the project configuration file"),
     as: pi.zod.string().optional().describe("join only: this session's peer name"),
-    to: pi.zod.string().optional().describe("Peer name; required for send"),
-    message: pi.zod.string().optional().describe("Message body; required for send"),
+    to: pi.zod.string().optional().describe("Peer name; required for send, and rejected for announce"),
+    message: pi.zod.string().optional().describe("Message body; required for send and for announce"),
     reply_to: pi.zod.string().optional().describe("Message identifier being answered")
   });
   pi.registerTool({
     name: "mesh",
     label: "OMP Relay Mesh",
-    description: "Join a relay room, list the peers in it, or send work to one of them. Join first: nothing else works until this session has joined, and the join result reports the room it resolved, where each part of it came from, and who else is present. A routed send result means the message was queued for the recipient; it does not mean the recipient read, accepted, or answered it.",
+    description: "Join a relay room, list the peers in it, send work to one peer, or announce something the whole room needs. Join first: nothing else works until this session has joined, and the join result reports the room it resolved, where each part of it came from, and who else is present. Send work to the peer that must do it, by name; announce information the room needs in order not to collide, with no target at all. A routed send result means the message was queued for the recipient, and an announcement's counts mean it was queued for that many peers; neither means anyone read, accepted, or answered it.",
     parameters,
     async execute(_toolCallId, args, _signal, _onUpdate, ctx) {
       const host = {
@@ -2972,7 +3118,8 @@ function ompRelay(pi) {
         client,
         room: live?.config.room ?? null,
         join: (request) => performJoin(ctx, request),
-        recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details)
+        recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details),
+        recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details)
       };
       return executeMesh(host, args);
     }
@@ -3034,5 +3181,7 @@ export {
   ompRelay as default,
   buildInboundInjection,
   OUTBOUND_MESSAGE_TYPE,
+  OUTBOUND_ANNOUNCE_TYPE,
+  INBOUND_NOTICE_TYPE,
   INBOUND_MESSAGE_TYPE
 };

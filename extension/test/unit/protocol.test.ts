@@ -43,6 +43,13 @@ const CLIENT_FRAMES: readonly ClientFrame[] = [
     body: "answering",
     reply_to: "msg-1",
   },
+  { type: "announce", id: "ann-1", body: "the schema landed" },
+  {
+    type: "announce",
+    id: "ann-2",
+    body: "and the migration with it",
+    reply_to: "ann-1",
+  },
   { type: "ping" },
 ];
 
@@ -57,7 +64,17 @@ const SERVER_FRAMES: readonly ServerFrame[] = [
     body: "answering",
     reply_to: "msg-1",
   },
+  { type: "notice", id: "ann-1", from: "windows-main", body: "the schema landed" },
+  {
+    type: "notice",
+    id: "ann-2",
+    from: "windows-main",
+    body: "and the migration with it",
+    reply_to: "ann-1",
+  },
   { type: "receipt", id: "msg-1", to: "windows-main", status: "routed" },
+  { type: "accepted", id: "ann-1", delivered: 2, shed: 1 },
+  { type: "accepted", id: "ann-2", delivered: 0, shed: 0 },
   { type: "pong" },
   { type: "error", code: "unsupported_protocol", message: "this relay speaks 1" },
   { type: "error", code: "invalid_identifier", request_id: "msg-1" },
@@ -98,6 +115,29 @@ describe("codec", () => {
       needle.every((byte, offset) => bytes[at + offset] === byte),
     );
     expect(present).toBe(false);
+  });
+
+  test("an announce carries no target key at all", () => {
+    // The absence of a peer component *is* the room-wide address, so there is
+    // no reserved value for a peer to register under and capture. A `to` key
+    // here, of any value, would be that reservation.
+    const payload = encodePayload({ type: "announce", id: "ann-1", body: "everyone" });
+    const bytes = [...payload];
+    const needle = [...new TextEncoder().encode("to")];
+    const present = bytes.some((_, at) =>
+      needle.every((byte, offset) => bytes[at + offset] === byte),
+    );
+    expect(present).toBe(false);
+  });
+
+  test("an announce assembled with a target is refused rather than silently stripped", () => {
+    // `AnnounceFrame.to` is `never`, so a literal carrying one does not
+    // compile. This is the case types cannot reach: a frame built by spreading
+    // a wider object. A caller that supplied a target believed it was
+    // addressing one peer, so broadcasting silently instead would be worse than
+    // a stated refusal.
+    const smuggled = { type: "announce", id: "ann-1", body: "everyone", to: "windows-main" };
+    expect(() => encodeFrame(smuggled as ClientFrame)).toThrow(/no target/);
   });
 
   test("an explicit nil reply_to decodes as absent", () => {
@@ -340,6 +380,62 @@ describe("server frame validation", () => {
       if (outcome.kind !== "frame") continue;
       expect(outcome.frame).toEqual(frame);
     }
+  });
+
+  test("a notice is surfaced as its own class, not folded into a message", () => {
+    // The class is the discriminator and nothing else, so a validator that
+    // shared the `message` branch by rewriting `type` would pass every field
+    // assertion and lose the one thing the host must branch on.
+    const outcome = validateServerFrame({
+      type: "notice",
+      id: "ann-1",
+      from: "windows-main",
+      body: "the schema landed",
+    });
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame.type).toBe("notice");
+  });
+
+  test("an accepted frame with a non-integer count is rejected and names it", () => {
+    // A fractional count is not a smaller number of recipients; it is a frame
+    // this client should not have believed.
+    for (const field of ["delivered", "shed"] as const) {
+      const outcome = validateServerFrame({
+        type: "accepted",
+        id: "ann-1",
+        delivered: 2,
+        shed: 0,
+        [field]: 1.5,
+      });
+      expect(outcome.kind).toBe("invalid");
+      if (outcome.kind !== "invalid") continue;
+      expect(outcome.reason).toContain(field);
+    }
+  });
+
+  test("an accepted frame with a negative count is rejected", () => {
+    const outcome = validateServerFrame({
+      type: "accepted",
+      id: "ann-1",
+      delivered: -1,
+      shed: 0,
+    });
+    expect(outcome.kind).toBe("invalid");
+    if (outcome.kind !== "invalid") return;
+    expect(outcome.reason).toContain("delivered");
+  });
+
+  test("a zero-count acceptance is a valid frame, not an omission", () => {
+    // An empty room is a fact about the room. Treating two zeroes as a missing
+    // field would turn the commonest first announcement into a dropped reply.
+    const outcome = validateServerFrame({
+      type: "accepted",
+      id: "ann-1",
+      delivered: 0,
+      shed: 0,
+    });
+    expect(outcome.kind).toBe("frame");
   });
 });
 

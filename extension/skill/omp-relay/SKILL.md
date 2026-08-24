@@ -1,20 +1,28 @@
 ---
 name: omp-relay
-description: Hand work to an OMP session on another machine through the OMP Relay `mesh` tool, and handle work that arrives from one. Use when the operator asks to reach another terminal, machine, or peer — "ask the Windows box", "send this to the other laptop", "see who else is connected" — or when a remote message arrives and you must answer it. Covers joining a room, resolving an informal peer reference against the roster, writing a briefing the recipient can act on without context, and reading a receipt correctly.
+description: Hand work to one remote OMP session or announce shared information to a relay room through the `mesh` tool, and handle deliveries that arrive from either class. Use when the operator asks to reach another terminal, machine, peer, or room — "ask the Windows box", "tell everyone the schema landed", "see who else is connected" — or when a remote message or room announcement arrives. Covers joining, choosing between `send` and `announce`, resolving informal peer references, writing self-contained briefings, and reading receipts and acceptance counts correctly.
 ---
 
 # OMP Relay collaboration
 
 The `mesh` tool connects this session to other OMP sessions through a relay. Each
-connection joins one **room**, addressed as `<project>/<task>`, and every session
-in that room is a **peer** with a name.
+connection joins one **room**, rendered to an operator as `<project>/<task>`, and
+every session in that room is a **peer** with a name.
 
-A room is an address space, not a channel. There is no room-wide utterance: every
-`send` names exactly one target.
+There are two delivery classes, chosen by what the content is — not by how many
+peers happen to be present:
 
-The peer on the other end is another autonomous agent with its own operator, its
-own machine, and no knowledge of this conversation. Everything below follows from
-that.
+- `send` addresses one peer. The operator-facing form is
+  `<project>/<task>@<peer>`.
+- `announce` addresses every other peer in the room. The operator-facing form is
+  `<project>/<task>`, with no peer component.
+
+Neither combined address is written on the wire: the connection already owns the
+room, and a directed frame carries only the peer name. No peer name is reserved
+to mean "everyone"; an announcement carries no target field at all.
+
+The peers are autonomous agents with their own operators, machines, and
+conversations. Everything below follows from that.
 
 ## 1. Join before you address anyone
 
@@ -63,14 +71,14 @@ only thing that distinguishes them, so consult it first.
 - **More than one consistent match** → report the candidates and ask which.
   Do not choose.
 
-## 3. Alone in the room? Stop
+## 3. Alone in the room? Distinguish work from information
 
-When the roster contains only this session, **stop and tell the operator**. Name
-the resolved room and ask whether the other end has joined yet, or whether the
-two rooms actually match.
+When work is intended for another peer and the roster contains only this
+session, **stop and tell the operator**. Name the resolved room and ask whether
+the other end has joined yet, or whether the two rooms actually match.
 
-Sending anyway returns `peer_offline`, which conflates three different
-situations:
+Sending directed work anyway returns `peer_offline`, which conflates three
+different situations:
 
 - the peer is not running;
 - the peer is running under a different name;
@@ -78,6 +86,10 @@ situations:
 
 Reporting "nobody else is in `acme/pr-471`" is precise. Forwarding an offline
 receipt is not.
+
+An announcement into the same empty room is different: `delivered: 0, shed: 0`
+is a successful answer saying nobody else was present. Report the empty room,
+not a failed announcement.
 
 ## 4. Write a briefing the recipient can act on
 
@@ -121,43 +133,66 @@ mesh(action: "send", to: "MacBook-Pro", message: "...", reply_to: "<the id from 
 Without `reply_to` the initiator cannot correlate your answer with what it asked,
 which matters most when it asked several things.
 
-## 5. Read the receipt correctly
+## 5. Read receipts and acceptance counts correctly
 
-A `routed` receipt means **the relay placed the frame in the recipient's queue**.
+A `routed` receipt means **the relay placed the frame in the named peer's
+queue**.
 
-It does not mean the recipient read it, accepted it, agreed to it, started it, or
+It does not mean the peer read it, accepted it, agreed to it, started it, or
 finished it.
 
-So after a `routed` receipt:
+An announcement's `accepted` reply carries counts instead of one status:
 
-- Report to the operator that the request was **queued** — never that the task is
-  done or under way.
+- `delivered` is how many other peers had the notice placed in their queue.
+- `shed` is how many addressed peers refused it because they were not reading
+  their connection. It does not name which peers.
+
+A shed count is not an invitation to retry blindly. Resending immediately adds
+to a room containing a peer whose queue is already full. Zero deliveries and
+zero shed means the room held nobody else; it is an empty-room observation, not
+an error.
+
+After either a routed receipt or an acceptance:
+
+- Report **queued**, never read or completed.
 - Continue with other work.
-- **Do not wait for a reply.** Do not poll, do not loop, do not hold the turn
-  open. There is no `wait` action and adding a sleep gains nothing.
+- **Do not wait for a reply.** Do not poll, loop, or hold the turn open. There
+  is no `wait` action.
 
-A reply arrives later as its own inbound message, which starts or interrupts a
-turn on its own. Handle it where it lands, whatever you were doing at the time.
+A reply arrives later as its own directed inbound message, which starts or
+steers a turn. Handle it where it lands.
 
-Other statuses: `peer_offline` (not queued — see §3), `recipient_backpressure`
-(the recipient's queue is full; retry later), `invalid_target` (the relay refused
-the name).
+An inbound room announcement follows a different interruption policy. When this
+session is idle, it starts a turn so the information is read. When a model run is
+in flight, it waits for that run to finish rather than aborting or steering it.
+Several notices remain separate queued messages. If the operator explicitly
+aborts the run, OMP restores queued notices to the operator's editor for an
+explicit decision rather than auto-running them.
 
-## 6. Reaching several peers is repeated sending
+Other directed-send statuses: `peer_offline` (not queued — see §3),
+`recipient_backpressure` (the named peer's queue is full; retry later), and
+`invalid_target` (the relay refused the name).
 
-There is no broadcast. To reach three peers, send three messages and report all
-three receipts.
+## 6. Choose `send` or `announce` by responsibility
 
-Before doing that, decide what the message actually is:
+Use `send` for work one peer must do. Name that peer, even if everyone in the
+room would understand the instruction. An instruction announced to the room
+leaves every recipient unable to tell who owns it.
 
-- **Work directed at one peer** — send it to that peer only. Do not copy it to
-  the room.
-- **Information several peers genuinely need** — send it to each in turn.
+Use `announce` once for information every peer needs in order not to collide:
+a shared decision landed, an interface changed, a lock is held, or a migration
+must precede dependent work.
 
-Every delivered message starts or interrupts a turn on the receiving side. A
-human reading an IRC channel skips what does not concern them; an agent does not
-get that choice. Broadcasting costs one interrupted turn per recipient, so the
-cost of an ambient announcement is proportional to the room.
+```text
+mesh(action: "announce", message: """
+Repository: github.com/acme/widget, branch feat/schema at 3f2a9c1.
+Shared decision: `Widget.id` is now a UUID string on the wire.
+Do not merge code that still emits the numeric form.
+""")
+```
+
+An announcement never reaches its author. The `accepted` reply is the author's
+confirmation; do not wait to see the notice itself, and do not wait for a reply.
 
 ## Quick reference
 
@@ -168,8 +203,10 @@ cost of an ambient announcement is proportional to the room.
 | Operator named a peer informally | `mesh(action: "list")`, match against the roster |
 | Reference matches nothing | Report the roster; do not send |
 | Reference matches several | Report the candidates; do not choose |
-| Roster holds only this session | Report the room and stop |
-| Sending work | Repository, revision, steps, artifact, acceptance criterion |
-| Answering a message | Set `reply_to` to its identifier |
-| Got `routed` | Say "queued", carry on, do not wait |
-| Several recipients | One `send` each, report every receipt |
+| Directed work, but nobody else is present | Report the room and stop |
+| Sending work to one peer | Repository, revision, steps, artifact, acceptance criterion |
+| Shared information the room needs | `mesh(action: "announce", message: "...")` with no target |
+| Answering a delivery | Set `reply_to` to its identifier |
+| Got `routed` | Say "queued for the peer", carry on, do not wait |
+| Got `accepted` | Report `delivered` and `shed` as queue counts; zero means an empty room |
+| Inbound announcement during a run | It waits; do not abort or steer the run |

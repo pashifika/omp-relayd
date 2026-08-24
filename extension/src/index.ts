@@ -7,6 +7,7 @@ import type {
 import {
   RelayClient,
   RequestFailed,
+  type AnnounceRequest,
   type ClientState,
   type Scheduler,
   type SendRequest,
@@ -28,13 +29,25 @@ import {
   describe,
   describeIdentifierProblem,
   identifierProblem,
-  type MessageFrame,
+  type AcceptedFrame,
+  type DeliveryFrame,
   type PeersFrame,
   type ReceiptFrame,
   type RoomId,
 } from "./protocol.ts";
 
 export const INBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.message";
+
+/**
+ * Session entry for one inbound announcement.
+ *
+ * A distinct type from {@link INBOUND_MESSAGE_TYPE} rather than a class field on
+ * it, for the reason {@link OUTBOUND_MESSAGE_TYPE} is distinct too: a later
+ * reader wants one class far more often than both, and a shared type would make
+ * every such read filter. It also means the class survives in the transcript
+ * without anyone parsing rendered text for it.
+ */
+export const INBOUND_NOTICE_TYPE = "io.github.pashifika.omp-relay.notice";
 
 /**
  * Session entry for one outbound message, the mirror of
@@ -45,6 +58,18 @@ export const INBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.message";
  * a shared type would make every such read filter.
  */
 export const OUTBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.sent";
+
+/**
+ * Session entry for one outbound announcement, the mirror of
+ * {@link INBOUND_NOTICE_TYPE}.
+ *
+ * The `send` record exists because an initiator that loses its own record of
+ * what it asked cannot resolve the `reply_to` that answers it. An announcement
+ * carries `reply_to` on the same terms and can be answered by a directed
+ * message naming it, so the same loss is reachable through this class -- which
+ * is why the record is not left to the directed class alone.
+ */
+export const OUTBOUND_ANNOUNCE_TYPE = "io.github.pashifika.omp-relay.announced";
 
 export interface MeshArguments {
   readonly action?: unknown;
@@ -60,6 +85,7 @@ export interface MeshClient {
   readonly state: ClientState;
   list(): Promise<PeersFrame>;
   send(request: SendRequest): Promise<ReceiptFrame>;
+  announce(request: AnnounceRequest): Promise<AcceptedFrame>;
 }
 
 export interface MeshToolResult {
@@ -67,7 +93,7 @@ export interface MeshToolResult {
   details: Record<string, unknown>;
 }
 
-/** The exact frame values for one inbound message, kept out of the model's context. */
+/** The exact frame values for one inbound delivery, kept out of the model's context. */
 export interface InboundDetails {
   readonly id: string;
   readonly from: string;
@@ -88,12 +114,37 @@ export interface OutboundDetails {
   readonly reply_to?: string;
 }
 
-/** What one validated inbound `message` frame contributes to the session. */
+/**
+ * The exact values of one outbound announcement and the acceptance that
+ * acknowledged it.
+ *
+ * Two counts rather than a status, because that is what the relay answered
+ * with: an announcement has no single outcome to record.
+ */
+export interface AnnouncedDetails {
+  readonly id: string;
+  readonly project: string;
+  readonly task: string;
+  readonly body: string;
+  readonly delivered: number;
+  readonly shed: number;
+  readonly reply_to?: string;
+}
+
+/**
+ * What one validated inbound delivery contributes to the session.
+ *
+ * `entryType` travels with the rest because the class decides it, and the
+ * caller that persists the entry should not have to re-derive the class from
+ * the frame it no longer holds.
+ */
 export interface InboundInjection {
   /** Rendered provenance and quoted body, delivered to the session as a user prompt. */
   readonly text: string;
   /** The unmodified frame values, persisted as a session entry rather than sent to the model. */
   readonly details: InboundDetails;
+  /** The session-entry type for this delivery's class. */
+  readonly entryType: typeof INBOUND_MESSAGE_TYPE | typeof INBOUND_NOTICE_TYPE;
 }
 
 /** What one successful join resolved, and who was in the room when it did. */
@@ -130,11 +181,11 @@ export type JoinOutcome =
 /**
  * What {@link executeMesh} needs from the session runtime.
  *
- * An interface rather than the client alone, because two of the three actions
- * now reach past the connection: `join` replaces it, and `send` persists a
- * record beside it. Keeping those behind named members is what lets the tool's
- * behaviour — including its refusal to register a non-interactive session — be
- * exercised without a socket.
+ * An interface rather than the client alone, because three of the four actions
+ * now reach past the connection: `join` replaces it, and `send` and `announce`
+ * each persist a record beside it. Keeping those behind named members is what
+ * lets the tool's behaviour — including its refusal to register a
+ * non-interactive session — be exercised without a socket.
  */
 export interface MeshHost {
   /**
@@ -146,10 +197,11 @@ export interface MeshHost {
   readonly interactive: boolean;
   /** The live client, or `null` when nothing is connected. */
   readonly client: MeshClient | null;
-  /** The room the live client joined, for recording an outbound message. */
+  /** The room the live client joined, for recording an outbound frame. */
   readonly room: RoomId | null;
   join(parameters: JoinParameters): Promise<JoinOutcome>;
   recordSend(details: OutboundDetails): void;
+  recordAnnounce(details: AnnouncedDetails): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +302,41 @@ function receiptResult(receipt: ReceiptFrame): MeshToolResult {
     id: receipt.id,
     to: receipt.to,
     status: receipt.status,
+  });
+}
+
+/**
+ * Renders an announcement's acceptance as its two counts.
+ *
+ * Worded as queueing rather than reading, for the reason a routed receipt is:
+ * the relay placed the frame in each peer's queue and knows nothing about what
+ * any of them did with it.
+ *
+ * Zero deliveries is a success. It says the room held nobody else, which is a
+ * fact about the room rather than a failure of the request, and reporting it as
+ * an error would send a caller to recover a connection that is fine.
+ *
+ * A shed count is not a delivery to retry blindly: the peer that shed it is a
+ * peer that is not reading its socket, so an immediate resend adds to a queue
+ * that is already full.
+ */
+function acceptedResult(accepted: AcceptedFrame): MeshToolResult {
+  const { id, delivered, shed } = accepted;
+  const peers = (count: number): string => (count === 1 ? "1 peer" : `${count} peers`);
+
+  let text: string;
+  if (delivered === 0 && shed === 0) {
+    text = `Announcement ${id} reached nobody: no other peer is in this room. The room was empty, so this is not a failure.`;
+  } else if (shed === 0) {
+    text = `Announcement ${id} was queued for ${peers(delivered)}; this does not mean any of them has read it.`;
+  } else {
+    text = `Announcement ${id} was queued for ${peers(delivered)} and shed by ${peers(shed)} that is not reading its connection; a shed peer is not reading, so resending would add to a queue that is already full.`;
+  }
+  return result(text, {
+    action: "announce",
+    id,
+    delivered,
+    shed,
   });
 }
 
@@ -355,8 +442,13 @@ function joinParameter(
 }
 
 export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<MeshToolResult> {
-  if (args.action !== "join" && args.action !== "list" && args.action !== "send") {
-    return validationFailure('action must be "join", "list", or "send"');
+  if (
+    args.action !== "join" &&
+    args.action !== "list" &&
+    args.action !== "send" &&
+    args.action !== "announce"
+  ) {
+    return validationFailure('action must be "join", "list", "send", or "announce"');
   }
 
   if (args.action === "join") {
@@ -413,6 +505,45 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
     }
   }
 
+  if (args.action === "announce") {
+    // Refused rather than ignored. A caller that supplied a target believed it
+    // was addressing one peer; broadcasting silently instead would be worse
+    // than a stated refusal, and there is no target to supply -- the absence of
+    // a peer component is what addresses the room.
+    if (args.to !== undefined) {
+      return validationFailure(
+        "announce takes no to: an announcement addresses the whole room, and naming a " +
+          'peer is what action "send" is for',
+      );
+    }
+    // The join-only selectors are refused for the same reason, one field over.
+    // `project` and `task` name a room, so accepting them and announcing anyway
+    // would broadcast into the room this session already holds -- the wrong
+    // peers, silently, from a caller that named different ones. `as` names a
+    // peer. Neither is a thing an announcement can carry, because `join` is the
+    // only way to change the room or peer name of a live session.
+    for (const field of ["project", "task", "as"] as const) {
+      if (args[field] !== undefined) {
+        return validationFailure(
+          `announce takes no ${field}: an announcement goes to the room this session already ` +
+            'joined, and changing the room or peer name of a live session is what action "join" is for',
+        );
+      }
+    }
+    if (typeof args.message !== "string") {
+      return validationFailure("announce requires a string message");
+    }
+    if (args.reply_to !== undefined) {
+      if (typeof args.reply_to !== "string") {
+        return validationFailure("reply_to must be a string when provided");
+      }
+      const replyProblem = correlationProblem(args.reply_to);
+      if (replyProblem !== null) {
+        return validationFailure(`reply_to ${describeIdentifierProblem(replyProblem)}`);
+      }
+    }
+  }
+
   const client = host.client;
   if (client === null || client.state !== "ready") {
     return result(
@@ -433,6 +564,36 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
             // not provider content.
             `Peers in this room: ${peers.peers.map(singleLine).join(", ")}`;
       return result(text, { action: "list", peers: [...peers.peers] });
+    }
+
+    if (args.action === "announce") {
+      const id = crypto.randomUUID();
+      const body = args.message as string;
+      const replyTo = args.reply_to as string | undefined;
+      const accepted = await client.announce({
+        id,
+        body,
+        ...(replyTo === undefined ? {} : { replyTo }),
+      });
+
+      // Recorded for the reason a `send` is: an announcement carries `reply_to`
+      // and can be answered by a directed message naming its identifier, so an
+      // announcer that kept no record loses the request that reply resolves.
+      // The counts stand where a receipt's status would: an announcement has no
+      // single outcome to record.
+      const announceRoom = host.room;
+      if (announceRoom !== null) {
+        host.recordAnnounce({
+          id: accepted.id,
+          project: announceRoom.project,
+          task: announceRoom.task,
+          body,
+          delivered: accepted.delivered,
+          shed: accepted.shed,
+          ...(replyTo === undefined ? {} : { reply_to: replyTo }),
+        });
+      }
+      return acceptedResult(accepted);
     }
 
     const id = crypto.randomUUID();
@@ -472,7 +633,7 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
 }
 
 /**
- * Renders one inbound message for delivery, and the frame values to persist.
+ * Renders one inbound delivery for the session, and the frame values to persist.
  *
  * The rendered text is what the model and the operator see, so every value
  * interpolated into it is neutralized first: the provenance fields to a single
@@ -480,6 +641,11 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
  * occupies column zero and every body line is quoted, which is what makes the
  * boundary unambiguous — a body line can no longer be read as a provenance
  * header, whatever it contains.
+ *
+ * The first provenance line names the class, and states for an announcement
+ * that it was addressed to the room. Without that the two are
+ * indistinguishable in the transcript, and a session would answer the room
+ * privately believing it had been asked.
  *
  * `purpose` is the exception, and only because of where it comes from: it is
  * accepted from the global file alone, so it is first-party operator text with
@@ -489,29 +655,36 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
  * remote body rather than reading as part of either.
  */
 export function buildInboundInjection(
-  message: MessageFrame,
+  delivery: DeliveryFrame,
   room: RoomId,
   purpose: string | null = null,
 ): InboundInjection {
   const details: InboundDetails = {
-    id: message.id,
-    from: message.from,
+    id: delivery.id,
+    from: delivery.from,
     project: room.project,
     task: room.task,
-    body: message.body,
-    ...(message.reply_to === undefined ? {} : { reply_to: message.reply_to }),
+    body: delivery.body,
+    ...(delivery.reply_to === undefined ? {} : { reply_to: delivery.reply_to }),
   };
+  const announcement = delivery.type === "notice";
   const lines = [
     ...(purpose === null ? [] : [PURPOSE_HEADING, purpose, ""]),
-    `Remote message from ${singleLine(message.from)}`,
+    announcement
+      ? `Room announcement from ${singleLine(delivery.from)}, addressed to everyone in this room`
+      : `Remote message from ${singleLine(delivery.from)}`,
     `Project: ${singleLine(room.project)}`,
     `Task: ${singleLine(room.task)}`,
-    `Message ID: ${singleLine(message.id)}`,
-    ...(message.reply_to === undefined ? [] : [`Reply to: ${singleLine(message.reply_to)}`]),
+    `${announcement ? "Announcement" : "Message"} ID: ${singleLine(delivery.id)}`,
+    ...(delivery.reply_to === undefined ? [] : [`Reply to: ${singleLine(delivery.reply_to)}`]),
     "",
-    ...quotedBody(message.body),
+    ...quotedBody(delivery.body),
   ];
-  return { text: lines.join("\n"), details };
+  return {
+    text: lines.join("\n"),
+    details,
+    entryType: announcement ? INBOUND_NOTICE_TYPE : INBOUND_MESSAGE_TYPE,
+  };
 }
 
 function schedulerFrom(ctx: ExtensionContext): Scheduler {
@@ -639,30 +812,62 @@ export default function ompRelay(pi: ExtensionAPI): void {
       config,
       scheduler: schedulerFrom(ctx),
       handlers: {
-        onMessage(message) {
-          const purpose = pendingPurpose;
-          pendingPurpose = null;
+        onDelivery(delivery) {
+          // Which delivery mode this frame takes, decided before the preamble
+          // is claimed, because the preamble may ride only a delivery that
+          // starts or steers a turn.
+          //
+          // A `message` always steers: `deliverAs: "steer"` queues on the
+          // steering queue, and the runtime's drain gate resumes from *any*
+          // transcript tail when that queue is non-empty
+          // (agent-session.ts:6269-6275 in OMP 18.0.4), so it starts a turn on
+          // an idle session and steers into a running one.
+          //
+          // A `notice` must not interrupt work in flight, so it defers with
+          // `followUp` while the model is streaming. Idle, it steers -- there is
+          // nothing to interrupt, and `followUp` would not start a turn at all:
+          // a follow-up-only resume needs an `assistant`/`toolResult` tail
+          // (agent-session.ts:6281-6288 in OMP 18.0.4), which a fresh session
+          // does not have.
+          //
+          // The idle test can race a run that begins before the delivery lands,
+          // in which case the notice becomes a steer into it. Accepted rather
+          // than guarded: the window is narrow, and guarding it would need a
+          // runtime primitive that tests idleness and delivers atomically.
+          const deferred = delivery.type === "notice" && !ctx.isIdle();
+
+          // A deferred notice reaches the model behind the run it waited for and
+          // behind anything that steered into it, so a preamble riding it would
+          // be read after the work it was meant to frame. It stays owed to the
+          // next delivery that starts or steers a turn.
+          const purpose = deferred ? null : pendingPurpose;
           if (purpose !== null) {
+            pendingPurpose = null;
             purposeDelivered = true;
           }
-          const injection = buildInboundInjection(message, config.room, purpose);
+
+          const injection = buildInboundInjection(delivery, config.room, purpose);
           // A session entry, which the runtime documents as state persistence
           // that never reaches the LLM. It is where the exact frame values live,
-          // so the rendered text can be neutralized without losing them.
-          pi.appendEntry(INBOUND_MESSAGE_TYPE, injection.details);
+          // so the rendered text can be neutralized without losing them. The
+          // type carries the class, so a later reader tells the two apart
+          // without parsing rendered text.
+          pi.appendEntry(injection.entryType, injection.details);
           // The call shape is load-bearing in all three of its parts.
           // Not a custom message: the runtime converts one to provider role
           // `developer` (compaction/messages.ts:194-211), ranking a remote peer
           // above the local operator. Not a bare `sendUserMessage`: with no
           // `deliverAs` it takes the prompt path, which auto-reads `@path` file
-          // mentions out of the remote body (agent-session.ts:5789-5800) — and
-          // neither `expandPromptTemplates: false` nor the `> ` body quoting
-          // stops that, because a preceding space already satisfies the mention
-          // boundary. Not `followUp`: its drain is gated on an
-          // `assistant`/`toolResult` transcript tail (agent-session.ts:6244-6266),
-          // so a fresh session would never start the turn; `steer` passes that
-          // gate from any tail via the steering-queue check.
-          pi.sendUserMessage(injection.text, { deliverAs: "steer" });
+          // mentions out of the remote body (agent-session.ts:5811-5820 in OMP
+          // 18.0.4) — and neither `expandPromptTemplates: false` nor the
+          // `> ` body quoting stops that, because a preceding space already
+          // satisfies the mention boundary. That applies to a notice exactly
+          // as it does to a message,
+          // which is why the idle branch here is `steer` and not an omitted
+          // `deliverAs`.
+          pi.sendUserMessage(injection.text, {
+            deliverAs: deferred ? "followUp" : "steer",
+          });
         },
         onReport(report) {
           const type = report.level === "warn" ? "warning" : report.level;
@@ -810,8 +1015,10 @@ export default function ompRelay(pi: ExtensionAPI): void {
 
   const parameters = pi.zod.object({
     action: pi.zod
-      .enum(["join", "list", "send"])
-      .describe("Connect to a room, list connected peers, or send a message"),
+      .enum(["join", "list", "send", "announce"])
+      .describe(
+        "Connect to a room, list connected peers, send a message to one peer, or announce to every other peer in the room",
+      ),
     project: pi.zod
       .string()
       .optional()
@@ -821,8 +1028,14 @@ export default function ompRelay(pi: ExtensionAPI): void {
       .optional()
       .describe("join only: room task, overriding the project configuration file"),
     as: pi.zod.string().optional().describe("join only: this session's peer name"),
-    to: pi.zod.string().optional().describe("Peer name; required for send"),
-    message: pi.zod.string().optional().describe("Message body; required for send"),
+    to: pi.zod
+      .string()
+      .optional()
+      .describe("Peer name; required for send, and rejected for announce"),
+    message: pi.zod
+      .string()
+      .optional()
+      .describe("Message body; required for send and for announce"),
     reply_to: pi.zod.string().optional().describe("Message identifier being answered"),
   });
 
@@ -830,7 +1043,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
     name: "mesh",
     label: "OMP Relay Mesh",
     description:
-      "Join a relay room, list the peers in it, or send work to one of them. Join first: nothing else works until this session has joined, and the join result reports the room it resolved, where each part of it came from, and who else is present. A routed send result means the message was queued for the recipient; it does not mean the recipient read, accepted, or answered it.",
+      "Join a relay room, list the peers in it, send work to one peer, or announce something the whole room needs. Join first: nothing else works until this session has joined, and the join result reports the room it resolved, where each part of it came from, and who else is present. Send work to the peer that must do it, by name; announce information the room needs in order not to collide, with no target at all. A routed send result means the message was queued for the recipient, and an announcement's counts mean it was queued for that many peers; neither means anyone read, accepted, or answered it.",
     parameters,
     async execute(_toolCallId, args, _signal, _onUpdate, ctx) {
       const host: MeshHost = {
@@ -839,6 +1052,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
         room: live?.config.room ?? null,
         join: (request) => performJoin(ctx, request),
         recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details),
+        recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details),
       };
       return executeMesh(host, args);
     },

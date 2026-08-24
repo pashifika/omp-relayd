@@ -401,3 +401,88 @@ fn typescript_receipt_fixture_decodes_its_status_from_a_string() {
         "an enum the TypeScript side spells as a snake_case string",
     );
 }
+
+#[test]
+fn typescript_announce_fixture_decodes_without_a_target() {
+    check_foreign_fixture(
+        "ts-announce.msgpack",
+        &ClientFrame::Announce {
+            id: "ann-1".to_owned(),
+            body: "the schema landed".to_owned(),
+            reply_to: None,
+        },
+        "a room-wide address the TypeScript encoder expressed as the absence of a target \
+         field, with no reserved value for a peer to capture",
+    );
+
+    // Decoding into `Announce` already proves this side reads it as an
+    // announcement, but not that the other side wrote no target: `ClientFrame`
+    // ignores unknown fields on purpose, so a `to` key would decode silently.
+    let committed = fs::read(fixture_dir().join("ts-announce.msgpack")).expect("read the fixture");
+    assert!(
+        !committed.windows(b"to".len()).any(|window| window == b"to"),
+        "the TypeScript announce fixture must contain no target key: {committed:02x?}"
+    );
+}
+
+#[test]
+fn typescript_notice_fixture_decodes_as_a_notice_rather_than_a_message() {
+    let expected = ServerFrame::Notice {
+        id: "ann-2".to_owned(),
+        from: "macbook-reviewer".to_owned(),
+        body: "and the migration with it".to_owned(),
+        reply_to: Some("ann-1".to_owned()),
+    };
+
+    check_foreign_fixture(
+        "ts-notice.msgpack",
+        &expected,
+        "a second delivery class the TypeScript side spelled in the discriminator, over a \
+         field set identical to `message`",
+    );
+
+    // `check_foreign_fixture` compares decoded values, so a fixture that had
+    // decoded as a `message` would have failed above. This measures the class
+    // relation instead: identical fields, a `type` one byte shorter. Both
+    // implementations must agree on that number, because the shared body budget
+    // is computed from it.
+    let committed = fs::read(fixture_dir().join("ts-notice.msgpack")).expect("read the fixture");
+    let as_message = protocol::encode(&ServerFrame::Message {
+        id: "ann-2".to_owned(),
+        from: "macbook-reviewer".to_owned(),
+        body: "and the migration with it".to_owned(),
+        reply_to: Some("ann-1".to_owned()),
+    })
+    .expect("encodes");
+    assert_eq!(
+        committed.len() + 1,
+        as_message.len(),
+        "the TypeScript notice is {} bytes and the same fields under `message` are {}; the \
+         difference must be exactly the one byte of the `type` value, or the two encoders \
+         disagree about the arithmetic the shared body budget rests on",
+        committed.len(),
+        as_message.len()
+    );
+}
+
+#[test]
+fn typescript_accepted_fixture_decodes_its_counts_as_integers() {
+    check_foreign_fixture(
+        "ts-accepted.msgpack",
+        &ServerFrame::Accepted {
+            id: "ann-1".to_owned(),
+            delivered: 2,
+            shed: 1,
+        },
+        "two integer counts the TypeScript side wrote as numbers rather than as a status \
+         string or a single total",
+    );
+
+    let committed = fs::read(fixture_dir().join("ts-accepted.msgpack")).expect("read the fixture");
+    assert!(
+        !committed
+            .windows(b"status".len())
+            .any(|window| window == b"status"),
+        "the TypeScript accepted fixture must carry no status field: {committed:02x?}"
+    );
+}

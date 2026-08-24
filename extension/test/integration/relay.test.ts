@@ -32,7 +32,7 @@ import {
   MAX_IDENTIFIER_BYTES,
   PROTOCOL_VERSION,
   validateServerFrame,
-  type MessageFrame,
+  type DeliveryFrame,
   type ServerFrame,
 } from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
@@ -53,7 +53,7 @@ interface Peer {
   readonly ready: Signal;
   readonly disconnects: Signal<string>;
   readonly reports: Signal<Report>;
-  readonly messages: Signal<MessageFrame>;
+  readonly deliveries: Signal<DeliveryFrame>;
 }
 
 function configFor(port: number, peer: string): RelayConfig {
@@ -65,7 +65,7 @@ function peerFor(config: RelayConfig, scheduler?: Scheduler): Peer {
   const ready = new Signal();
   const disconnects = new Signal<string>();
   const reports = new Signal<Report>();
-  const messages = new Signal<MessageFrame>();
+  const deliveries = new Signal<DeliveryFrame>();
 
   const client = new RelayClient({
     config,
@@ -74,10 +74,10 @@ function peerFor(config: RelayConfig, scheduler?: Scheduler): Peer {
       onReady: () => ready.fire(undefined),
       onDisconnect: (reason) => disconnects.fire(reason),
       onReport: (report) => reports.fire(report),
-      onMessage: (message) => messages.fire(message),
+      onDelivery: (delivery) => deliveries.fire(delivery),
     },
   });
-  return { client, scheduler: fake, ready, disconnects, reports, messages };
+  return { client, scheduler: fake, ready, disconnects, reports, deliveries };
 }
 
 const escaped: unknown[] = [];
@@ -237,26 +237,79 @@ describe("roster and routing", () => {
       body: "review the diff",
       id: "routed-1",
     });
-    await recipient.messages.until(1);
+    await recipient.deliveries.until(1);
 
     expect(receipt).toEqual({ type: "receipt", id: "routed-1", to: "route-recipient", status: "routed" });
     // `from` is derived by the relay from the registered peer name, never taken
     // from the sender's frame.
-    expect(recipient.messages.last).toEqual({
+    expect(recipient.deliveries.last).toEqual({
       type: "message",
       id: "routed-1",
       from: "route-sender",
       body: "review the diff",
     });
-    expect(recipient.messages.last && "reply_to" in recipient.messages.last).toBe(false);
+    expect(recipient.deliveries.last && "reply_to" in recipient.deliveries.last).toBe(false);
 
     // "Exactly once" needs a barrier rather than a sleep: a completed round
     // trip through the relay after the message arrived means any duplicate
     // would already have been delivered by now.
     await recipient.client.list("delivery-barrier");
-    expect(recipient.messages.count).toBe(1);
+    expect(recipient.deliveries.count).toBe(1);
 
     await Promise.all([sender.client.stop(), recipient.client.stop()]);
+  });
+
+  test("one announcement reaches both other peers and never its author", async () => {
+    const announcer = peerFor(configFor(shared().port, "announce-author"));
+    const first = peerFor(configFor(shared().port, "announce-first"));
+    const second = peerFor(configFor(shared().port, "announce-second"));
+
+    announcer.client.start();
+    first.client.start();
+    second.client.start();
+    await Promise.all([
+      announcer.ready.until(1),
+      first.ready.until(1),
+      second.ready.until(1),
+    ]);
+
+    const accepted = await announcer.client.announce({
+      body: "the schema landed",
+      id: "announcement-1",
+      replyTo: "decision-7",
+    });
+    await Promise.all([first.deliveries.until(1), second.deliveries.until(1)]);
+
+    expect(accepted).toEqual({
+      type: "accepted",
+      id: "announcement-1",
+      delivered: 2,
+      shed: 0,
+    });
+    const expected: DeliveryFrame = {
+      type: "notice",
+      id: "announcement-1",
+      from: "announce-author",
+      body: "the schema landed",
+      reply_to: "decision-7",
+    };
+    expect(first.deliveries.observed).toEqual([expected]);
+    expect(second.deliveries.observed).toEqual([expected]);
+
+    // The list reply is a same-connection barrier after `accepted`. By the time
+    // it resolves, an accidental self-delivery would already have reached the
+    // host; no sleep and no guessed quiet interval.
+    await announcer.client.list("after-announcement");
+    expect(announcer.deliveries.count).toBe(0);
+    console.log(
+      `announcement ${accepted.id}: delivered=${accepted.delivered}, shed=${accepted.shed}; recipients=${first.deliveries.count}+${second.deliveries.count}, author=${announcer.deliveries.count}`,
+    );
+
+    await Promise.all([
+      announcer.client.stop(),
+      first.client.stop(),
+      second.client.stop(),
+    ]);
   });
 
   test("a reply carries reply_to through to the recipient", async () => {
@@ -275,9 +328,9 @@ describe("roster and routing", () => {
       id: "reply-2",
       replyTo: "reply-1",
     });
-    await recipient.messages.until(1);
+    await recipient.deliveries.until(1);
 
-    expect(recipient.messages.last?.reply_to).toBe("reply-1");
+    expect(recipient.deliveries.last?.reply_to).toBe("reply-1");
 
     await Promise.all([sender.client.stop(), recipient.client.stop()]);
   });
@@ -293,11 +346,11 @@ describe("roster and routing", () => {
       body: "note to self",
       id: "self-1",
     });
-    await peer.messages.until(1);
+    await peer.deliveries.until(1);
 
     expect(receipt.status).toBe("routed");
-    expect(peer.messages.last?.from).toBe("self-addressed");
-    expect(peer.messages.last?.body).toBe("note to self");
+    expect(peer.deliveries.last?.from).toBe("self-addressed");
+    expect(peer.deliveries.last?.body).toBe("note to self");
 
     await peer.client.stop();
   });
@@ -344,10 +397,10 @@ describe("roster and routing", () => {
       body,
       id: "bulk-1",
     });
-    await recipient.messages.until(1);
+    await recipient.deliveries.until(1);
 
     expect(receipt.status).toBe("routed");
-    expect(recipient.messages.last?.body).toBe(body);
+    expect(recipient.deliveries.last?.body).toBe(body);
     console.log(
       `relayed ${body.length} bytes intact across kernel-chosen chunk boundaries`,
     );

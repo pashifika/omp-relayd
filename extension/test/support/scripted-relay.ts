@@ -19,9 +19,11 @@
 import { createServer, type Server, type Socket } from "node:net";
 
 import {
+  asRecord,
   encodePayload,
   FrameAccumulator,
   LENGTH_PREFIX_BYTES,
+  type ClientFrame,
   type ServerFrame,
 } from "../../src/protocol.ts";
 
@@ -39,6 +41,26 @@ export interface RelaySession {
 
 /** Called for every decoded client frame. Throwing fails the test loudly. */
 export type Script = (frame: unknown, session: RelaySession) => void;
+
+/**
+ * Whether `value` is a decoded frame map carrying `type`.
+ *
+ * Shared rather than re-declared per test file, because every script starts by
+ * asking this and three copies had already drifted into three signatures. The
+ * parameter is the client-frame union, so a script matching on a `type` no
+ * client can send fails to compile instead of silently never firing.
+ */
+export function isFrame(
+  value: unknown,
+  type: ClientFrame["type"],
+): value is Record<string, unknown> {
+  return asRecord(value)?.["type"] === type;
+}
+
+/** One field of a decoded frame map, or `undefined` when there is no map. */
+export function frameField(value: unknown, field: string): unknown {
+  return asRecord(value)?.[field];
+}
 
 /**
  * Frames the length prefix independently of `encodeFrame`.

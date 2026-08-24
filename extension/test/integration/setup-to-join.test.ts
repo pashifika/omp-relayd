@@ -15,7 +15,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { copyFile, mkdtemp, readFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -30,6 +30,8 @@ import {
   startRelay,
   type RelayProcess,
 } from "../support/relay-process.ts";
+import { Signal } from "../support/signal.ts";
+
 
 const BUNDLE = resolve(PACKAGE_ROOT, "dist", "index.js");
 const HELPER = join(REPO_ROOT, "scripts", "setup-client.sh");
@@ -51,11 +53,22 @@ afterAll(async () => {
   await relay?.stop();
 });
 
-/** A context complete enough for the two code paths this exercises. */
-function context(cwd: string, notifications: string[]): ExtensionContext {
+interface RuntimeObservation {
+  readonly userMessages: Array<{ content: unknown; options: unknown }>;
+  readonly entries: Array<{ customType: string; data: unknown }>;
+  readonly injected: Signal<void>;
+}
+
+/** A context complete enough for join, announce, and inbound notice delivery. */
+function context(
+  cwd: string,
+  notifications: string[],
+  observation?: RuntimeObservation,
+): ExtensionContext {
   return {
     mode: "tui",
     cwd,
+    isIdle: () => true,
     ui: {
       notify(message: string) {
         notifications.push(message);
@@ -66,6 +79,13 @@ function context(cwd: string, notifications: string[]): ExtensionContext {
     clearTimer: (handle: unknown) => {
       clearTimeout(handle as Parameters<typeof clearTimeout>[0]);
       clearInterval(handle as Parameters<typeof clearInterval>[0]);
+    },
+    sendUserMessage(content: unknown, options: unknown) {
+      observation?.userMessages.push({ content, options });
+      observation?.injected.fire(undefined);
+    },
+    appendEntry(customType: string, data: unknown) {
+      observation?.entries.push({ customType, data });
     },
   } as unknown as ExtensionContext;
 }
@@ -187,6 +207,140 @@ describe("the documented setup reaches a joined session", () => {
     } finally {
       for (const handler of extension.handlers.get("session_shutdown") ?? []) {
         await handler({ type: "session_shutdown" }, ctx);
+      }
+    }
+  }, RELAY_SETUP_TIMEOUT_MS);
+
+  test("three loaded extension sessions announce through the real relay", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "omp-relay-three-agent-"));
+    const projectRoot = await mkdtemp(join(tmpdir(), "omp-relay-three-root-"));
+    await mkdir(join(projectRoot, ".omp"), { recursive: true });
+    await writeFile(
+      join(agentDir, "omp-relay.yml"),
+      [
+        "transport:",
+        "  mode: local",
+        `  address: "127.0.0.1:${relay.port}"`,
+        "startup: manual",
+        "peer:",
+        '  name: "default-peer"',
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await writeFile(
+      projectConfigPath(projectRoot),
+      ["room:", "  project: omp-relayd", "  task: three-extension-sessions", ""].join("\n"),
+      "utf8",
+    );
+
+    process.env[AGENT_DIR_ENV] = agentDir;
+    process.env[PROJECT_ROOT_ENV] = projectRoot;
+
+    // Three independent runtime instances from three copies of the committed
+    // bundle. The copied paths defeat module-instance sharing; all three still
+    // execute the artifact the README tells an operator to load.
+    const sessions = await Promise.all(
+      ["author", "first", "second"].map(async (name) => {
+        const deployment = await mkdtemp(join(tmpdir(), `omp-relay-three-${name}-`));
+        const extensionPath = join(deployment, "index.js");
+        await copyFile(BUNDLE, extensionPath);
+        const loaded = await loadExtensions([extensionPath], deployment);
+        expect(loaded.errors).toEqual([]);
+        const extension = loaded.extensions[0];
+        if (extension === undefined) throw new Error(`no extension loaded for ${name}`);
+
+        const observation: RuntimeObservation = {
+          userMessages: [],
+          entries: [],
+          injected: new Signal<void>(),
+        };
+        // `loadExtensions` deliberately installs throwing action stubs until a
+        // host binds its runtime. Bind only the two actions this delivery path
+        // uses; registration and tool execution remain the real bundle.
+        loaded.runtime.sendUserMessage = (content, options) => {
+          observation.userMessages.push({ content, options });
+          observation.injected.fire(undefined);
+        };
+        loaded.runtime.appendEntry = (customType, data) => {
+          observation.entries.push({ customType, data });
+        };
+        const ctx = context(projectRoot, [], observation);
+        for (const handler of extension.handlers.get("session_start") ?? []) {
+          await handler({ type: "session_start" }, ctx);
+        }
+        const mesh = extension.tools.get("mesh");
+        if (mesh === undefined) throw new Error(`mesh not registered for ${name}`);
+        const joined = await mesh.definition.execute(
+          `join-${name}`,
+          { action: "join", as: `three-${name}` },
+          undefined,
+          undefined,
+          ctx,
+        );
+        expect((joined.details as Record<string, unknown>)["status"]).toBeUndefined();
+        return { name, extension, mesh, ctx, observation };
+      }),
+    );
+
+    try {
+      const author = sessions[0];
+      const first = sessions[1];
+      const second = sessions[2];
+      if (author === undefined || first === undefined || second === undefined) {
+        throw new Error("three extension sessions were not created");
+      }
+
+      const announced = await author.mesh.definition.execute(
+        "announce-1",
+        {
+          action: "announce",
+          message: "The schema landed; do not emit the numeric form.",
+          reply_to: "decision-7",
+        },
+        undefined,
+        undefined,
+        author.ctx,
+      );
+      await Promise.all([
+        first.observation.injected.until(1),
+        second.observation.injected.until(1),
+      ]);
+
+      const details = announced.details as Record<string, unknown>;
+      expect(details["delivered"]).toBe(2);
+      expect(details["shed"]).toBe(0);
+      expect(author.observation.userMessages).toEqual([]);
+      for (const recipient of [first, second]) {
+        expect(recipient.observation.userMessages).toHaveLength(1);
+        expect(recipient.observation.userMessages[0]?.options).toEqual({
+          deliverAs: "steer",
+        });
+        expect(String(recipient.observation.userMessages[0]?.content)).toContain(
+          "Room announcement from three-author, addressed to everyone in this room",
+        );
+        expect(recipient.observation.entries).toEqual([
+          {
+            customType: "io.github.pashifika.omp-relay.notice",
+            data: {
+              id: details["id"],
+              from: "three-author",
+              project: "omp-relayd",
+              task: "three-extension-sessions",
+              body: "The schema landed; do not emit the numeric form.",
+              reply_to: "decision-7",
+            },
+          },
+        ]);
+      }
+      console.log(
+        `three extension sessions: delivered=${details["delivered"]}, shed=${details["shed"]}; recipient injections=${first.observation.userMessages.length}+${second.observation.userMessages.length}; author injections=${author.observation.userMessages.length}`,
+      );
+    } finally {
+      for (const session of sessions) {
+        for (const handler of session.extension.handlers.get("session_shutdown") ?? []) {
+          await handler({ type: "session_shutdown" }, session.ctx);
+        }
       }
     }
   }, RELAY_SETUP_TIMEOUT_MS);

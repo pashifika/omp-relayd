@@ -18,6 +18,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { encode as rawEncode } from "@msgpack/msgpack";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -34,7 +35,7 @@ import { FIXTURE_DIR } from "../support/paths.ts";
 
 const updating = process.env["UPDATE_FIXTURES"] !== undefined;
 
-/** The three frames, and the interoperability risk each one exists to catch. */
+/** The six frames, and the interoperability risk each one exists to catch. */
 const TS_FIXTURES: readonly {
   readonly name: string;
   readonly frame: ClientFrame | ServerFrame;
@@ -69,6 +70,36 @@ const TS_FIXTURES: readonly {
       status: "recipient_backpressure",
     },
     risk: "an enum encoded as a snake_case string rather than as an integer",
+  },
+  {
+    name: "ts-announce.msgpack",
+    frame: {
+      type: "announce",
+      id: "ann-1",
+      body: "the schema landed",
+    },
+    risk: "a room-wide address expressed as the absence of a target field, with no reserved value for a peer to capture",
+  },
+  {
+    name: "ts-notice.msgpack",
+    frame: {
+      type: "notice",
+      id: "ann-2",
+      from: "macbook-reviewer",
+      body: "and the migration with it",
+      reply_to: "ann-1",
+    },
+    risk: "a second delivery class carried by the discriminator over a field set identical to `message`",
+  },
+  {
+    name: "ts-accepted.msgpack",
+    frame: {
+      type: "accepted",
+      id: "ann-1",
+      delivered: 2,
+      shed: 1,
+    },
+    risk: "an aggregate outcome as two integer counts rather than as a receipt status",
   },
 ];
 
@@ -191,6 +222,132 @@ describe("this implementation decodes the Rust relay's fixtures", () => {
     console.log(
       `rust-receipt.msgpack: ${committed.length} bytes, status typeof ${typeof map?.["status"]}`,
     );
+  });
+
+  test("rust-announce.msgpack carries no target field at all", async () => {
+    const committed = await requireRustFixture("rust-announce.msgpack");
+
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    expect(decoded.value).toEqual({
+      type: "announce",
+      id: "ann-1",
+      body: "the schema landed",
+    });
+
+    // Structural, not a substring scan: the absence of the key is the property,
+    // and this side must not have invented one while decoding.
+    const map = asRecord(decoded.value);
+    expect(map).not.toBeNull();
+    expect(map !== null && "to" in map).toBe(false);
+    expect(Object.keys(map ?? {}).sort()).toEqual(["body", "id", "type"]);
+    console.log(
+      `rust-announce.msgpack: ${committed.length} bytes, keys ${Object.keys(map ?? {}).join("+")}`,
+    );
+  });
+
+  test("rust-notice.msgpack validates as a notice, not as a message", async () => {
+    const committed = await requireRustFixture("rust-notice.msgpack");
+
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    const outcome = validateServerFrame(decoded.value);
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame).toEqual({
+      type: "notice",
+      id: "ann-2",
+      from: "macbook-reviewer",
+      body: "and the migration with it",
+      reply_to: "ann-1",
+    });
+
+    // The class relation the shared body budget rests on: identical fields, and
+    // a `type` one byte shorter. Measured here rather than asserted, so the two
+    // implementations are shown to agree on the number.
+    const asMessage = encodePayload({
+      type: "message",
+      id: "ann-2",
+      from: "macbook-reviewer",
+      body: "and the migration with it",
+      reply_to: "ann-1",
+    });
+    expect(committed.length + 1).toBe(asMessage.length);
+    console.log(
+      `rust-notice.msgpack: ${committed.length} bytes, exactly 1 below the same fields as a message (${asMessage.length})`,
+    );
+  });
+
+  test("rust-accepted.msgpack carries two integer counts and no status", async () => {
+    const committed = await requireRustFixture("rust-accepted.msgpack");
+
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    const outcome = validateServerFrame(decoded.value);
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame).toEqual({
+      type: "accepted",
+      id: "ann-1",
+      delivered: 2,
+      shed: 1,
+    });
+
+    const map = asRecord(decoded.value);
+    expect(map !== null && "status" in map).toBe(false);
+    expect(typeof map?.["delivered"]).toBe("number");
+    expect(typeof map?.["shed"]).toBe("number");
+    console.log(
+      `rust-accepted.msgpack: ${committed.length} bytes, delivered/shed typeof ${typeof map?.["delivered"]}/${typeof map?.["shed"]}, no status key`,
+    );
+  });
+
+  test("field order does not decide what a Rust fixture means", async () => {
+    // Named maps, not positional tuples: the whole set depends on it, and the
+    // cheapest proof is to re-encode the decoded value with its keys reversed
+    // and require the same reading back.
+    for (const name of ["rust-announce.msgpack", "rust-notice.msgpack", "rust-accepted.msgpack"]) {
+      const committed = await requireRustFixture(name);
+      const decoded = decodePayload(committed);
+      expect(decoded.ok).toBe(true);
+      if (!decoded.ok) continue;
+      const map = asRecord(decoded.value);
+      expect(map).not.toBeNull();
+      if (map === null) continue;
+
+      const reversed = Object.fromEntries(Object.entries(map).reverse());
+      const roundTrip = decodePayload(rawEncode(reversed));
+      expect(roundTrip.ok).toBe(true);
+      if (!roundTrip.ok) continue;
+      expect(roundTrip.value).toEqual(decoded.value);
+    }
+  });
+
+  test("an unknown extra field on an announce is ignored, not refused", async () => {
+    // Additive evolution within major version 1: a relay one version ahead may
+    // add a field, and a client that refused the frame would turn an additive
+    // change into a dropped request.
+    const committed = await requireRustFixture("rust-announce.msgpack");
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    const map = asRecord(decoded.value);
+    expect(map).not.toBeNull();
+    if (map === null) return;
+
+    const widened = decodePayload(rawEncode({ ...map, priority: 9, from: "impersonated" }));
+    expect(widened.ok).toBe(true);
+    if (!widened.ok) return;
+    const widenedMap = asRecord(widened.value);
+    expect(widenedMap?.["id"]).toBe("ann-1");
+    expect(widenedMap?.["body"]).toBe("the schema landed");
+    expect(widenedMap !== null && "to" in widenedMap).toBe(false);
   });
 });
 

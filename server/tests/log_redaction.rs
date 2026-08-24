@@ -86,6 +86,11 @@ async fn no_log_record_carries_a_message_body() {
     // is what lets the announcement below take the shed path.
     let (backpressured_at, _stalled) =
         exercise_a_backpressured_body(&relay, &here, &mut sender).await;
+    // A third reading recipient, so the announcement below fans out to three
+    // peers: this one, `recipient`, and the stalled one. Kept alive for the same
+    // reason as `_stalled`: dropping it deregisters the peer, and the fanout
+    // would see two recipients instead of the three the scenario specifies.
+    let _reading = Client::join(&relay, &here, "reading").await;
     exercise_a_shed_announcement(&mut sender).await;
     exercise_a_malformed_frame(&relay).await;
 
@@ -122,6 +127,46 @@ async fn no_log_record_carries_a_message_body() {
          error text that quotes the payload; observed: {decode_record}"
     );
 
+    // One record per announcement, never one per recipient, so the count is the
+    // assertion: a fanout over three recipients of which one was not reading
+    // must leave exactly one shed record behind.
+    let shed_records: Vec<&str> = captured
+        .lines()
+        .filter(|line| line.contains("announcement shed by a recipient queue"))
+        .collect();
+    assert_eq!(
+        shed_records.len(),
+        1,
+        "one announcement must emit one shed record; observed {} among the {lines} \
+         captured lines",
+        shed_records.len()
+    );
+    let shed_record = shed_records[0];
+    for (name, expected) in [
+        ("room", "omp-relayd/redaction"),
+        ("from", "sender"),
+        ("id", "a2"),
+        ("delivered", "2"),
+        ("shed", "1"),
+    ] {
+        assert_eq!(
+            log_field(shed_record, name),
+            Some(expected),
+            "the shed record must report {name} as {expected:?}; observed {:?} in \
+             {shed_record}",
+            log_field(shed_record, name)
+        );
+    }
+    let fanned_out = captured
+        .lines()
+        .filter(|line| line.contains("announcement fanned out"))
+        .count();
+    assert_eq!(
+        fanned_out, 1,
+        "the announcement that shed nothing must emit exactly one record; observed \
+         {fanned_out} among the {lines} captured lines"
+    );
+
     let longest = captured.lines().map(str::len).max().unwrap_or(0);
     assert!(
         !captured.contains(CANARY),
@@ -138,6 +183,23 @@ async fn no_log_record_carries_a_message_body() {
          no occurrence of {CANARY}; backpressure at attempt {backpressured_at}",
         captured.len()
     );
+}
+
+/// Reads one `name=value` field out of a formatted log record.
+///
+/// Values are compared rather than substring-matched, because
+/// `contains("shed=1")` would also accept a record reporting `shed=10`. Quotes
+/// are trimmed because the `fmt` layer renders a string field with them and a
+/// numeric field without.
+fn log_field<'a>(record: &'a str, name: &str) -> Option<&'a str> {
+    record
+        .split_whitespace()
+        .find_map(|token| {
+            token
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+        })
+        .map(|value| value.trim_matches('"'))
 }
 
 /// A body that is routed successfully, which takes the debug-level path.
@@ -231,11 +293,14 @@ async fn exercise_a_shed_announcement(announcer: &mut Client<tokio::net::TcpStre
         .await;
 
     match announcer.recv().await {
-        ServerFrame::Accepted { shed, .. } => {
+        ServerFrame::Accepted {
+            delivered, shed, ..
+        } => {
             assert!(
-                shed > 0,
-                "the premise is a recipient whose queue is full, so the warn-level record \
-                 is emitted; observed {shed} shed"
+                delivered == 2 && shed == 1,
+                "the premise is three recipients of which one is not reading, so the \
+                 warn-level record is emitted; observed {delivered} delivered and \
+                 {shed} shed"
             );
         }
         other => panic!("expected an acceptance, received {other:?}"),
