@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -94,7 +94,7 @@ impl Default for Deadlines {
 #[derive(Clone, Debug)]
 struct PeerHandle {
     connection_id: u64,
-    outbound: mpsc::Sender<ServerFrame>,
+    outbound: mpsc::Sender<Bytes>,
     /// Set when a newer connection takes this peer name.
     ///
     /// Separate from `outbound` on purpose. Closing the queue cannot serve as
@@ -118,6 +118,26 @@ struct Registration {
 }
 
 type Rooms = HashMap<RoomId, HashMap<String, PeerHandle>>;
+
+/// What one routing attempt did with a frame.
+///
+/// [`Routed::Unwritable`] is kept apart from the receipt statuses because it is
+/// the *sender's* failure rather than the recipient's. Encoding used to happen
+/// on the recipient's writer task, where a frame that would not fit the cap
+/// closed the recipient's connection -- the third-party close the reserved
+/// envelope headroom in [`protocol`] exists to make unreachable. Encoding on
+/// the routing call keeps the failure with the connection that built the frame,
+/// and this variant is how the caller learns to charge it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Routed {
+    /// A verdict the sender is told as a `receipt` status.
+    Status(ReceiptStatus),
+    /// Nothing was enqueued, because the frame did not become a payload this
+    /// relay can write. Unreachable for a `send` whose identifiers and body
+    /// passed validation: the body budget is sized so that the `message` built
+    /// from one always fits the frame cap.
+    Unwritable,
+}
 
 /// Registry of rooms and their registered peers.
 ///
@@ -182,7 +202,7 @@ impl ServerState {
         &self,
         room: &RoomId,
         peer: &str,
-        outbound: mpsc::Sender<ServerFrame>,
+        outbound: mpsc::Sender<Bytes>,
         evict: watch::Sender<bool>,
     ) -> Registration {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -248,13 +268,24 @@ impl ServerState {
         names
     }
 
-    /// Places `frame` in the outbound queue of `to` within `room`.
+    /// Encodes `frame` and places it in the outbound queue of `to` within
+    /// `room`.
     ///
     /// The room lock is released before the enqueue attempt, and the attempt is
     /// non-blocking: a full queue becomes an observable
     /// [`ReceiptStatus::RecipientBackpressure`] rather than a stalled sender or
     /// unbounded memory growth.
-    pub fn route(&self, room: &RoomId, to: &str, frame: ServerFrame) -> ReceiptStatus {
+    ///
+    /// Encoding happens here, on the task of the connection that *built* the
+    /// frame, rather than on the recipient's writer. That is what makes
+    /// [`Routed::Unwritable`] reportable to the right peer at all, and it is
+    /// also what lets a fanout encode once and hand the same payload to every
+    /// recipient.
+    ///
+    /// The recipient is resolved before the frame is encoded, so an offline
+    /// peer costs no serialization of a body up to
+    /// [`protocol::MAX_BODY_BYTES`].
+    pub fn route(&self, room: &RoomId, to: &str, frame: &ServerFrame) -> Routed {
         let outbound = {
             let rooms = self.read_rooms();
             rooms
@@ -264,15 +295,62 @@ impl ServerState {
         };
 
         let Some(outbound) = outbound else {
-            return ReceiptStatus::PeerOffline;
+            return Routed::Status(ReceiptStatus::PeerOffline);
         };
 
-        match outbound.try_send(frame) {
-            Ok(()) => ReceiptStatus::Routed,
-            Err(TrySendError::Full(_)) => ReceiptStatus::RecipientBackpressure,
-            // The recipient's task has already dropped its receiver; it is
-            // gone even though its registry entry has not been reaped yet.
-            Err(TrySendError::Closed(_)) => ReceiptStatus::PeerOffline,
+        let Some(payload) = encode_delivery(room, to, frame) else {
+            return Routed::Unwritable;
+        };
+
+        Routed::Status(enqueue(&outbound, payload))
+    }
+}
+
+/// Places an encoded payload in one peer's outbound queue without blocking.
+fn enqueue(outbound: &mpsc::Sender<Bytes>, payload: Bytes) -> ReceiptStatus {
+    match outbound.try_send(payload) {
+        Ok(()) => ReceiptStatus::Routed,
+        Err(TrySendError::Full(_)) => ReceiptStatus::RecipientBackpressure,
+        // The recipient's task has already dropped its receiver; it is gone
+        // even though its registry entry has not been reaped yet.
+        Err(TrySendError::Closed(_)) => ReceiptStatus::PeerOffline,
+    }
+}
+
+/// Encodes one delivery, or reports that this relay cannot write it.
+///
+/// Both failures are invariant breaches rather than peer behaviour. The body
+/// budget is sized so that a `send` whose identifiers and body passed
+/// validation always produces a `message` inside the frame cap, and the frames
+/// this relay builds hold only strings, `u32`s, and vectors of strings, which
+/// [`rmp_serde`] cannot fail to serialize into a `Vec`. So the detail is logged
+/// here at `error` level, where an operator sees it, and the caller is left
+/// with a plain "nothing was enqueued".
+///
+/// Neither record carries a body: the payload size and
+/// [`protocol::Error::kind`] are the whole of what an operator can act on, and
+/// a serde error text quotes the value it rejected.
+fn encode_delivery(room: &RoomId, to: &str, frame: &ServerFrame) -> Option<Bytes> {
+    match protocol::encode(frame) {
+        Ok(payload) if payload.len() <= protocol::MAX_FRAME_BYTES => Some(payload),
+        Ok(payload) => {
+            tracing::error!(
+                %room,
+                to,
+                payload_bytes = payload.len(),
+                cap = protocol::MAX_FRAME_BYTES,
+                "delivery exceeds the frame cap; nothing enqueued"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                %room,
+                to,
+                kind = error.kind(),
+                "delivery could not be encoded; nothing enqueued"
+            );
+            None
         }
     }
 }
@@ -454,11 +532,7 @@ fn register_peer(
     room: RoomId,
     peer: String,
     peer_addr: SocketAddr,
-) -> (
-    RegisteredPeer,
-    mpsc::Receiver<ServerFrame>,
-    watch::Receiver<bool>,
-) {
+) -> (RegisteredPeer, mpsc::Receiver<Bytes>, watch::Receiver<bool>) {
     let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
     let (evict_tx, evict_rx) = watch::channel(false);
     let registration = state.register(&room, &peer, outbound_tx, evict_tx);
@@ -557,7 +631,7 @@ async fn pump<S>(
     writer: protocol::FrameWriter<S>,
     state: &ServerState,
     registered: &RegisteredPeer,
-    outbound: mpsc::Receiver<ServerFrame>,
+    outbound: mpsc::Receiver<Bytes>,
     evicted: watch::Receiver<bool>,
     shutdown: &mut watch::Receiver<bool>,
 ) where
@@ -605,7 +679,7 @@ async fn pump<S>(
 /// channel empty and takes a delivery.
 async fn run_writer<S>(
     mut writer: protocol::FrameWriter<S>,
-    mut outbound: mpsc::Receiver<ServerFrame>,
+    mut outbound: mpsc::Receiver<Bytes>,
     mut replies: mpsc::Receiver<ServerFrame>,
     mut evicted: watch::Receiver<bool>,
     registered: &RegisteredPeer,
@@ -652,7 +726,12 @@ async fn run_writer<S>(
             },
 
             delivery = outbound.recv() => match delivery {
-                Some(frame) => {
+                Some(payload) => {
+                    // Already encoded, by the routing call on the task of the
+                    // connection that sent it. This arm never serializes, so a
+                    // frame this relay cannot write can no longer close the
+                    // connection it was addressed to.
+                    //
                     // The write itself is unbounded on purpose -- the reader is
                     // the watchdog, and a per-write timeout here would give a
                     // silent peer one full idle window per queued frame -- but
@@ -670,7 +749,7 @@ async fn run_writer<S>(
                     let wrote = tokio::select! {
                         biased;
                         () = wait_for_flag(&mut evicted) => None,
-                        result = write_frame(&mut writer, &frame) => Some(result),
+                        result = writer.send(payload) => Some(result),
                     };
 
                     match wrote {
@@ -1135,10 +1214,10 @@ fn handle_send(
     // `body` is moved into the delivered frame and is never a log field; only
     // its size is observable in logs.
     let body_bytes = body.len();
-    let status = state.route(
+    let outcome = state.route(
         &registered.room,
         &to,
-        ServerFrame::Message {
+        &ServerFrame::Message {
             id: id.clone(),
             from: registered.peer.clone(),
             body,
@@ -1146,10 +1225,52 @@ fn handle_send(
         },
     );
 
+    let Routed::Status(status) = outcome else {
+        drop(receipt_slot);
+        return refuse_unwritable(replies, registered, &id, body_bytes);
+    };
+
     log_route(registered, &to, &id, body_bytes, status);
 
     receipt_slot.send(ServerFrame::Receipt { id, to, status });
     ControlFlow::Continue(())
+}
+
+/// Closes the connection whose `send` produced a delivery this relay cannot
+/// write.
+///
+/// Charged to the sender, which built the frame, and never to the recipient it
+/// was addressed to. Unreachable while the body budget holds: `id`, `reply_to`,
+/// and `body` are all checked before routing and `from` is a registered peer
+/// name, which is exactly the arithmetic
+/// `worst_case_message_at_the_body_budget_fits_the_frame_cap` proves. It is
+/// handled rather than asserted so that a later change breaking that arithmetic
+/// closes the connection responsible instead of a third party's, which is the
+/// property `an_unwritable_delivery_closes_nobody` pins.
+///
+/// [`ServerState::route`] has already logged what went wrong at `error` level;
+/// this record names the connection paying for it.
+fn refuse_unwritable(
+    replies: &mpsc::Sender<ServerFrame>,
+    registered: &RegisteredPeer,
+    id: &str,
+    body_bytes: usize,
+) -> ControlFlow<()> {
+    tracing::info!(
+        room = %registered.room,
+        peer = %registered.peer,
+        connection_id = registered.connection_id,
+        id,
+        body_bytes,
+        "the message this send would produce is not writable; closing without routing it"
+    );
+    queue_diagnostic(
+        replies,
+        ErrorCode::FrameTooLarge,
+        "the message this send would produce does not fit the frame cap; it was not routed"
+            .to_owned(),
+    );
+    ControlFlow::Break(())
 }
 
 /// Clamps a rejected `to` value to the identifier limit before it is echoed.
@@ -1406,7 +1527,7 @@ mod tests {
         RoomId::new("omp-relayd", "implement-tcp-relay-server")
     }
 
-    fn peer_queue() -> (mpsc::Sender<ServerFrame>, mpsc::Receiver<ServerFrame>) {
+    fn peer_queue() -> (mpsc::Sender<Bytes>, mpsc::Receiver<Bytes>) {
         mpsc::channel(OUTBOUND_QUEUE_CAPACITY)
     }
 
@@ -1424,7 +1545,7 @@ mod tests {
         state: &ServerState,
         room: &RoomId,
         peer: &str,
-        outbound: mpsc::Sender<ServerFrame>,
+        outbound: mpsc::Sender<Bytes>,
     ) -> (Registration, watch::Receiver<bool>) {
         let (evict_tx, evict_rx) = watch::channel(false);
         (state.register(room, peer, outbound, evict_tx), evict_rx)
@@ -1437,6 +1558,29 @@ mod tests {
             body: "review the diff".to_owned(),
             reply_to: None,
         }
+    }
+
+    /// Routes and unwraps the receipt status.
+    ///
+    /// Every routing test but one is about the status; the unwritable outcome
+    /// has its own test, and a fixture frame reaching it here would be a bug in
+    /// the fixture rather than a result.
+    fn route_status(
+        state: &ServerState,
+        room: &RoomId,
+        to: &str,
+        frame: &ServerFrame,
+    ) -> ReceiptStatus {
+        match state.route(room, to, frame) {
+            Routed::Status(status) => status,
+            Routed::Unwritable => panic!("this fixture frame is well inside the frame cap"),
+        }
+    }
+
+    /// Decodes what a peer's outbound queue holds, which is now bytes rather
+    /// than a frame.
+    fn decode_delivery(payload: &Bytes) -> ServerFrame {
+        protocol::decode(payload).expect("a queued delivery is an encoded server frame")
     }
 
     #[test]
@@ -1505,13 +1649,17 @@ mod tests {
             "the replacement must still be registered"
         );
         assert_eq!(
-            state.route(&room(), "reviewer", message("msg-1")),
+            route_status(&state, &room(), "reviewer", &message("msg-1")),
             ReceiptStatus::Routed,
             "traffic must reach the replacement"
         );
+        let queued = second_rx
+            .try_recv()
+            .expect("the replacement's queue holds the delivery");
         assert!(
-            matches!(second_rx.try_recv(), Ok(ServerFrame::Message { .. })),
-            "the replacement's queue must hold the routed frame"
+            matches!(decode_delivery(&queued), ServerFrame::Message { .. }),
+            "the queue must hold an encoded `message`, ready for the writer to hand to the \
+             socket without serializing anything"
         );
 
         assert!(
@@ -1566,15 +1714,16 @@ mod tests {
         register_in(&state, &room(), "windows-main", tx);
 
         assert_eq!(
-            state.route(&room(), "nobody", message("msg-1")),
+            route_status(&state, &room(), "nobody", &message("msg-1")),
             ReceiptStatus::PeerOffline,
             "an unregistered name is offline"
         );
         assert_eq!(
-            state.route(
+            route_status(
+                &state,
                 &RoomId::new("other", "task"),
                 "windows-main",
-                message("msg-1")
+                &message("msg-1")
             ),
             ReceiptStatus::PeerOffline,
             "a peer of the same name in another room is not reachable"
@@ -1582,13 +1731,13 @@ mod tests {
 
         for slot in 1..=OUTBOUND_QUEUE_CAPACITY {
             assert_eq!(
-                state.route(&room(), "windows-main", message("msg-fill")),
+                route_status(&state, &room(), "windows-main", &message("msg-fill")),
                 ReceiptStatus::Routed,
                 "queue slot {slot} of {OUTBOUND_QUEUE_CAPACITY} must accept a frame"
             );
         }
         assert_eq!(
-            state.route(&room(), "windows-main", message("msg-overflow")),
+            route_status(&state, &room(), "windows-main", &message("msg-overflow")),
             ReceiptStatus::RecipientBackpressure,
             "frame {} must not fit a {OUTBOUND_QUEUE_CAPACITY}-slot queue",
             OUTBOUND_QUEUE_CAPACITY + 1
@@ -1596,7 +1745,7 @@ mod tests {
 
         assert!(rx.try_recv().is_ok(), "draining frees a slot");
         assert_eq!(
-            state.route(&room(), "windows-main", message("msg-after-drain")),
+            route_status(&state, &room(), "windows-main", &message("msg-after-drain")),
             ReceiptStatus::Routed,
             "backpressure must be transient, not a permanent state"
         );
@@ -1610,9 +1759,54 @@ mod tests {
         drop(rx);
 
         assert_eq!(
-            state.route(&room(), "windows-main", message("msg-1")),
+            route_status(&state, &room(), "windows-main", &message("msg-1")),
             ReceiptStatus::PeerOffline,
             "a registered peer whose task is gone is offline, not backpressured"
+        );
+    }
+
+    /// The failure the `Bytes` refactor exists to relocate.
+    ///
+    /// Before it, a frame past the cap was discovered by the *recipient's*
+    /// writer: `LengthDelimitedCodec::encode` refused it, `run_writer` returned
+    /// on the `Err`, and the recipient's connection closed for a frame it did
+    /// not build. The budget in `protocol` keeps a validated `send` from
+    /// reaching that state, but the point here is where the failure lands when
+    /// something does, so this bypasses `handle_send` and hands `route` a frame
+    /// no budget check ever saw.
+    #[test]
+    fn an_unwritable_delivery_closes_nobody() {
+        let state = ServerState::new();
+        let (tx, mut rx) = peer_queue();
+        register_in(&state, &room(), "windows-main", tx);
+
+        let oversized = ServerFrame::Message {
+            id: "msg-1".to_owned(),
+            from: "macbook-reviewer".to_owned(),
+            body: "x".repeat(protocol::MAX_FRAME_BYTES),
+            reply_to: None,
+        };
+        assert!(
+            protocol::encode(&oversized).expect("encodes").len() > protocol::MAX_FRAME_BYTES,
+            "the premise: this frame is one the framing codec would refuse to write"
+        );
+
+        assert_eq!(
+            state.route(&room(), "windows-main", &oversized),
+            Routed::Unwritable,
+            "an unwritable frame must be reported to the caller, which is the sender's \
+             handler, rather than handed to the recipient's writer to fail on"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "nothing may be enqueued: the recipient's queue is untouched and its writer \
+             never sees the frame, so its connection cannot be closed by it"
+        );
+        assert_eq!(
+            route_status(&state, &room(), "windows-main", &message("msg-2")),
+            ReceiptStatus::Routed,
+            "and the recipient stays routable afterwards"
         );
     }
 
