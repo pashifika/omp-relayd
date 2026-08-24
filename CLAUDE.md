@@ -67,11 +67,18 @@ so discovering this late only wastes the work of rewinding.
 
 Name the branch `<type>/<short-slug>` using the Conventional Commits type that
 will dominate the change — `feat/relay-handshake`, `fix/frame-length-guard`,
-`ci/rust-job`. Land it through a pull request; rebase, squash and merge commits
-are all offered, and unresolved review threads block the merge. Prefer a merge
-commit when the branch's own commits are worth keeping as history, and a squash
-when they are not. Write commit messages as Conventional Commits. The agent
-chooses coherent commit boundaries.
+`ci/rust-job`. Land it through a pull request. **The merge commit is the only
+method the ruleset permits**, so there is no choice to make and no squash to
+prefer; unresolved review threads block the merge. Write commit messages as
+Conventional Commits. The agent chooses coherent commit boundaries.
+
+That restriction is what makes a dependent pull request cheap. CI runs on every
+pull request, including one whose base is another topic branch, so a chain may be
+opened as a chain — `#1` onto `main`, `#2` onto `#1`'s branch, `#3` onto `#2`'s —
+and each diff shows only its own change. Merge bottom-up; the forge retargets
+each child as its parent lands. A squash would rewrite the commits the children
+still carry, re-inflating every downstream diff and forcing a rebase per merge,
+which is precisely why the method is pinned rather than recommended.
 
 ## CI conventions
 
@@ -100,6 +107,19 @@ that file and reimporting it, never through the web interface. It targets
 `~DEFAULT_BRANCH`, but `ci.yml` names `main` literally — if the default branch is
 ever renamed, update the workflow triggers in the same commit or `ci` silently
 stops reporting.
+
+Nothing enforces that agreement, and a web-interface edit leaves the file
+describing protection the forge no longer applies — worse than an out-of-date
+file, because the documented remedy is to reimport it, which would silently
+revert the live change. Diff the two before trusting either, sorting keys so
+field order is not mistaken for drift:
+
+```bash
+gh api "repos/$OWNER/$REPO/rulesets/$ID" |
+  jq -S '[.rules[] | {(.type): .parameters}] | add' > /tmp/live.json
+jq -S '[.rules[] | {(.type): .parameters}] | add' .github/rulesets/main.json |
+  diff - /tmp/live.json && echo "no drift"
+```
 
 ## Testing and verification
 
