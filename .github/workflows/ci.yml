@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Run code validation for every pull request. The Docker job below is the
+  # only check reserved for pull requests targeting `main`.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
@@ -345,9 +346,11 @@ jobs:
   # makes unlikely; publication is manual, so such a failure surfaces as a red
   # publish run rather than as a broken release.
   #
-  # It pushes nothing and holds no credential, so a fork's pull request runs it.
+  # It pushes nothing and holds no credential, so it is safe on a fork's pull
+  # request to `main`. Non-main pull requests skip this artifact-level check.
   docker:
     name: docker
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -394,6 +397,7 @@ jobs:
         timeout-minutes: 5
         env:
           RESULTS: ${{ toJSON(needs) }}
+          ALLOW_DOCKER_SKIP: ${{ github.event_name == 'pull_request' && github.base_ref != 'main' }}
         run: |
           set -euo pipefail
 
@@ -407,14 +411,28 @@ jobs:
           echo "ci: aggregating $count job result(s)"
           jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<< "$RESULTS"
 
-          # Anything other than success -- failure, cancellation, or a skip -- is a
-          # failure of the gate. A skipped dependency must not pass as verified.
-          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<< "$RESULTS")
+          # A Docker skip is expected only for pull requests that do not target
+          # `main`. Every failure, cancellation, and other skip fails the gate.
+          echo "ci: docker skip allowed=$ALLOW_DOCKER_SKIP"
+          failed=$(jq -r --arg allow_docker_skip "$ALLOW_DOCKER_SKIP" '
+            to_entries[]
+            | select(
+                .value.result != "success"
+                and (
+                  .key != "docker"
+                  or .value.result != "skipped"
+                  or $allow_docker_skip != "true"
+                )
+              )
+            | .key
+          ' <<< "$RESULTS")
 
           if [ -n "$failed" ]; then
-            echo "ci: gate failed; these jobs did not succeed:"
+            echo "ci: gate failed; these jobs did not satisfy the event policy:"
             printf '  %s\n' $failed
             exit 1
           fi
 
-          echo "ci: all $count job(s) succeeded"
+          succeeded=$(jq '[to_entries[] | select(.value.result == "success")] | length' <<< "$RESULTS")
+          skipped=$(jq '[to_entries[] | select(.value.result == "skipped")] | length' <<< "$RESULTS")
+          echo "ci: policy satisfied; succeeded=$succeeded skipped=$skipped total=$count"
