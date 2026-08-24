@@ -1,4 +1,9 @@
 // @bun
+// src/index.ts
+import { mkdir, readFile as readFile2, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join as join2 } from "path";
+
 // src/client.ts
 import { connect } from "net";
 // node_modules/@msgpack/msgpack/dist.esm/utils/prettyByte.mjs
@@ -1415,6 +1420,8 @@ var MAX_FRAME_BYTES = 64 * 1024;
 var MAX_IDENTIFIER_BYTES = 64;
 var MAX_CORRELATION_BYTES = 128;
 var MAX_BODY_BYTES = MAX_FRAME_BYTES - 512;
+var DIGEST_CHARS = 43;
+var BASE64URL_CHARACTER = /^[A-Za-z0-9_-]$/;
 var SERVER_FRAME_TYPES = [
   "ready",
   "peers",
@@ -1422,6 +1429,7 @@ var SERVER_FRAME_TYPES = [
   "notice",
   "receipt",
   "accepted",
+  "reserved",
   "pong",
   "error"
 ];
@@ -1600,6 +1608,36 @@ function validateServerFrame(value) {
       }
       return { kind: "frame", frame: { type: "accepted", id, delivered, shed } };
     }
+    case "reserved": {
+      const requestId = map["request_id"];
+      if (!isNonEmptyString(requestId)) {
+        return fieldInvalid("reserved", "request_id", requestId);
+      }
+      const status = map["status"];
+      if (!isNonEmptyString(status)) {
+        return fieldInvalid("reserved", "status", status);
+      }
+      const expiresIn = map["expires_in"];
+      const stated = expiresIn !== undefined && expiresIn !== null;
+      if (stated && (typeof expiresIn !== "number" || !Number.isInteger(expiresIn) || expiresIn < 0 || expiresIn > 4294967295)) {
+        return fieldInvalid("reserved", "expires_in", expiresIn, "a u32");
+      }
+      if (stated && status !== "granted") {
+        return {
+          kind: "invalid",
+          reason: `reserved.expires_in is present with status ${JSON.stringify(status)}, which is not a grant`
+        };
+      }
+      return {
+        kind: "frame",
+        frame: {
+          type: "reserved",
+          request_id: requestId,
+          status,
+          ...stated ? { expires_in: expiresIn } : {}
+        }
+      };
+    }
     case "error": {
       const code = map["code"];
       if (!isNonEmptyString(code))
@@ -1646,16 +1684,21 @@ function validateDelivery(type, map) {
   if (replyTo.kind === "invalid") {
     return fieldInvalid(type, "reply_to", map["reply_to"], "a string");
   }
-  if (type === "notice") {
-    return {
-      kind: "frame",
-      frame: replyTo.value === null ? { type: "notice", id, from, body } : { type: "notice", id, from, body, reply_to: replyTo.value }
-    };
+  const attachment = optionalString(map, "attachment");
+  if (attachment.kind === "invalid") {
+    return fieldInvalid(type, "attachment", map["attachment"], "a string");
   }
-  return {
-    kind: "frame",
-    frame: replyTo.value === null ? { type: "message", id, from, body } : { type: "message", id, from, body, reply_to: replyTo.value }
+  if (attachment.value !== null && digestProblem(attachment.value) !== null) {
+    return fieldInvalid(type, "attachment", map["attachment"], `${DIGEST_CHARS} characters of unpadded base64url`);
+  }
+  const optional = {
+    ...replyTo.value === null ? {} : { reply_to: replyTo.value },
+    ...attachment.value === null ? {} : { attachment: attachment.value }
   };
+  if (type === "notice") {
+    return { kind: "frame", frame: { type: "notice", id, from, body, ...optional } };
+  }
+  return { kind: "frame", frame: { type: "message", id, from, body, ...optional } };
 }
 function asRecord(value) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -1733,6 +1776,30 @@ function correlationProblem(value) {
   }
   return null;
 }
+function describeDigestProblem(problem) {
+  switch (problem.kind) {
+    case "wrong_length":
+      return `must be exactly ${problem.expected} characters, found ${problem.found}`;
+    case "not_base64url":
+      return `contains ${JSON.stringify(problem.character)}, which is not unpadded base64url`;
+  }
+}
+function digestProblem(value) {
+  const found = [...value].length;
+  if (found !== DIGEST_CHARS) {
+    return { kind: "wrong_length", expected: DIGEST_CHARS, found };
+  }
+  for (const character of value) {
+    if (!BASE64URL_CHARACTER.test(character)) {
+      return { kind: "not_base64url", character };
+    }
+  }
+  return null;
+}
+async function digestOf(bytes) {
+  const hashed = await crypto.subtle.digest("SHA-256", bytes);
+  return Buffer.from(hashed).toString("base64url");
+}
 function bodyOverBudget(body) {
   const bytes = utf8Length(body);
   return bytes > MAX_BODY_BYTES ? bytes : null;
@@ -1742,6 +1809,7 @@ function bodyOverBudget(body) {
 var REQUEST_TIMEOUT_MS = 5000;
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HANDSHAKE_TIMEOUT_MS = 1e4;
+var TRANSFER_STALL_MS = 1e4;
 var RECONNECT_INITIAL_MS = 500;
 var RECONNECT_CAP_MS = 30000;
 var RECONNECT_JITTER = 0.2;
@@ -1757,20 +1825,36 @@ class RequestFailed extends Error {
   name = "RequestFailed";
   reason;
   code;
-  constructor(reason, message, code = null) {
+  status;
+  bytes;
+  constructor(reason, message, detail = {}) {
     super(message);
     this.reason = reason;
-    this.code = code;
+    this.code = detail.code ?? null;
+    this.status = detail.status ?? null;
+    this.bytes = detail.bytes ?? null;
   }
 }
+var REPLY_SPACES = ["list", "delivery", "reserve"];
 function replySpace(kind) {
-  return kind === "list" ? "list" : "delivery";
+  switch (kind) {
+    case "list":
+      return "list";
+    case "reserve":
+      return "reserve";
+    case "send":
+    case "announce":
+      return "delivery";
+  }
 }
 function backoffDelay(attempt, random) {
   const exponential = RECONNECT_INITIAL_MS * 2 ** Math.max(0, attempt - 1);
   const base = Math.min(exponential, RECONNECT_CAP_MS);
   const jittered = base * (1 + RECONNECT_JITTER * (random() * 2 - 1));
   return Math.min(Math.round(jittered), RECONNECT_CAP_MS);
+}
+function pathSegment(value) {
+  return encodeURIComponent(value).replaceAll(".", "%2E");
 }
 function asThenable(value) {
   const candidate = value;
@@ -1794,6 +1878,7 @@ class RelayClient {
   #attempt = 0;
   #outageReported = false;
   #statedCause = null;
+  #transfers = new Set;
   constructor(options) {
     this.#config = options.config;
     this.#scheduler = options.scheduler ?? ambientScheduler;
@@ -1823,6 +1908,10 @@ class RelayClient {
     this.#clearHeartbeat();
     this.#timedOut.clear();
     this.#failPending(new RequestFailed("stopped", "the client was stopped"));
+    for (const controller of this.#transfers) {
+      controller.abort(new Error("the client was stopped"));
+    }
+    this.#transfers.clear();
     const socket = this.#socket;
     this.#socket = null;
     this.#accumulator = null;
@@ -1878,12 +1967,19 @@ class RelayClient {
     if (oversized !== null) {
       return refuse(`send body is ${oversized} UTF-8 bytes, over the ${MAX_BODY_BYTES}-byte budget`);
     }
+    if (request.attachment !== undefined) {
+      const broken = digestProblem(request.attachment);
+      if (broken !== null) {
+        return refuse(`send attachment ${describeDigestProblem(broken)}`);
+      }
+    }
     this.#issue(id, "send", {
       type: "send",
       id,
       to: request.to,
       body: request.body,
-      ...request.replyTo === undefined ? {} : { reply_to: request.replyTo }
+      ...request.replyTo === undefined ? {} : { reply_to: request.replyTo },
+      ...request.attachment === undefined ? {} : { attachment: request.attachment }
     }, (outcome) => {
       if (!outcome.ok) {
         reject(outcome.error);
@@ -1916,11 +2012,18 @@ class RelayClient {
     if (oversized !== null) {
       return refuse(`announce body is ${oversized} UTF-8 bytes, over the ${MAX_BODY_BYTES}-byte budget`);
     }
+    if (request.attachment !== undefined) {
+      const broken = digestProblem(request.attachment);
+      if (broken !== null) {
+        return refuse(`announce attachment ${describeDigestProblem(broken)}`);
+      }
+    }
     this.#issue(id, "announce", {
       type: "announce",
       id,
       body: request.body,
-      ...request.replyTo === undefined ? {} : { reply_to: request.replyTo }
+      ...request.replyTo === undefined ? {} : { reply_to: request.replyTo },
+      ...request.attachment === undefined ? {} : { attachment: request.attachment }
     }, (outcome) => {
       if (!outcome.ok) {
         reject(outcome.error);
@@ -1931,6 +2034,114 @@ class RelayClient {
       }
     });
     return promise;
+  }
+  async attach(bytes) {
+    const digest = await digestOf(bytes);
+    const reserved = await this.reserve(digest, bytes.byteLength);
+    if (reserved.status !== "granted") {
+      throw new RequestFailed("refused", `the relay refused to hold ${bytes.byteLength} bytes: ${reserved.status}`, { status: reserved.status });
+    }
+    const expiresIn = reserved.expires_in ?? 0;
+    await this.#transfer("PUT", digest, {
+      body: bytes,
+      headers: { "content-length": String(bytes.byteLength) },
+      expect: [201, 204]
+    });
+    return { digest, bytes: bytes.byteLength, expiresIn };
+  }
+  reserve(digest, bytes) {
+    const requestId = crypto.randomUUID();
+    const { promise, resolve, reject } = Promise.withResolvers();
+    const broken = digestProblem(digest);
+    if (broken !== null) {
+      reject(new RequestFailed("invalid_request", `reserve digest ${describeDigestProblem(broken)}`));
+      return promise;
+    }
+    if (!Number.isInteger(bytes) || bytes < 0) {
+      reject(new RequestFailed("invalid_request", `reserve bytes must be a non-negative integer, got ${bytes}`));
+      return promise;
+    }
+    this.#issue(requestId, "reserve", { type: "reserve", request_id: requestId, digest, bytes }, (outcome) => {
+      if (!outcome.ok) {
+        if (outcome.error.reason === "relay_error" && outcome.error.code === "unsupported_frame") {
+          reject(new RequestFailed("unsupported", "this relay does not implement attachments, so nothing can be reserved", { code: outcome.error.code }));
+          return;
+        }
+        reject(outcome.error);
+      } else if (outcome.frame.type === "reserved") {
+        resolve(outcome.frame);
+      } else {
+        reject(new RequestFailed("unexpected_reply", `reserve ${requestId} was answered with a ${outcome.frame.type} frame`));
+      }
+    });
+    return promise;
+  }
+  async lengthOf(digest) {
+    const broken = digestProblem(digest);
+    if (broken !== null) {
+      throw new RequestFailed("invalid_request", `attachment digest ${describeDigestProblem(broken)}`);
+    }
+    const response = await this.#transfer("HEAD", digest, { expect: [200, 404] });
+    if (response.status === 404) {
+      return null;
+    }
+    const declared = Number(response.headers.get("content-length"));
+    return Number.isInteger(declared) && declared >= 0 ? declared : null;
+  }
+  async fetchAttachment(digest, options = {}) {
+    if (options.maxBytes !== undefined) {
+      const length = await this.lengthOf(digest);
+      if (length === null) {
+        throw new RequestFailed("unavailable", `the relay holds no payload at ${digest}; it was never uploaded or its time to live has elapsed`);
+      }
+      if (length > options.maxBytes) {
+        throw new RequestFailed("over_ceiling", `the payload is ${length} bytes, over the ${options.maxBytes}-byte ceiling; nothing was transferred`, { bytes: length });
+      }
+    }
+    const response = await this.#transfer("GET", digest, { expect: [200, 404] });
+    if (response.status === 404) {
+      throw new RequestFailed("unavailable", `the relay holds no payload at ${digest}; it was never uploaded or its time to live has elapsed`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const computed = await digestOf(bytes);
+    if (computed !== digest) {
+      throw new RequestFailed("transfer_failed", `the downloaded payload hashes to ${computed}, not to the address ${digest} it was fetched from`);
+    }
+    return bytes;
+  }
+  async#transfer(method, digest, options) {
+    if (this.#stopped) {
+      throw new RequestFailed("stopped", "the client is not running");
+    }
+    const room = this.#config.room;
+    const { host, port } = this.#config.transport;
+    const authority = host.includes(":") ? `[${host}]` : host;
+    const url = `http://${authority}:${port}/blob/${pathSegment(room.project)}/${pathSegment(room.task)}/${digest}`;
+    const controller = new AbortController;
+    this.#transfers.add(controller);
+    const stall = this.#scheduler.setTimeout(() => {
+      controller.abort(new Error(`no progress within ${TRANSFER_STALL_MS} ms`));
+    }, TRANSFER_STALL_MS);
+    try {
+      const response = await fetch(url, {
+        method,
+        signal: controller.signal,
+        ...options.body === undefined ? {} : { body: options.body },
+        ...options.headers === undefined ? {} : { headers: options.headers }
+      });
+      if (!options.expect.includes(response.status)) {
+        throw new RequestFailed("transfer_failed", `${method} ${digest} was answered ${response.status}`);
+      }
+      return response;
+    } catch (error) {
+      if (error instanceof RequestFailed) {
+        throw error;
+      }
+      throw new RequestFailed("transfer_failed", `${method} ${digest} failed: ${describe(error)}`);
+    } finally {
+      this.#scheduler.clearTimeout(stall);
+      this.#transfers.delete(controller);
+    }
   }
   #openConnection() {
     this.#cancelReconnect();
@@ -2035,6 +2246,9 @@ class RelayClient {
       case "accepted":
         this.#settle(frame.id, "announce", { ok: true, frame });
         break;
+      case "reserved":
+        this.#settle(frame.request_id, "reserve", { ok: true, frame });
+        break;
       case "error":
         this.#handleError(socket, frame);
         break;
@@ -2051,7 +2265,9 @@ class RelayClient {
     if (frame.request_id !== undefined && this.#state === "ready") {
       const settled = this.#settleEither(frame.request_id, {
         ok: false,
-        error: new RequestFailed("relay_error", `the relay rejected the request: ${detail}`, frame.code)
+        error: new RequestFailed("relay_error", `the relay rejected the request: ${detail}`, {
+          code: frame.code
+        })
       });
       if (settled) {
         return;
@@ -2208,7 +2424,12 @@ class RelayClient {
     }
   }
   #settleEither(token, outcome) {
-    return this.#settleKey(`delivery:${token}`, outcome) || this.#settleKey(`list:${token}`, outcome);
+    for (const space of REPLY_SPACES) {
+      if (this.#settleKey(`${space}:${token}`, outcome)) {
+        return true;
+      }
+    }
+    return false;
   }
   #settleKey(key, outcome) {
     const entry = this.#pending.get(key);
@@ -2668,6 +2889,7 @@ var INBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.message";
 var INBOUND_NOTICE_TYPE = "io.github.pashifika.omp-relay.notice";
 var OUTBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.sent";
 var OUTBOUND_ANNOUNCE_TYPE = "io.github.pashifika.omp-relay.announced";
+var ATTACHMENT_DIR = "omp-relay-attachments";
 var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var CONTROL_CHARACTERS_OUTSIDE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var NEUTRALIZED = "\uFFFD";
@@ -2699,7 +2921,32 @@ function requestFailure(error) {
     reason: "unknown"
   });
 }
-function receiptResult(receipt) {
+function attachmentFailure(action, error) {
+  if (error instanceof RequestFailed && error.reason === "refused") {
+    const recovery = error.status === "payload_too_large" ? "The payload is over the per-payload maximum, so waiting will not help: split it, " + "send a smaller part, or describe it in the body instead." : "This is capacity rather than a size limit: the room's payloads are removed when " + "its last peer leaves and each payload expires on its own, so retrying later or " + "attaching something smaller can succeed.";
+    return result(`OMP Relay refused to hold the attachment (${error.status ?? "refused"}), so no ${action} ` + `was performed and nothing reached the room. ${recovery}`, {
+      action,
+      status: "refused",
+      reason: "attachment_refused",
+      ...error.status === null ? {} : { refusal: error.status }
+    });
+  }
+  if (error instanceof RequestFailed && error.reason === "unsupported") {
+    return result(`This relay does not implement attachments, so nothing was ${action === "send" ? "sent" : "announced"}. ` + `Include the material in the message body, or split it, and say why.`, { action, status: "unavailable", reason: "attachments_unsupported" });
+  }
+  return requestFailure(error);
+}
+function expiredResult(reference) {
+  return result(`The relay no longer holds the payload at ${reference}. This is expiry rather than ` + "a failure: stored payloads have a limited lifetime and a room's payloads are " + "removed when its last peer leaves. Ask the sender to send it again; retrying the " + "fetch will not recover it.", { action: "fetch", status: "unavailable", reference, reason: "expired" });
+}
+function expiryNote(seconds) {
+  if (seconds === undefined || seconds <= 0)
+    return "";
+  const hours = Math.floor(seconds / 3600);
+  const stated = hours >= 1 ? `${hours} hour${hours === 1 ? "" : "s"}` : `${Math.floor(seconds / 60)} minutes`;
+  return ` The attachment is held for about ${stated}; say so in the body, because a recipient reading later will find it gone.`;
+}
+function receiptResult(receipt, attachment, expiry) {
   let text;
   switch (receipt.status) {
     case "routed":
@@ -2718,14 +2965,17 @@ function receiptResult(receipt) {
       text = `Relay returned receipt status ${JSON.stringify(receipt.status)} for message ${receipt.id}.`;
       break;
   }
-  return result(text, {
+  const rendered = attachment === undefined ? text : `${text} It carries attachment reference ${attachment}, which the recipient fetches with ` + `action "fetch".${expiryNote(expiry)}`;
+  return result(rendered, {
     action: "send",
     id: receipt.id,
     to: receipt.to,
-    status: receipt.status
+    status: receipt.status,
+    ...attachment === undefined ? {} : { attachment },
+    ...expiry === undefined ? {} : { expires_in: expiry }
   });
 }
-function acceptedResult(accepted) {
+function acceptedResult(accepted, attachment, expiry) {
   const { id, delivered, shed } = accepted;
   const peers = (count) => count === 1 ? "1 peer" : `${count} peers`;
   let text;
@@ -2736,11 +2986,14 @@ function acceptedResult(accepted) {
   } else {
     text = `Announcement ${id} was queued for ${peers(delivered)} and shed by ${peers(shed)} that is not reading its connection; a shed peer is not reading, so resending would add to a queue that is already full.`;
   }
-  return result(text, {
+  const rendered = attachment === undefined ? text : `${text} It carries attachment reference ${attachment}, which a recipient fetches with ` + `action "fetch".${expiryNote(expiry)}`;
+  return result(rendered, {
     action: "announce",
     id,
     delivered,
-    shed
+    shed,
+    ...attachment === undefined ? {} : { attachment },
+    ...expiry === undefined ? {} : { expires_in: expiry }
   });
 }
 var SOURCE_LABEL = {
@@ -2799,8 +3052,8 @@ function joinParameter(value, name) {
   return { ok: true, value };
 }
 async function executeMesh(host, args) {
-  if (args.action !== "join" && args.action !== "list" && args.action !== "send" && args.action !== "announce") {
-    return validationFailure('action must be "join", "list", "send", or "announce"');
+  if (args.action !== "join" && args.action !== "list" && args.action !== "send" && args.action !== "announce" && args.action !== "fetch") {
+    return validationFailure('action must be "join", "list", "send", "announce", or "fetch"');
   }
   if (args.action === "join") {
     const project = joinParameter(args.project, "project");
@@ -2849,6 +3102,9 @@ async function executeMesh(host, args) {
         return validationFailure(`reply_to ${describeIdentifierProblem(replyProblem)}`);
       }
     }
+    if (args.attach !== undefined && typeof args.attach !== "string") {
+      return validationFailure("attach must be a string path when provided");
+    }
   }
   if (args.action === "announce") {
     if (args.to !== undefined) {
@@ -2871,6 +3127,28 @@ async function executeMesh(host, args) {
         return validationFailure(`reply_to ${describeIdentifierProblem(replyProblem)}`);
       }
     }
+    if (args.attach !== undefined && typeof args.attach !== "string") {
+      return validationFailure("attach must be a string path when provided");
+    }
+  }
+  if (args.action === "fetch") {
+    for (const field of ["to", "message", "reply_to", "project", "task", "as", "attach"]) {
+      if (args[field] !== undefined) {
+        return validationFailure(`fetch takes no ${field}: a fetch is addressed by its reference alone, in the room ` + "this session already joined");
+      }
+    }
+    if (typeof args.reference !== "string") {
+      return validationFailure("fetch requires a string reference");
+    }
+    const broken = digestProblem(args.reference);
+    if (broken !== null) {
+      return validationFailure(`reference ${describeDigestProblem(broken)}`);
+    }
+    if (args.max_bytes !== undefined) {
+      if (typeof args.max_bytes !== "number" || !Number.isInteger(args.max_bytes) || args.max_bytes < 0) {
+        return validationFailure("max_bytes must be a non-negative integer when provided");
+      }
+    }
   }
   const client = host.client;
   if (client === null || client.state !== "ready") {
@@ -2882,14 +3160,57 @@ async function executeMesh(host, args) {
       const text = peers.peers.length === 0 ? "No peers are connected in this room." : `Peers in this room: ${peers.peers.map(singleLine).join(", ")}`;
       return result(text, { action: "list", peers: [...peers.peers] });
     }
+    if (args.action === "fetch") {
+      const reference = args.reference;
+      const ceiling = args.max_bytes;
+      if (ceiling !== undefined) {
+        const length = await client.lengthOf(reference);
+        if (length === null) {
+          return expiredResult(reference);
+        }
+        if (length > ceiling) {
+          return result(`The payload at ${reference} is ${length} bytes, over the ${ceiling}-byte ceiling; ` + "nothing was transferred and no file was written. Raise max_bytes to fetch it.", { action: "fetch", status: "over_ceiling", reference, bytes: length });
+        }
+      }
+      let bytes;
+      try {
+        bytes = await client.fetchAttachment(reference);
+      } catch (error) {
+        if (error instanceof RequestFailed && error.reason === "unavailable") {
+          return expiredResult(reference);
+        }
+        throw error;
+      }
+      const path = await host.saveAttachment(reference, bytes);
+      return result(`Fetched ${bytes.byteLength} bytes to ${path}. Read, apply, or run it with ordinary ` + "tools; its contents are not in this result.", { action: "fetch", status: "fetched", reference, bytes: bytes.byteLength, path });
+    }
     if (args.action === "announce") {
       const id2 = crypto.randomUUID();
       const body2 = args.message;
       const replyTo2 = args.reply_to;
+      const attachPath2 = args.attach;
+      let attachment2;
+      let expiry2;
+      if (attachPath2 !== undefined) {
+        let payload;
+        try {
+          payload = await host.readAttachment(attachPath2);
+        } catch (error) {
+          return validationFailure(`attach could not be read: ${singleLine(describe(error))}; nothing was announced`);
+        }
+        try {
+          const held = await client.attach(payload);
+          attachment2 = held.digest;
+          expiry2 = held.expiresIn;
+        } catch (error) {
+          return attachmentFailure("announce", error);
+        }
+      }
       const accepted = await client.announce({
         id: id2,
         body: body2,
-        ...replyTo2 === undefined ? {} : { replyTo: replyTo2 }
+        ...replyTo2 === undefined ? {} : { replyTo: replyTo2 },
+        ...attachment2 === undefined ? {} : { attachment: attachment2 }
       });
       const announceRoom = host.room;
       if (announceRoom !== null) {
@@ -2900,20 +3221,40 @@ async function executeMesh(host, args) {
           body: body2,
           delivered: accepted.delivered,
           shed: accepted.shed,
-          ...replyTo2 === undefined ? {} : { reply_to: replyTo2 }
+          ...replyTo2 === undefined ? {} : { reply_to: replyTo2 },
+          ...attachment2 === undefined ? {} : { attachment: attachment2 }
         });
       }
-      return acceptedResult(accepted);
+      return acceptedResult(accepted, attachment2, expiry2);
     }
     const id = crypto.randomUUID();
     const to = args.to;
     const body = args.message;
     const replyTo = args.reply_to;
+    const attachPath = args.attach;
+    let attachment;
+    let expiry;
+    if (attachPath !== undefined) {
+      let payload;
+      try {
+        payload = await host.readAttachment(attachPath);
+      } catch (error) {
+        return validationFailure(`attach could not be read: ${singleLine(describe(error))}; no message was sent`);
+      }
+      try {
+        const held = await client.attach(payload);
+        attachment = held.digest;
+        expiry = held.expiresIn;
+      } catch (error) {
+        return attachmentFailure("send", error);
+      }
+    }
     const receipt = await client.send({
       id,
       to,
       body,
-      ...replyTo === undefined ? {} : { replyTo }
+      ...replyTo === undefined ? {} : { replyTo },
+      ...attachment === undefined ? {} : { attachment }
     });
     const room = host.room;
     if (room !== null) {
@@ -2924,10 +3265,11 @@ async function executeMesh(host, args) {
         task: room.task,
         body,
         status: receipt.status,
-        ...replyTo === undefined ? {} : { reply_to: replyTo }
+        ...replyTo === undefined ? {} : { reply_to: replyTo },
+        ...attachment === undefined ? {} : { attachment }
       });
     }
-    return receiptResult(receipt);
+    return receiptResult(receipt, attachment, expiry);
   } catch (error) {
     return requestFailure(error);
   }
@@ -2939,7 +3281,8 @@ function buildInboundInjection(delivery, room, purpose = null) {
     project: room.project,
     task: room.task,
     body: delivery.body,
-    ...delivery.reply_to === undefined ? {} : { reply_to: delivery.reply_to }
+    ...delivery.reply_to === undefined ? {} : { reply_to: delivery.reply_to },
+    ...delivery.attachment === undefined ? {} : { attachment: delivery.attachment }
   };
   const announcement = delivery.type === "notice";
   const lines = [
@@ -2949,6 +3292,10 @@ function buildInboundInjection(delivery, room, purpose = null) {
     `Task: ${singleLine(room.task)}`,
     `${announcement ? "Announcement" : "Message"} ID: ${singleLine(delivery.id)}`,
     ...delivery.reply_to === undefined ? [] : [`Reply to: ${singleLine(delivery.reply_to)}`],
+    ...delivery.attachment === undefined ? [] : [
+      `Attachment available, not downloaded: ${singleLine(delivery.attachment)}`,
+      'Fetch it deliberately with mesh action "fetch" if this work needs it.'
+    ],
     "",
     ...quotedBody(delivery.body)
   ];
@@ -3099,13 +3446,16 @@ function ompRelay(pi) {
     };
   };
   const parameters = pi.zod.object({
-    action: pi.zod.enum(["join", "list", "send", "announce"]).describe("Connect to a room, list connected peers, send a message to one peer, or announce to every other peer in the room"),
+    action: pi.zod.enum(["join", "list", "send", "announce", "fetch"]).describe("Connect to a room, list connected peers, send a message to one peer, announce to every other peer in the room, or fetch a payload someone attached"),
     project: pi.zod.string().optional().describe("join only: room project, overriding the project configuration file"),
     task: pi.zod.string().optional().describe("join only: room task, overriding the project configuration file"),
     as: pi.zod.string().optional().describe("join only: this session's peer name"),
     to: pi.zod.string().optional().describe("Peer name; required for send, and rejected for announce"),
     message: pi.zod.string().optional().describe("Message body; required for send and for announce"),
-    reply_to: pi.zod.string().optional().describe("Message identifier being answered")
+    reply_to: pi.zod.string().optional().describe("Message identifier being answered"),
+    attach: pi.zod.string().optional().describe("send and announce: path to a local file to attach, for material too large for a message body such as a diff, a log bundle, or a build artifact. The recipient is told a reference and fetches it deliberately."),
+    reference: pi.zod.string().optional().describe("fetch only: the attachment reference a delivery reported"),
+    max_bytes: pi.zod.number().int().nonnegative().optional().describe("fetch only: decline a payload larger than this, reporting its size and transferring nothing")
   });
   pi.registerTool({
     name: "mesh",
@@ -3119,7 +3469,15 @@ function ompRelay(pi) {
         room: live?.config.room ?? null,
         join: (request) => performJoin(ctx, request),
         recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details),
-        recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details)
+        recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details),
+        readAttachment: async (path) => new Uint8Array(await readFile2(path)),
+        saveAttachment: async (digest, bytes) => {
+          const directory = join2(tmpdir(), ATTACHMENT_DIR);
+          await mkdir(directory, { recursive: true, mode: 448 });
+          const path = join2(directory, digest);
+          await writeFile(path, bytes, { mode: 384 });
+          return path;
+        }
       };
       return executeMesh(host, args);
     }
