@@ -1208,10 +1208,14 @@ fn handle_send(
     }
 
     // `reply_to` is the other half of the envelope the body budget reserves
-    // room for. Leaving it unchecked reopened exactly the attack the budget
-    // closes: an oversized `reply_to` with an empty body passes every other
-    // check, and the `message` built from it exceeds the frame cap, so the
-    // encode failure lands on the recipient's connection.
+    // room for. Leaving it unchecked let an oversized `reply_to` with an empty
+    // body pass every other check and build a `message` over the frame cap.
+    // Encoding happens on this connection's own routing call, so with or
+    // without this check the failure is charged here rather than to the
+    // recipient, and `refuse_unwritable` states a cause for it either way. What
+    // the check buys is which cause: `invalid_identifier` naming `send.reply_to`
+    // -- the recoverable rejection on this path, leaving the connection open --
+    // instead of the generic `frame_too_large` close a failed encode ends in.
     if let Some(error) = reply_to
         .as_deref()
         .and_then(|value| protocol::validate_correlation_id(value).err())
@@ -1231,8 +1235,13 @@ fn handle_send(
         );
     }
 
-    // Checked before routing, so the encode failure never lands on the
-    // recipient's connection: otherwise any sender could close any peer.
+    // Checked before routing, so an unrelayable body is refused here, by name,
+    // on the sender's own connection. Encoding a delivery happens on this task,
+    // so the failure was never the recipient's to absorb. Both outcomes close
+    // this connection and both state a cause; what the check buys is
+    // specificity -- this diagnostic names the body, its size, and the budget
+    // it broke, where the `refuse_unwritable` fallback can only report that the
+    // `message` the frame would have produced did not fit the cap.
     if let Some(body_bytes) = protocol::body_over_budget(&body) {
         tracing::info!(
             room = %registered.room,
