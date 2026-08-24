@@ -504,26 +504,36 @@ describe("mesh tool", () => {
     expect(host.announced).toEqual([]);
   });
 
-  test("an announcement carrying a target is refused, naming the unsupported argument", async () => {
-    // A model that supplied `to` believed it was addressing one peer. Silently
-    // broadcasting instead would be worse than a stated refusal, and there is
-    // no target to supply: the absence of a peer component is the address.
-    const client = new RecordingClient();
-    const host = new RecordingHost(client);
+  test.each([
+    ["to", { action: "announce", message: "everyone", to: "beta" }, '"send"'],
+    ["project", { action: "announce", message: "everyone", project: "other" }, '"join"'],
+    ["task", { action: "announce", message: "everyone", task: "room" }, '"join"'],
+    ["as", { action: "announce", message: "everyone", as: "gamma" }, '"join"'],
+  ])(
+    "an announcement carrying %s is refused, naming it and the action that takes it",
+    async (field, args, pointsAt) => {
+      // A model that supplied one of these believed it was addressing something
+      // else: `to` one peer, `project`/`task` another room, `as` under another
+      // name. Announcing anyway would broadcast into the room this session
+      // already holds, under the name it already registered -- the wrong peers,
+      // silently, which is worse than a stated refusal.
+      const client = new RecordingClient();
+      const host = new RecordingHost(client);
 
-    const output = await executeMesh(host, {
-      action: "announce",
-      to: "beta",
-      message: "everyone",
-    });
+      const output = await executeMesh(host, args);
 
-    const text = output.content[0]?.text ?? "";
-    expect(text).toStartWith("Invalid mesh arguments:");
-    expect(text).toContain("no to");
-    expect(text).toContain('"send"');
-    expect(client.announcements).toEqual([]);
-    expect(client.sends).toEqual([]);
-  });
+      const text = output.content[0]?.text ?? "";
+      expect(text).toStartWith("Invalid mesh arguments:");
+      expect(text).toContain(`no ${field}`);
+      expect(text).toContain(pointsAt);
+      // Refused is only half the property. The defect this covers did refuse
+      // `to` and accepted the other three, so nothing-was-sent is what catches
+      // it: both the relay call and the session record must be absent.
+      expect(client.announcements).toEqual([]);
+      expect(client.sends).toEqual([]);
+      expect(host.announced).toEqual([]);
+    },
+  );
 
   test("list reports every peer returned by the relay", async () => {
     const client = new RecordingClient();

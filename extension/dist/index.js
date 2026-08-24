@@ -2854,6 +2854,11 @@ async function executeMesh(host, args) {
     if (args.to !== undefined) {
       return validationFailure("announce takes no to: an announcement addresses the whole room, and naming a " + 'peer is what action "send" is for');
     }
+    for (const field of ["project", "task", "as"]) {
+      if (args[field] !== undefined) {
+        return validationFailure(`announce takes no ${field}: an announcement goes to the room this session already ` + 'joined, and changing the room or peer name of a live session is what action "join" is for');
+      }
+    }
     if (typeof args.message !== "string") {
       return validationFailure("announce requires a string message");
     }

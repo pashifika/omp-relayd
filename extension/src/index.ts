@@ -516,6 +516,20 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
           'peer is what action "send" is for',
       );
     }
+    // The join-only selectors are refused for the same reason, one field over.
+    // `project` and `task` name a room, so accepting them and announcing anyway
+    // would broadcast into the room this session already holds -- the wrong
+    // peers, silently, from a caller that named different ones. `as` names a
+    // peer. Neither is a thing an announcement can carry, because `join` is the
+    // only way to change the room or peer name of a live session.
+    for (const field of ["project", "task", "as"] as const) {
+      if (args[field] !== undefined) {
+        return validationFailure(
+          `announce takes no ${field}: an announcement goes to the room this session already ` +
+            'joined, and changing the room or peer name of a live session is what action "join" is for',
+        );
+      }
+    }
     if (typeof args.message !== "string") {
       return validationFailure("announce requires a string message");
     }
