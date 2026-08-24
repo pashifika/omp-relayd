@@ -1,6 +1,6 @@
 ---
 name: omp-relay
-description: Hand work to one remote OMP session or announce shared information to a relay room through the `mesh` tool, and handle deliveries that arrive from either class. Use when the operator asks to reach another terminal, machine, peer, or room — "ask the Windows box", "tell everyone the schema landed", "see who else is connected" — or when a remote message or room announcement arrives. Covers joining, choosing between `send` and `announce`, resolving informal peer references, writing self-contained briefings, and reading receipts and acceptance counts correctly.
+description: Hand work to one remote OMP session or announce shared information to a relay room through the `mesh` tool, attach material too large for a message body, and handle deliveries that arrive from either class. Use when the operator asks to reach another terminal, machine, peer, or room — "ask the Windows box", "tell everyone the schema landed", "send them the failing test's output", "see who else is connected" — or when a remote message or room announcement arrives, with or without an attachment. Covers joining, choosing between `send` and `announce`, resolving informal peer references, writing self-contained briefings, attaching and fetching payloads, and reading receipts, acceptance counts, and refusals correctly.
 ---
 
 # OMP Relay collaboration
@@ -194,6 +194,101 @@ Do not merge code that still emits the numeric form.
 An announcement never reaches its author. The `accepted` reply is the author's
 confirmation; do not wait to see the notice itself, and do not wait for a reply.
 
+## 7. Send large material as an attachment, not as prose
+
+A message body is capped. Anything substantial — a diff, a failing test's
+captured output, a log bundle, a build artifact — will not fit, and the three
+obvious workarounds are all wrong:
+
+- **Do not truncate it.** A partial diff does not apply and a partial log hides
+  the line that mattered.
+- **Do not split it across messages.** The recipient has to reassemble by hand,
+  and nothing guarantees the parts arrive together or in order.
+- **Do not name a local path.** The recipient may be on a different machine, so
+  a path is not a shared reference even when both sessions are working on the
+  same repository and the same revision. `/tmp/out.log` on your host does not
+  exist on theirs.
+
+Attach the file instead:
+
+```text
+mesh(action: "send", to: "win-desktop", attach: "/work/widget/target/nextest.log", message: """
+Repository: github.com/acme/widget, branch feat/win-paths at 3f2a9c1.
+Attached: the full `cargo nextest` output from this macOS run, 2.1 MB.
+Why: three path tests pass here and I need to know whether they pass for you.
+Return: the same command's output from your machine, or the assertion messages
+of whichever tests failed.
+Accepted when: I can compare the two runs test by test.
+""")
+```
+
+**The body explains; the attachment carries.** What the payload is, why it was
+sent, and what the recipient should do with it all belong in the body — because
+the body is what the recipient reads *before* deciding whether to transfer
+anything. An attachment with an empty body is a file arriving with no reason.
+
+Attaching works on `announce` too, on the same terms.
+
+## 8. A reference expires, and a fetch is deliberate
+
+What travels on the wire is a **reference**, never the payload. That has two
+consequences worth acting on.
+
+**The material has a limited lifetime.** The result of a successful attachment
+states how long the relay will hold it. Say so in the body whenever the
+recipient may not read the message promptly:
+
+```text
+Attached: the failing test's output. The relay holds it for about 2 hours; if
+you get to this later and the fetch says it is gone, ask me and I will resend.
+```
+
+A fetch that reports the payload as no longer available is **expiry, not
+failure**. Nothing is broken and retrying will not recover it — the payload is
+not there any more. Ask the sender to send it again. A room's attachments are
+also removed once every peer has left it, so a reference does not outlive the
+collaboration that produced it.
+
+**An inbound attachment has not been downloaded.** When a delivery tells you an
+attachment is available, nothing has been transferred to this machine. Fetching
+is an explicit act:
+
+```text
+mesh(action: "fetch", reference: "<the reference from the delivery>")
+```
+
+Decide whether you need it before fetching. A message may be answerable from its
+body alone, and a payload you do not need is a transfer nobody wanted. When you
+do not know how large it is, pass a ceiling — the size is reported and nothing
+is transferred when it is exceeded:
+
+```text
+mesh(action: "fetch", reference: "...", max_bytes: 5000000)
+```
+
+A fetch yields **a file path, not content**. The payload is on disk; read,
+search, `grep`, or apply it with your ordinary tools. Do not expect the bytes in
+the tool's result, and do not ask for them — that is what a path exists to avoid.
+
+## 9. A refused attachment sent nothing at all
+
+An attachment can be refused before anything is sent, and the refusal names
+which bound it reached. The three call for different responses:
+
+| Refusal | What it means | What to do |
+|---|---|---|
+| `payload_too_large` | This one payload is over the per-payload maximum | Send something smaller; waiting will not help |
+| `room_full` | This room's attachments together are at their total | Wait for this room's existing attachments to expire, or attach something smaller |
+| `store_full` | The relay's whole store is full, across every room | Tell the operator; this is not yours to resolve |
+
+In every case **nothing was sent**. The message is not half-delivered and the
+recipient has not been told about a payload that is not there. Once the bound is
+addressed, sending again is correct rather than a duplicate.
+
+Report the refusal to the operator with its bound named. "The relay refused the
+attachment because the room is full, so I sent nothing" is precise; "the send
+failed" is not, and it hides which of the three responses applies.
+
 ## Quick reference
 
 | Situation | Action |
@@ -210,3 +305,11 @@ confirmation; do not wait to see the notice itself, and do not wait for a reply.
 | Got `routed` | Say "queued for the peer", carry on, do not wait |
 | Got `accepted` | Report `delivered` and `shed` as queue counts; zero means an empty room |
 | Inbound announcement during a run | It waits; do not abort or steer the run |
+| Material too large for a body | `attach` the file; keep the body as the explanation |
+| Tempted to paste, truncate, split, or name a path | Attach instead; the recipient may be on another machine |
+| Attachment granted | Say the stated lifetime in the body when the recipient may read it late |
+| Told an attachment is available | Nothing was downloaded; decide, then `mesh(action: "fetch")` |
+| Unsure how large a payload is | Pass `max_bytes`; the size is reported and nothing transfers |
+| Fetch says the payload is gone | Expiry, not failure; ask for a resend, do not retry |
+| Fetch succeeded | Use the returned path with ordinary tools; the bytes are not in the result |
+| Attachment refused | Nothing was sent; name the bound and respond to that bound |

@@ -1810,6 +1810,7 @@ var REQUEST_TIMEOUT_MS = 5000;
 var HEARTBEAT_INTERVAL_MS = 30000;
 var HANDSHAKE_TIMEOUT_MS = 1e4;
 var TRANSFER_STALL_MS = 1e4;
+var TRANSFER_CHUNK_BYTES = 64 * 1024;
 var RECONNECT_INITIAL_MS = 500;
 var RECONNECT_CAP_MS = 30000;
 var RECONNECT_JITTER = 0.2;
@@ -2098,11 +2099,14 @@ class RelayClient {
         throw new RequestFailed("over_ceiling", `the payload is ${length} bytes, over the ${options.maxBytes}-byte ceiling; nothing was transferred`, { bytes: length });
       }
     }
-    const response = await this.#transfer("GET", digest, { expect: [200, 404] });
+    const response = await this.#transfer("GET", digest, {
+      expect: [200, 404],
+      drain: true
+    });
     if (response.status === 404) {
       throw new RequestFailed("unavailable", `the relay holds no payload at ${digest}; it was never uploaded or its time to live has elapsed`);
     }
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    const bytes = response.bytes;
     const computed = await digestOf(bytes);
     if (computed !== digest) {
       throw new RequestFailed("transfer_failed", `the downloaded payload hashes to ${computed}, not to the address ${digest} it was fetched from`);
@@ -2119,29 +2123,81 @@ class RelayClient {
     const url = `http://${authority}:${port}/blob/${pathSegment(room.project)}/${pathSegment(room.task)}/${digest}`;
     const controller = new AbortController;
     this.#transfers.add(controller);
-    const stall = this.#scheduler.setTimeout(() => {
-      controller.abort(new Error(`no progress within ${TRANSFER_STALL_MS} ms`));
-    }, TRANSFER_STALL_MS);
+    let stall = null;
+    const stopWaiting = () => {
+      if (stall !== null) {
+        this.#scheduler.clearTimeout(stall);
+        stall = null;
+      }
+    };
+    const restart = () => {
+      stopWaiting();
+      stall = this.#scheduler.setTimeout(() => {
+        controller.abort(new Error(`no progress within ${TRANSFER_STALL_MS} ms`));
+      }, TRANSFER_STALL_MS);
+    };
+    restart();
     try {
       const response = await fetch(url, {
         method,
         signal: controller.signal,
-        ...options.body === undefined ? {} : { body: options.body },
-        ...options.headers === undefined ? {} : { headers: options.headers }
+        ...options.body === undefined ? {} : { body: this.#progressing(options.body, restart) },
+        ...options.headers === undefined ? {} : { headers: options.headers },
+        ...options.body === undefined ? {} : { duplex: "half" }
       });
       if (!options.expect.includes(response.status)) {
         throw new RequestFailed("transfer_failed", `${method} ${digest} was answered ${response.status}`);
       }
-      return response;
+      const bytes = options.drain === true && response.status === 200 ? await this.#drain(response, restart) : new Uint8Array(0);
+      return { status: response.status, headers: response.headers, bytes };
     } catch (error) {
       if (error instanceof RequestFailed) {
         throw error;
       }
       throw new RequestFailed("transfer_failed", `${method} ${digest} failed: ${describe(error)}`);
     } finally {
-      this.#scheduler.clearTimeout(stall);
+      stopWaiting();
       this.#transfers.delete(controller);
     }
+  }
+  #progressing(payload, restart) {
+    let offset = 0;
+    return new ReadableStream({
+      pull: (controller) => {
+        if (offset >= payload.byteLength) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(offset + TRANSFER_CHUNK_BYTES, payload.byteLength);
+        controller.enqueue(payload.subarray(offset, end));
+        offset = end;
+        restart();
+      }
+    });
+  }
+  async#drain(response, restart) {
+    const body = response.body;
+    if (body === null) {
+      return new Uint8Array(0);
+    }
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;; ) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      chunks.push(value);
+      total += value.byteLength;
+      restart();
+    }
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    return joined;
   }
   #openConnection() {
     this.#cancelReconnect();
