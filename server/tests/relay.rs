@@ -531,6 +531,145 @@ async fn a_rejected_reply_to_names_the_send_it_rejected() {
     );
 }
 
+/// An `attachment` is a reference the relay never resolves, which is not a
+/// reason to relay it unvalidated: a recipient validates the field on arrival
+/// and treats an invalid frame as unrecoverable, so a malformed value routed
+/// onward closes a connection that did nothing wrong. It is refused on the
+/// sender's own connection instead, and nothing is delivered.
+#[tokio::test]
+async fn a_malformed_attachment_is_refused_and_delivers_nothing() {
+    let relay = Relay::start().await;
+    let here = room("attachment-validation");
+    let mut sender = Client::join(&relay, &here, "sender").await;
+    let mut recipient = Client::join(&relay, &here, "recipient").await;
+
+    for (label, id, attachment) in [
+        ("too short", "m1", "x".to_owned()),
+        (
+            "outside the alphabet",
+            "m2",
+            "+".repeat(protocol::DIGEST_CHARS),
+        ),
+        ("too long", "m3", "A".repeat(protocol::DIGEST_CHARS + 1)),
+    ] {
+        sender
+            .send(&ClientFrame::Send {
+                id: id.to_owned(),
+                to: "recipient".to_owned(),
+                body: "carrying a broken reference".to_owned(),
+                reply_to: None,
+                attachment: Some(attachment.clone()),
+            })
+            .await;
+
+        match sender.recv().await {
+            ServerFrame::Error {
+                code,
+                request_id,
+                message,
+            } => {
+                assert_eq!(
+                    code,
+                    ErrorCode::InvalidIdentifier,
+                    "{label}: an attachment is an address, so a malformed one is an \
+                     identifier failure; message was {message:?}"
+                );
+                assert_eq!(
+                    request_id.as_deref(),
+                    Some(id),
+                    "{label}: the error must name the send it rejected"
+                );
+            }
+            other => panic!("{label}: expected an invalid_identifier error, received {other:?}"),
+        }
+
+        assert_eq!(
+            recipient.recv_within(QUIET).await,
+            None,
+            "{label}: a send with attachment {attachment:?} reached the recipient"
+        );
+    }
+
+    sender.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        sender.recv().await,
+        ServerFrame::Pong,
+        "a rejected attachment is recoverable and must keep the sender's \
+         connection open"
+    );
+    recipient.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        recipient.recv().await,
+        ServerFrame::Pong,
+        "the recipient's connection must be untouched by another peer's \
+         malformed reference"
+    );
+}
+
+/// The reason the check above is not cosmetic. An `announce` is one encoded
+/// notice handed to every other peer in the room, so an unvalidated reference
+/// let a single malformed value from any admitted peer close every other
+/// connection in its room.
+#[tokio::test]
+async fn a_malformed_announced_attachment_leaves_every_other_peer_connected() {
+    let relay = Relay::start().await;
+    let here = room("announced-attachment");
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut first = Client::join(&relay, &here, "first").await;
+    let mut second = Client::join(&relay, &here, "second").await;
+
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "a1".to_owned(),
+            body: "an announcement no peer may be closed by".to_owned(),
+            reply_to: None,
+            attachment: Some("x".to_owned()),
+        })
+        .await;
+
+    match announcer.recv().await {
+        ServerFrame::Error {
+            code,
+            request_id,
+            message,
+        } => {
+            assert_eq!(
+                code,
+                ErrorCode::InvalidIdentifier,
+                "message was {message:?}"
+            );
+            assert_eq!(
+                request_id.as_deref(),
+                Some("a1"),
+                "the error must name the announcement it rejected"
+            );
+        }
+        other => panic!("expected an invalid_identifier error, received {other:?}"),
+    }
+
+    // The assertion that matters: nothing was fanned out, so no recipient had a
+    // frame to close on, and every one of them is still here.
+    for (label, peer) in [("first", &mut first), ("second", &mut second)] {
+        assert_eq!(
+            peer.recv_within(QUIET).await,
+            None,
+            "{label} received a notice carrying a malformed reference"
+        );
+        peer.send(&ClientFrame::Ping).await;
+        assert_eq!(
+            peer.recv().await,
+            ServerFrame::Pong,
+            "{label} lost its connection to another peer's malformed announcement"
+        );
+    }
+
+    assert_eq!(
+        relay.state.list_peers(&here),
+        vec!["announcer", "first", "second"],
+        "every peer must still be registered"
+    );
+}
+
 #[tokio::test]
 async fn a_self_addressed_send_is_delivered_to_the_sender() {
     let relay = Relay::start().await;
