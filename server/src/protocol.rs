@@ -197,6 +197,24 @@ pub enum ClientFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
     },
+    /// Requests delivery of `body` to every other peer in the sender's room.
+    ///
+    /// Carries no target field at all. The absence of a peer component *is* the
+    /// room-wide address, which is what keeps a reserved target value from
+    /// existing for a peer to register under and capture. A frame typed `send`
+    /// whose `to` is missing is a malformed `send` and never an announcement --
+    /// reading it as one would resurrect the reserved-value variant through the
+    /// back door, and `a_send_without_a_target_is_not_an_announcement` pins it.
+    Announce {
+        /// Opaque correlation token echoed in the `accepted` reply and in every
+        /// delivered `notice`.
+        id: String,
+        /// Payload, relayed uninterpreted and never logged.
+        body: String,
+        /// Identifier of the message being answered, when this is a reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+    },
     /// Liveness probe; answered with `pong`.
     Ping,
     /// Any frame whose `type` is not one of the above.
@@ -216,6 +234,7 @@ impl ClientFrame {
             Self::Hello { .. } => "hello",
             Self::List { .. } => "list",
             Self::Send { .. } => "send",
+            Self::Announce { .. } => "announce",
             Self::Ping => "ping",
             Self::Unsupported => "unsupported",
         }
@@ -250,6 +269,31 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
     },
+    /// An announcement relayed from another peer of the room.
+    ///
+    /// The same field set as [`ServerFrame::Message`] under a distinct `type`,
+    /// so a recipient can tell an announcement from a directed message without
+    /// parsing anything. That distinction is the whole reason this is a frame
+    /// rather than a reserved value in `send.to`: `message` carries no `to`, so
+    /// a reserved target would have been invisible here.
+    ///
+    /// One byte shorter on the wire than `message`, since `notice` is a shorter
+    /// `type` value over identical fields. It therefore fits inside the
+    /// envelope reservation [`MAX_BODY_BYTES`] was computed against, which is
+    /// why one budget covers both classes;
+    /// `worst_case_notice_at_the_body_budget_fits_the_frame_cap` measures it.
+    Notice {
+        /// Correlation token chosen by the announcer.
+        id: String,
+        /// Registered peer name of the announcer, derived by the relay.
+        from: String,
+        /// Payload, relayed uninterpreted.
+        body: String,
+        /// Identifier of the message being answered, when the announcer set
+        /// one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+    },
     /// Relay-level outcome of one `send`.
     Receipt {
         /// Correlation token copied from the `send`.
@@ -258,6 +302,25 @@ pub enum ServerFrame {
         to: String,
         /// What the relay did with the frame.
         status: ReceiptStatus,
+    },
+    /// Relay-level outcome of one `announce`, as two counts.
+    ///
+    /// Deliberately not a [`ReceiptStatus`]: that enum is one closed value and
+    /// no member of it is true of five recipients of which two were
+    /// backpressured. Both counts are carried rather than one plus a total,
+    /// because the announcer cannot derive the other -- it does not know the
+    /// room's population at the instant the fanout ran, and a `list` before the
+    /// announcement would be a different instant.
+    Accepted {
+        /// Correlation token copied from the `announce`.
+        id: String,
+        /// Addressed recipients whose outbound queue took the `notice`.
+        delivered: u32,
+        /// Addressed recipients whose outbound queue refused it: a full queue,
+        /// or a receiver whose task has gone but whose registry entry has not
+        /// been reaped. The two are one count because nothing acts on the
+        /// difference; the second is a race window rather than a state.
+        shed: u32,
     },
     /// Answer to `ping`.
     Pong,
@@ -272,6 +335,26 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
+}
+
+impl ServerFrame {
+    /// The discriminator this frame carries, for log fields.
+    ///
+    /// Mirrors [`ClientFrame::type_name`]. Used where a record has to say which
+    /// frame it is about but must not carry its content: an unwritable
+    /// delivery, where the body is the one thing that may not be logged.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::Peers { .. } => "peers",
+            Self::Message { .. } => "message",
+            Self::Notice { .. } => "notice",
+            Self::Receipt { .. } => "receipt",
+            Self::Accepted { .. } => "accepted",
+            Self::Pong => "pong",
+            Self::Error { .. } => "error",
+        }
+    }
 }
 
 /// Relay-level outcome of a routing attempt.
@@ -672,6 +755,16 @@ mod tests {
                 body: "on it".to_owned(),
                 reply_to: Some("msg-1".to_owned()),
             },
+            ClientFrame::Announce {
+                id: "ann-1".to_owned(),
+                body: "the schema landed".to_owned(),
+                reply_to: None,
+            },
+            ClientFrame::Announce {
+                id: "ann-2".to_owned(),
+                body: "and the migration with it".to_owned(),
+                reply_to: Some("ann-1".to_owned()),
+            },
             ClientFrame::Ping,
         ]
     }
@@ -697,10 +790,32 @@ mod tests {
                 body: "on it".to_owned(),
                 reply_to: Some("msg-1".to_owned()),
             },
+            ServerFrame::Notice {
+                id: "ann-1".to_owned(),
+                from: "macbook-reviewer".to_owned(),
+                body: "the schema landed".to_owned(),
+                reply_to: None,
+            },
+            ServerFrame::Notice {
+                id: "ann-2".to_owned(),
+                from: "macbook-reviewer".to_owned(),
+                body: "and the migration with it".to_owned(),
+                reply_to: Some("ann-1".to_owned()),
+            },
             ServerFrame::Receipt {
                 id: "msg-1".to_owned(),
                 to: "windows-main".to_owned(),
                 status: ReceiptStatus::Routed,
+            },
+            ServerFrame::Accepted {
+                id: "ann-1".to_owned(),
+                delivered: 2,
+                shed: 0,
+            },
+            ServerFrame::Accepted {
+                id: "ann-2".to_owned(),
+                delivered: 0,
+                shed: 0,
             },
             ServerFrame::Pong,
             ServerFrame::Error {
@@ -1178,6 +1293,118 @@ mod tests {
             "worst-case message: {encoded} bytes = {envelope} envelope + {MAX_BODY_BYTES} body, \
              {} bytes below the {MAX_FRAME_BYTES}-byte cap",
             MAX_FRAME_BYTES - encoded
+        );
+    }
+
+    /// The shared-budget claim, measured rather than argued.
+    ///
+    /// `wire-protocol` states that one 65024-byte budget covers both classes
+    /// because a `notice` carries the same field set as a `message` under a
+    /// `type` value one byte shorter. That is only true if nothing else about
+    /// the two frames differs, which is exactly the kind of premise a later
+    /// field addition would break in silence. Asserting the relation, not just
+    /// the cap, is what makes this test notice that.
+    #[test]
+    fn worst_case_notice_at_the_body_budget_fits_the_frame_cap() {
+        let maximal = |as_notice: bool| {
+            let id = "i".repeat(MAX_CORRELATION_BYTES);
+            let from = "f".repeat(MAX_IDENTIFIER_BYTES);
+            let body = "b".repeat(MAX_BODY_BYTES);
+            let reply_to = Some("r".repeat(MAX_CORRELATION_BYTES));
+            if as_notice {
+                ServerFrame::Notice {
+                    id,
+                    from,
+                    body,
+                    reply_to,
+                }
+            } else {
+                ServerFrame::Message {
+                    id,
+                    from,
+                    body,
+                    reply_to,
+                }
+            }
+        };
+
+        let notice = encode(&maximal(true)).expect("encodes").len();
+        let message = encode(&maximal(false)).expect("encodes").len();
+        let envelope = notice - MAX_BODY_BYTES;
+
+        assert!(
+            notice <= MAX_FRAME_BYTES,
+            "worst-case notice is {notice} bytes ({envelope} of envelope around a \
+             {MAX_BODY_BYTES}-byte body), which exceeds the {MAX_FRAME_BYTES}-byte cap"
+        );
+        assert_eq!(
+            message - notice,
+            1,
+            "the shared budget rests on `notice` being exactly one byte smaller than \
+             `message` -- the `type` value, over an identical field set. message \
+             {message}, notice {notice}: a difference of anything else means the two \
+             frames have diverged and the reservation was computed against the wrong one"
+        );
+        println!(
+            "worst-case notice: {notice} bytes = {envelope} envelope + {MAX_BODY_BYTES} body, \
+             {} bytes below the {MAX_FRAME_BYTES}-byte cap, 1 byte below the worst-case \
+             message's {message}",
+            MAX_FRAME_BYTES - notice
+        );
+    }
+
+    /// A `send` missing its target is malformed, never an announcement.
+    ///
+    /// The design rejected making `to` optional precisely because that variant
+    /// turns a capability mismatch into an outage: an old relay answers an
+    /// unknown `type` with `unsupported_frame` and stays open, but a `send` with
+    /// no `to` fails decoding, which is a `malformed_frame` close. Both halves
+    /// are asserted here, because "decoding fails" and "the announcement path is
+    /// not reached" are different claims and only the pair of them closes the
+    /// back door.
+    #[test]
+    fn a_send_without_a_target_is_not_an_announcement() {
+        #[derive(Serialize)]
+        struct TargetlessSend<'a> {
+            #[serde(rename = "type")]
+            kind: &'a str,
+            id: &'a str,
+            body: &'a str,
+        }
+
+        let payload = encode(&TargetlessSend {
+            kind: "send",
+            id: "msg-1",
+            body: "who is this for",
+        })
+        .expect("encodes");
+
+        let decoded = decode::<ClientFrame>(&payload);
+        assert!(
+            matches!(decoded, Err(Error::Decode(_))),
+            "a `send` without `to` must fail decoding, which the relay reports as \
+             `malformed_frame`; it decoded as {decoded:?}"
+        );
+
+        // And the announcement path is reached only by the announcement's own
+        // discriminator, which carries no target to omit in the first place.
+        let announcement = encode(&ClientFrame::Announce {
+            id: "msg-1".to_owned(),
+            body: "who is this for".to_owned(),
+            reply_to: None,
+        })
+        .expect("encodes");
+        assert!(
+            !contains_key(&announcement, b"to"),
+            "an `announce` must carry no target field at all: {announcement:02x?}"
+        );
+        assert_eq!(
+            decode::<ClientFrame>(&announcement).expect("decodes"),
+            ClientFrame::Announce {
+                id: "msg-1".to_owned(),
+                body: "who is this for".to_owned(),
+                reply_to: None,
+            }
         );
     }
 

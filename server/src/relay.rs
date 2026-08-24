@@ -139,6 +139,25 @@ pub enum Routed {
     Unwritable,
 }
 
+/// What one fanout did, as the two counts an `accepted` frame carries.
+///
+/// Counts rather than a [`ReceiptStatus`], because that enum is one closed
+/// value and no member of it is true of five recipients of which two were
+/// backpressured. Their sum is the number of peers the fanout addressed, so a
+/// peer alone in its room gets two zeroes -- an empty room is a fact about the
+/// room, not a failure of the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fanout {
+    /// Addressed recipients whose outbound queue took the payload.
+    ///
+    /// A `u32` because that is the wire type, and a room cannot approach the
+    /// limit: every peer in it holds a live connection and a 128-slot queue.
+    pub delivered: u32,
+    /// Addressed recipients whose queue refused it, whether because it was full
+    /// or because the receiver was already gone.
+    pub shed: u32,
+}
+
 /// Registry of rooms and their registered peers.
 ///
 /// The relay keeps nothing else: no message history, no queue for absent peers,
@@ -298,11 +317,54 @@ impl ServerState {
             return Routed::Status(ReceiptStatus::PeerOffline);
         };
 
-        let Some(payload) = encode_delivery(room, to, frame) else {
+        let Some(payload) = encode_delivery(room, frame) else {
             return Routed::Unwritable;
         };
 
         Routed::Status(enqueue(&outbound, payload))
+    }
+
+    /// Places an encoded `payload` in the outbound queue of every peer of
+    /// `room` except `announcer`, reporting how many queues took it.
+    ///
+    /// Every recipient handle is collected under the read lock and the lock is
+    /// released before the first enqueue, so a room-sized fanout holds the
+    /// registry for one `HashMap` walk rather than for N channel operations.
+    /// The one allocation per announcement is that `Vec` of handles.
+    ///
+    /// The payload is encoded once by the caller and handed to every recipient,
+    /// so the per-recipient cost is a reference-count bump rather than a clone
+    /// of a body up to [`protocol::MAX_BODY_BYTES`].
+    ///
+    /// The announcer is excluded, deliberately asymmetric with [`Self::route`],
+    /// which delivers a self-addressed frame normally. A directed message to
+    /// oneself is a legible request; an announcement that starts a turn on its
+    /// own author is a loop with no reader.
+    pub fn fanout(&self, room: &RoomId, announcer: &str, payload: &Bytes) -> Fanout {
+        let recipients: Vec<mpsc::Sender<Bytes>> = {
+            let rooms = self.read_rooms();
+            rooms
+                .get(room)
+                .map(|peers| {
+                    peers
+                        .iter()
+                        .filter(|(name, _)| name.as_str() != announcer)
+                        .map(|(_, handle)| handle.outbound.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut counts = Fanout::default();
+        for outbound in &recipients {
+            // `Bytes::clone` is a reference-count bump on the shared buffer.
+            if enqueue(outbound, payload.clone()) == ReceiptStatus::Routed {
+                counts.delivered += 1;
+            } else {
+                counts.shed += 1;
+            }
+        }
+        counts
     }
 }
 
@@ -330,13 +392,13 @@ fn enqueue(outbound: &mpsc::Sender<Bytes>, payload: Bytes) -> ReceiptStatus {
 /// Neither record carries a body: the payload size and
 /// [`protocol::Error::kind`] are the whole of what an operator can act on, and
 /// a serde error text quotes the value it rejected.
-fn encode_delivery(room: &RoomId, to: &str, frame: &ServerFrame) -> Option<Bytes> {
+fn encode_delivery(room: &RoomId, frame: &ServerFrame) -> Option<Bytes> {
     match protocol::encode(frame) {
         Ok(payload) if payload.len() <= protocol::MAX_FRAME_BYTES => Some(payload),
         Ok(payload) => {
             tracing::error!(
                 %room,
-                to,
+                frame = frame.type_name(),
                 payload_bytes = payload.len(),
                 cap = protocol::MAX_FRAME_BYTES,
                 "delivery exceeds the frame cap; nothing enqueued"
@@ -346,7 +408,7 @@ fn encode_delivery(room: &RoomId, to: &str, frame: &ServerFrame) -> Option<Bytes
         Err(error) => {
             tracing::error!(
                 %room,
-                to,
+                frame = frame.type_name(),
                 kind = error.kind(),
                 "delivery could not be encoded; nothing enqueued"
             );
@@ -573,19 +635,19 @@ fn register_peer(
 /// acknowledged closes the connection.
 ///
 /// Usable, not allocated: the channel is built [`DIAGNOSTIC_RESERVE`] slots
-/// larger and both [`enqueue_reply`] and [`reserve_receipt`] stop at this
-/// depth.
+/// larger and both [`enqueue_reply`] and [`reserve_acknowledgement`] stop at
+/// this depth.
 const REPLY_QUEUE_CAPACITY: usize = 8;
 
 /// Reply slots held past [`REPLY_QUEUE_CAPACITY`] for [`queue_diagnostic`].
 ///
 /// Without the reserve, the one close a saturated reply path forces was the one
-/// close that could not state its cause. [`reserve_receipt`] fails because the
-/// channel is full, and the [`queue_diagnostic`] on the next line `try_send`s
-/// to that same channel with no `.await` in between -- so the writer cannot
-/// have freed a slot and the diagnostic provably cannot land. The peer closed
-/// for not draining its replies received the bare EOF that every other close
-/// path exists to avoid.
+/// close that could not state its cause. [`reserve_acknowledgement`] fails
+/// because the channel is full, and the [`queue_diagnostic`] on the next line
+/// `try_send`s to that same channel with no `.await` in between -- so the
+/// writer cannot have freed a slot and the diagnostic provably cannot land. The
+/// peer closed for not draining its replies received the bare EOF that every
+/// other close path exists to avoid.
 ///
 /// Testing capacity and then sending is sound here because of the channel's
 /// shape rather than by luck. There is exactly one sender -- [`pump`] moves
@@ -594,8 +656,8 @@ const REPLY_QUEUE_CAPACITY: usize = 8;
 /// slots that nothing can invalidate between the test and the send.
 ///
 /// One slot is enough because every [`queue_diagnostic`] call site is terminal:
-/// duplicate `hello`, decode failure, framing error, over-budget body, receipt
-/// reservation failure, and the idle deadline each yield
+/// duplicate `hello`, decode failure, framing error, over-budget body, an
+/// acknowledgement reservation failure, and the idle deadline each yield
 /// [`ControlFlow::Break`] or return from [`run_reader`] on the next line, and
 /// [`run_reader`] runs once per connection. The reserve is consumed at most
 /// once.
@@ -1080,6 +1142,10 @@ fn handle_frame(
             reply_to,
         } => handle_send(replies, state, registered, id, to, body, reply_to),
 
+        ClientFrame::Announce { id, body, reply_to } => {
+            handle_announce(replies, state, registered, id, body, reply_to)
+        }
+
         ClientFrame::Unsupported => {
             tracing::info!(
                 room = %registered.room,
@@ -1193,7 +1259,7 @@ fn handle_send(
     // requires exactly one receipt per valid `send`, so routing first and
     // finding no room afterwards delivered the message and lost its receipt --
     // leaving the sender unable to tell whether to retry.
-    let Some(receipt_slot) = reserve_receipt(replies) else {
+    let Some(receipt_slot) = reserve_acknowledgement(replies) else {
         tracing::info!(
             room = %registered.room,
             peer = %registered.peer,
@@ -1227,7 +1293,7 @@ fn handle_send(
 
     let Routed::Status(status) = outcome else {
         drop(receipt_slot);
-        return refuse_unwritable(replies, registered, &id, body_bytes);
+        return refuse_unwritable(replies, registered, "message", &id, body_bytes);
     };
 
     log_route(registered, &to, &id, body_bytes, status);
@@ -1236,23 +1302,148 @@ fn handle_send(
     ControlFlow::Continue(())
 }
 
-/// Closes the connection whose `send` produced a delivery this relay cannot
+/// Validates and fans out one `announce`, then reports its aggregate receipt.
+///
+/// The checks are ordered as on the `send` path and for the same reasons. `id`
+/// first, because no rejection can name the frame it answers without it.
+/// `reply_to` second, because it is the one recoverable rejection here that
+/// *can* name it. The body budget last, because it is the one that closes the
+/// connection, so it is reached only once the frame is known to be one the
+/// relay would otherwise have delivered.
+///
+/// There is no target check, and no place for one: an `announce` carries no
+/// target field at all.
+fn handle_announce(
+    replies: &mpsc::Sender<ServerFrame>,
+    state: &ServerState,
+    registered: &RegisteredPeer,
+    id: String,
+    body: String,
+    reply_to: Option<String>,
+) -> ControlFlow<()> {
+    if let Err(error) = protocol::validate_correlation_id(&id) {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("announce.id {error}")),
+                request_id: None,
+            },
+        );
+    }
+
+    if let Some(error) = reply_to
+        .as_deref()
+        .and_then(|value| protocol::validate_correlation_id(value).err())
+    {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("announce.reply_to {error}")),
+                // `id` passed validation above, so this is the one rejection on
+                // the `announce` path that can name the frame it rejected.
+                request_id: Some(id),
+            },
+        );
+    }
+
+    if let Some(body_bytes) = protocol::body_over_budget(&body) {
+        tracing::info!(
+            room = %registered.room,
+            peer = %registered.peer,
+            connection_id = registered.connection_id,
+            body_bytes,
+            budget = protocol::MAX_BODY_BYTES,
+            "announced body exceeds the relayable budget"
+        );
+        queue_diagnostic(
+            replies,
+            ErrorCode::FrameTooLarge,
+            format!(
+                "body is {body_bytes} bytes; at most {} can be relayed within the {}-byte \
+                 frame cap",
+                protocol::MAX_BODY_BYTES,
+                protocol::MAX_FRAME_BYTES
+            ),
+        );
+        return ControlFlow::Break(());
+    }
+
+    // Secured before any recipient is enqueued, exactly as a `receipt` is. The
+    // invariant it buys generalizes to a fanout without change, because it
+    // constrains the order of securing against enqueueing and not the number of
+    // recipients: zero acknowledgements means zero deliveries, so a resend after
+    // reconnecting is never a duplicate.
+    let Some(accepted_slot) = reserve_acknowledgement(replies) else {
+        tracing::info!(
+            room = %registered.room,
+            peer = %registered.peer,
+            connection_id = registered.connection_id,
+            capacity = REPLY_QUEUE_CAPACITY,
+            "cannot acknowledge an announcement; closing without routing it"
+        );
+        queue_diagnostic(
+            replies,
+            ErrorCode::IdleTimeout,
+            "replies are not being drained, so this announcement cannot be acknowledged; \
+             it was not routed"
+                .to_owned(),
+        );
+        return ControlFlow::Break(());
+    };
+
+    // `body` is moved into the notice and is never a log field; only its size is
+    // observable in logs.
+    let body_bytes = body.len();
+    let notice = ServerFrame::Notice {
+        id: id.clone(),
+        from: registered.peer.clone(),
+        body,
+        reply_to,
+    };
+
+    // Encoded once for the whole room. Every field of a `notice` is
+    // sender-derived, so the payload is byte-identical for every recipient and
+    // the fanout hands out reference-counted clones of this one buffer.
+    let Some(payload) = encode_delivery(&registered.room, &notice) else {
+        drop(accepted_slot);
+        return refuse_unwritable(replies, registered, "notice", &id, body_bytes);
+    };
+
+    let counts = state.fanout(&registered.room, &registered.peer, &payload);
+    log_fanout(registered, &id, body_bytes, counts);
+
+    accepted_slot.send(ServerFrame::Accepted {
+        id,
+        delivered: counts.delivered,
+        shed: counts.shed,
+    });
+    ControlFlow::Continue(())
+}
+
+/// Closes the connection whose frame produced a delivery this relay cannot
 /// write.
 ///
 /// Charged to the sender, which built the frame, and never to the recipient it
 /// was addressed to. Unreachable while the body budget holds: `id`, `reply_to`,
 /// and `body` are all checked before routing and `from` is a registered peer
 /// name, which is exactly the arithmetic
-/// `worst_case_message_at_the_body_budget_fits_the_frame_cap` proves. It is
-/// handled rather than asserted so that a later change breaking that arithmetic
-/// closes the connection responsible instead of a third party's, which is the
-/// property `an_unwritable_delivery_closes_nobody` pins.
+/// `worst_case_message_at_the_body_budget_fits_the_frame_cap` and its `notice`
+/// counterpart prove. It is handled rather than asserted so that a later change
+/// breaking that arithmetic closes the connection responsible instead of a third
+/// party's, which is the property `an_unwritable_delivery_closes_nobody` pins.
+///
+/// `produced` names the delivery frame the relay was building -- `message` or
+/// `notice` -- because that is the frame whose size the sender has to act on,
+/// and it is not the frame the sender wrote.
 ///
 /// [`ServerState::route`] has already logged what went wrong at `error` level;
 /// this record names the connection paying for it.
 fn refuse_unwritable(
     replies: &mpsc::Sender<ServerFrame>,
     registered: &RegisteredPeer,
+    produced: &str,
     id: &str,
     body_bytes: usize,
 ) -> ControlFlow<()> {
@@ -1260,15 +1451,18 @@ fn refuse_unwritable(
         room = %registered.room,
         peer = %registered.peer,
         connection_id = registered.connection_id,
+        produced,
         id,
         body_bytes,
-        "the message this send would produce is not writable; closing without routing it"
+        "the delivery this frame would produce is not writable; closing without routing it"
     );
     queue_diagnostic(
         replies,
         ErrorCode::FrameTooLarge,
-        "the message this send would produce does not fit the frame cap; it was not routed"
-            .to_owned(),
+        format!(
+            "the {produced} this frame would produce does not fit the frame cap; \
+             it was not routed"
+        ),
     );
     ControlFlow::Break(())
 }
@@ -1334,6 +1528,28 @@ fn log_route(
     }
 }
 
+/// Emits the fanout outcome. Carries metadata only: never `body`.
+///
+/// One record per announcement rather than one per recipient. Per-recipient
+/// records would make a single announcement's log volume scale with the room
+/// while adding nothing a reader could act on: the shed count already says how
+/// many peers were not reading, and *which* peer that was is already observable
+/// from the backpressure and registration events.
+fn log_fanout(registered: &RegisteredPeer, id: &str, body_bytes: usize, counts: Fanout) {
+    let room = tracing::field::display(&registered.room);
+    let from = registered.peer.as_str();
+    let Fanout { delivered, shed } = counts;
+
+    if shed == 0 {
+        tracing::debug!(%room, from, id, body_bytes, delivered, shed, "announcement fanned out");
+    } else {
+        tracing::warn!(
+            %room, from, id, body_bytes, delivered, shed,
+            "announcement shed by a recipient queue"
+        );
+    }
+}
+
 /// Encodes and writes one frame, flushing it.
 async fn write_frame<S>(
     writer: &mut protocol::FrameWriter<S>,
@@ -1369,7 +1585,8 @@ where
 ///
 /// Used for every reply whose loss costs the peer nothing it can observe:
 /// `pong`, `peers`, and the recoverable `error` frames. A `send` receipt is
-/// contractual and uses [`reserve_receipt`] instead.
+/// contractual, as is an `announce` acceptance, and both use
+/// [`reserve_acknowledgement`] instead.
 fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> ControlFlow<()> {
     let queued = if replies.capacity() <= DIAGNOSTIC_RESERVE {
         Err(TrySendError::Full(frame))
@@ -1391,14 +1608,21 @@ fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> Con
     }
 }
 
-/// Claims the slot a `send` receipt will occupy, before the send is routed.
+/// Claims the slot a routed frame's acknowledgement will occupy, before that
+/// frame is routed.
 ///
 /// `peer-relay` requires exactly one `receipt` for every syntactically valid
-/// `send`, so the acknowledgement has to be secured *first*. Routing and then
+/// `send` and exactly one `accepted` for every syntactically valid `announce`,
+/// so the acknowledgement has to be secured *first*. Routing and then
 /// discovering there is no room routed the message and dropped its receipt:
 /// measured at 24 coalesced sends, 8 receipts, 9 delivered, then a close. The
 /// sender could not tell that its ninth message had been delivered, so it would
 /// resend it.
+///
+/// One reservation serves both classes without change, because the invariant is
+/// about the *order* of securing against enqueueing and not about the number of
+/// recipients: zero acknowledgements means zero deliveries, whether the frame
+/// addressed one peer or the whole room.
 ///
 /// Returning `None` therefore means "do not route this frame", and the caller
 /// closes the connection instead. Nothing was delivered, so the sender's retry
@@ -1406,9 +1630,12 @@ fn enqueue_reply(replies: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> Con
 ///
 /// Refuses on the same threshold as [`enqueue_reply`], and for a sharper
 /// reason: the caller's very next act on this path is to queue the `error`
-/// frame naming the close. Reserving the last slot would buy one receipt the
-/// peer cannot read at the price of the one diagnostic it needs.
-fn reserve_receipt(replies: &mpsc::Sender<ServerFrame>) -> Option<mpsc::Permit<'_, ServerFrame>> {
+/// frame naming the close. Reserving the last slot would buy one
+/// acknowledgement the peer cannot read at the price of the one diagnostic it
+/// needs.
+fn reserve_acknowledgement(
+    replies: &mpsc::Sender<ServerFrame>,
+) -> Option<mpsc::Permit<'_, ServerFrame>> {
     if replies.capacity() <= DIAGNOSTIC_RESERVE {
         return None;
     }
@@ -1811,6 +2038,127 @@ mod tests {
     }
 
     #[test]
+    fn a_fanout_addresses_every_other_peer_of_the_room() {
+        let state = ServerState::new();
+        let other_room = RoomId::new("omp-relayd", "some-other-task");
+
+        let (announcer_tx, mut announcer_rx) = peer_queue();
+        register_in(&state, &room(), "macbook-reviewer", announcer_tx);
+        let (first_tx, mut first_rx) = peer_queue();
+        register_in(&state, &room(), "windows-main", first_tx);
+        let (second_tx, mut second_rx) = peer_queue();
+        register_in(&state, &room(), "linux-builder", second_tx);
+        let (elsewhere_tx, mut elsewhere_rx) = peer_queue();
+        register_in(&state, &other_room, "elsewhere", elsewhere_tx);
+
+        let payload = protocol::encode(&ServerFrame::Notice {
+            id: "ann-1".to_owned(),
+            from: "macbook-reviewer".to_owned(),
+            body: "the schema landed".to_owned(),
+            reply_to: None,
+        })
+        .expect("encodes");
+
+        assert_eq!(
+            state.fanout(&room(), "macbook-reviewer", &payload),
+            Fanout {
+                delivered: 2,
+                shed: 0
+            },
+            "both other peers of the room must be addressed, and neither the announcer \
+             nor the other room's peer counted"
+        );
+
+        for (peer, queue) in [
+            ("windows-main", &mut first_rx),
+            ("linux-builder", &mut second_rx),
+        ] {
+            let queued = queue.try_recv().expect("a recipient holds the notice");
+            assert_eq!(
+                queued, payload,
+                "{peer} must hold the very bytes the caller encoded: one encode for the \
+                 whole room, and a reference-count bump per recipient"
+            );
+        }
+        assert_eq!(
+            announcer_rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "an announcement must never reach its own author: starting a turn on the \
+             announcer is a loop with no reader"
+        );
+        assert_eq!(
+            elsewhere_rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "and it must not cross the room boundary"
+        );
+    }
+
+    #[test]
+    fn a_fanout_counts_a_refusing_queue_without_failing_the_others() {
+        let state = ServerState::new();
+        let (announcer_tx, _announcer_rx) = peer_queue();
+        register_in(&state, &room(), "macbook-reviewer", announcer_tx);
+        let (draining_tx, mut draining_rx) = peer_queue();
+        register_in(&state, &room(), "windows-main", draining_tx);
+        let (stalled_tx, _stalled_rx) = peer_queue();
+        register_in(&state, &room(), "linux-builder", stalled_tx);
+        let (gone_tx, gone_rx) = peer_queue();
+        register_in(&state, &room(), "departed", gone_tx);
+        drop(gone_rx);
+
+        let payload = Bytes::from_static(b"a notice");
+
+        // Fill exactly one recipient's queue, so its refusal is a full queue
+        // rather than an absent one.
+        for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+            assert_eq!(
+                route_status(&state, &room(), "linux-builder", &message("filler")),
+                ReceiptStatus::Routed,
+                "the premise: this recipient's queue must be filled to capacity"
+            );
+        }
+
+        assert_eq!(
+            state.fanout(&room(), "macbook-reviewer", &payload),
+            Fanout {
+                delivered: 1,
+                shed: 2
+            },
+            "a full queue and a departed receiver are both shed, and the draining peer \
+             is delivered to regardless: one recipient's state must not fail the fanout"
+        );
+        assert_eq!(
+            draining_rx.try_recv().expect("the draining peer holds it"),
+            payload,
+            "and it holds the announced payload rather than a filler message"
+        );
+    }
+
+    #[test]
+    fn a_lone_peer_fans_out_to_nobody_without_failing() {
+        let state = ServerState::new();
+        let (tx, mut rx) = peer_queue();
+        register_in(&state, &room(), "solo", tx);
+
+        assert_eq!(
+            state.fanout(&room(), "solo", &Bytes::from_static(b"a notice")),
+            Fanout::default(),
+            "an empty room is a fact about the room, not a failure of the request: two \
+             zeroes rather than an error"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "and the lone peer is still not its own recipient"
+        );
+        assert_eq!(
+            state.fanout(&RoomId::new("absent", "room"), "solo", &Bytes::new()),
+            Fanout::default(),
+            "an unknown room addresses nobody"
+        );
+    }
+
+    #[test]
     fn an_emptied_room_is_not_retained() {
         let state = ServerState::new();
         let (tx, _rx) = peer_queue();
@@ -1887,7 +2235,7 @@ mod tests {
         );
 
         assert!(
-            reserve_receipt(&replies).is_none(),
+            reserve_acknowledgement(&replies).is_none(),
             "a `send` receipt is contractual, so a full queue must refuse the reservation \
              instead: the caller then declines to route, which is what stops a send being \
              delivered with its receipt dropped"
@@ -1933,10 +2281,10 @@ mod tests {
             );
             assert_eq!(writer_side.len(), slot, "slot {slot} must be queued");
         }
-        let slot = reserve_receipt(&replies).expect("the last usable slot is free");
+        let slot = reserve_acknowledgement(&replies).expect("the last usable slot is free");
 
         assert!(
-            reserve_receipt(&replies).is_none(),
+            reserve_acknowledgement(&replies).is_none(),
             "the reservation must actually consume capacity, or two sends could both \
              believe they are acknowledged"
         );
