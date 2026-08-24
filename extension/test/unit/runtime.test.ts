@@ -36,12 +36,20 @@ import {
 } from "../../src/config.ts";
 import ompRelay, {
   INBOUND_MESSAGE_TYPE,
+  INBOUND_NOTICE_TYPE,
+  OUTBOUND_ANNOUNCE_TYPE,
   OUTBOUND_MESSAGE_TYPE,
   type MeshToolResult,
 } from "../../src/index.ts";
 import { PROTOCOL_VERSION } from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
-import { ScriptedRelay, type RelaySession, type Script } from "../support/scripted-relay.ts";
+import {
+  frameField,
+  isFrame,
+  ScriptedRelay,
+  type RelaySession,
+  type Script,
+} from "../support/scripted-relay.ts";
 import { Signal } from "../support/signal.ts";
 
 const ROOM = { project: "omp-relayd", task: "implement-omp-extension" };
@@ -55,20 +63,6 @@ const realSetTimeout = globalThis.setTimeout;
 const realSetInterval = globalThis.setInterval;
 const realClearTimeout = globalThis.clearTimeout;
 const realClearInterval = globalThis.clearInterval;
-
-function isHello(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as Record<string, unknown>)["type"] === "hello"
-  );
-}
-
-function frameField(value: unknown, field: string): unknown {
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)[field]
-    : undefined;
-}
 
 // ---------------------------------------------------------------------------
 // Displacement
@@ -90,7 +84,7 @@ describe("a peer name taken by another session", () => {
     let holder: RelaySession | null = null;
     let displaced: RelaySession | null = null;
     const script: Script = (frame, session) => {
-      if (!isHello(frame)) return;
+      if (!isFrame(frame, "hello")) return;
       if (holder !== null) {
         displaced = holder;
         holder.send({
@@ -214,6 +208,8 @@ interface SessionHarness {
    * raised on its own instead of polling for it.
    */
   readonly notified: Signal<string>;
+  /** Changes what `ctx.isIdle()` reports to an inbound-delivery handler. */
+  setIdle(idle: boolean): void;
   /** Invokes the registered `mesh` tool exactly as the runtime would. */
   mesh(args: Record<string, unknown>, ctx?: ExtensionContext): Promise<MeshToolResult>;
 }
@@ -230,6 +226,7 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   const notifications: string[] = [];
   const notified = new Signal<string>();
   let execute: ToolExecute | null = null;
+  let idle = true;
 
   const chain = {
     describe() {
@@ -274,6 +271,9 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   // The real ambient timers, captured at module load, so replacing the globals
   // in a test does not turn the context's own delegation into an ambient call.
   const ctx = {
+    isIdle() {
+      return idle;
+    },
     mode,
     cwd,
     ui: {
@@ -304,6 +304,9 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
     ctx,
     notifications,
     notified,
+    setIdle(value) {
+      idle = value;
+    },
     mesh(args, override) {
       if (execute === null) throw new Error("the extension registered no tool");
       return execute("call-1", args, undefined, undefined, override ?? ctx);
@@ -399,6 +402,32 @@ const PLAIN_INBOUND = {
   body: "Please review the parser.",
 } as const;
 
+/** One inbound room announcement, with the text and entry it must produce. */
+const NOTICE = {
+  type: "notice",
+  id: "announcement-7",
+  from: "alpha",
+  body: "The schema has landed.",
+  reply_to: "message-42",
+} as const;
+
+const PLAIN_NOTICE = {
+  type: "notice",
+  id: "announcement-8",
+  from: "alpha",
+  body: "No reply reference.",
+} as const;
+
+const NOTICE_TEXT = [
+  "Room announcement from alpha, addressed to everyone in this room",
+  `Project: ${ROOM.project}`,
+  `Task: ${ROOM.task}`,
+  "Announcement ID: announcement-7",
+  "Reply to: message-42",
+  "",
+  "> The schema has landed.",
+].join("\n");
+
 const INBOUND_TEXT = [
   "Remote message from alpha",
   `Project: ${ROOM.project}`,
@@ -410,18 +439,19 @@ const INBOUND_TEXT = [
 ].join("\n");
 
 /**
- * A relay that admits every connection, answers `list`, and can deliver
- * messages on demand.
+ * A relay that admits every connection, answers `list`, accepts announcements,
+ * and can deliver server frames on demand.
  *
  * `list` is answered because a join is not complete until the roster comes
- * back, so every join-driven test needs it; the hellos are recorded because
- * "the relay saw the new room" is what makes a rejoin observable from the far
- * side rather than only from the caller's own report.
+ * back, so every join-driven test needs it; hellos and outbound frames are
+ * retained because observing the far side is stronger than observing only the
+ * extension's own result.
  */
 interface Recorder {
   readonly script: Script;
   readonly hellos: Array<{ project: string; task: string; peer: string }>;
   readonly sends: unknown[];
+  readonly announcements: unknown[];
   /** Delivers a frame on the most recent connection. */
   deliver(frame: Parameters<RelaySession["send"]>[0]): void;
   peers: readonly string[];
@@ -430,10 +460,12 @@ interface Recorder {
 function recordingRelay(options: { deliverOnReady?: readonly unknown[] } = {}): Recorder {
   const hellos: Array<{ project: string; task: string; peer: string }> = [];
   const sends: unknown[] = [];
+  const announcements: unknown[] = [];
   let latest: RelaySession | null = null;
   const recorder: Recorder = {
     hellos,
     sends,
+    announcements,
     peers: [PEER],
     deliver(frame) {
       latest?.send(frame);
@@ -462,6 +494,16 @@ function recordingRelay(options: { deliverOnReady?: readonly unknown[] } = {}): 
         });
         return;
       }
+      if (type === "announce") {
+        announcements.push(frame);
+        session.send({
+          type: "accepted",
+          id: String(frameField(frame, "id")),
+          delivered: 2,
+          shed: 0,
+        });
+        return;
+      }
       if (type === "send") {
         sends.push(frame);
         session.send({
@@ -478,7 +520,7 @@ function recordingRelay(options: { deliverOnReady?: readonly unknown[] } = {}): 
 
 /** Admits the connection and delivers {@link INBOUND} on the same handshake. */
 const ADMIT_AND_DELIVER: Script = (frame, session) => {
-  if (!isHello(frame)) return;
+  if (!isFrame(frame, "hello")) return;
   session.send({ type: "ready", protocol: PROTOCOL_VERSION });
   session.send(INBOUND);
 };
@@ -491,7 +533,7 @@ const ADMIT_AND_DELIVER: Script = (frame, session) => {
  */
 async function startAutoSession(
   relay: ScriptedRelay,
-  options: { purpose?: string } = {},
+  options: { purpose?: string; idle?: boolean } = {},
 ): Promise<{ harness: SessionHarness; shutdown: () => Promise<void>; written: Layers }> {
   const written = layers({
     port: relay.port,
@@ -499,10 +541,10 @@ async function startAutoSession(
     ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
   });
   const harness = sessionHarness(written.projectRoot);
+  if (options.idle !== undefined) harness.setIdle(options.idle);
   ompRelay(harness.api);
 
   await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
-
   return {
     harness,
     written,
@@ -768,6 +810,50 @@ describe("joining a live session", () => {
     }
   });
 
+  test("an announcement through the tool leaves its own session entry", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port });
+      const harness = sessionHarness(written.projectRoot);
+      ompRelay(harness.api);
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      await harness.mesh({ action: "join" });
+
+      const announced = await harness.mesh({
+        action: "announce",
+        message: "The schema has landed.",
+        reply_to: "message-42",
+      });
+
+      expect(announced.details["delivered"]).toBe(2);
+      expect(announced.details["shed"]).toBe(0);
+      expect(recorder.announcements).toHaveLength(1);
+      expect(frameField(recorder.announcements[0], "to")).toBeUndefined();
+      expect(harness.calls.entries).toEqual([
+        {
+          customType: OUTBOUND_ANNOUNCE_TYPE,
+          data: {
+            id: announced.details["id"],
+            project: ROOM.project,
+            task: ROOM.task,
+            body: "The schema has landed.",
+            delivered: 2,
+            shed: 0,
+            reply_to: "message-42",
+          },
+        },
+      ]);
+
+      await harness.handlers.get("session_shutdown")?.(
+        { type: "session_shutdown" },
+        harness.ctx,
+      );
+    } finally {
+      await relay.close();
+    }
+  });
+
   test("a rejoin after the relay displaced this peer reconnects", async () => {
     // `peer_replaced` is terminal by design: the displaced client stops for
     // good rather than fighting for the name. The identical rejoin is then the
@@ -937,6 +1023,82 @@ describe("the machine's purpose under automatic startup", () => {
       console.log(
         `auto session: message 1 carried the purpose preamble (${first.split("\n").length} lines), message 2 did not (${second.split("\n").length} lines)`,
       );
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a deferred notice leaves the purpose for the next turn-starting delivery", async () => {
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, {
+        purpose,
+        idle: false,
+      });
+      await relay.awaitReceived(1);
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(1);
+
+      const deferred = String(harness.calls.userMessages[0]?.content);
+      expect(harness.calls.userMessages[0]?.options).toEqual({ deliverAs: "followUp" });
+      expect(deferred).not.toContain(purpose);
+
+      // The run has finished. A directed delivery starts or steers the next turn,
+      // so this is where the still-owed preamble belongs.
+      harness.setIdle(true);
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-after-notice" });
+      await harness.calls.injected.until(2);
+
+      const starting = String(harness.calls.userMessages[1]?.content);
+      expect(harness.calls.userMessages[1]?.options).toEqual({ deliverAs: "steer" });
+      expect(starting.split("\n").slice(0, 3)).toEqual([
+        "This terminal's configured purpose, from its own operator:",
+        purpose,
+        "",
+      ]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("an idle notice may carry the purpose, and a later join does not repeat it", async () => {
+    const purpose = "Run Linux builds here. Decline Windows work.";
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, {
+        purpose,
+        idle: true,
+      });
+      await relay.awaitReceived(1);
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(1);
+
+      const injected = String(harness.calls.userMessages[0]?.content);
+      expect(harness.calls.userMessages[0]?.options).toEqual({ deliverAs: "steer" });
+      expect(injected).toContain(purpose);
+
+      // Flip to manual so the join result is a channel that *could* carry the
+      // purpose. It must not: the notice already delivered it to this session.
+      writeGlobal(written.agentDir, {
+        port: relay.port,
+        startup: "manual",
+        purpose,
+      });
+      const joined = await harness.mesh({ action: "join" });
+      expect(joined.content[0]?.text).not.toContain(purpose);
+
+      recorder.deliver({ ...PLAIN_INBOUND, id: "message-after-join" });
+      await harness.calls.injected.until(2);
+      expect(String(harness.calls.userMessages[1]?.content)).not.toContain(purpose);
 
       await shutdown();
     } finally {
@@ -1522,6 +1684,93 @@ describe("the session runtime", () => {
             reply_to: "message-3",
           },
         },
+      ]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("an idle notice starts a turn without entering prompt preprocessing", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [NOTICE] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: true });
+      await harness.calls.injected.until(1);
+
+      // Explicit `steer`, even while idle. Omitting `deliverAs` would enter
+      // `AgentSession.prompt()`, whose non-streaming path auto-reads `@filepath`
+      // mentions (agent-session.ts:5789-5798). A queued steer schedules the idle
+      // drain and may resume from any transcript tail
+      // (agent-session.ts:6204-6228, 6247-6253), so it still starts a turn.
+      expect(harness.calls.userMessages).toEqual([
+        { content: NOTICE_TEXT, options: { deliverAs: "steer" } },
+      ]);
+      expect(harness.calls.entries).toEqual([
+        {
+          customType: INBOUND_NOTICE_TYPE,
+          data: {
+            id: "announcement-7",
+            from: "alpha",
+            project: ROOM.project,
+            task: ROOM.task,
+            body: "The schema has landed.",
+            reply_to: "message-42",
+          },
+        },
+      ]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a notice while streaming is deferred rather than steered or aborted", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [NOTICE] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      await harness.calls.injected.until(1);
+
+      expect(harness.calls.userMessages).toEqual([
+        { content: NOTICE_TEXT, options: { deliverAs: "followUp" } },
+      ]);
+      expect(harness.calls.customMessages).toEqual([]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("several notices during one run remain separate follow-up messages", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [NOTICE, PLAIN_NOTICE] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      await harness.calls.injected.until(2);
+
+      expect(harness.calls.userMessages).toHaveLength(2);
+      expect(harness.calls.userMessages.map((call) => call.options)).toEqual([
+        { deliverAs: "followUp" },
+        { deliverAs: "followUp" },
+      ]);
+      expect(harness.calls.userMessages.map((call) => String(call.content))).toEqual([
+        NOTICE_TEXT,
+        [
+          "Room announcement from alpha, addressed to everyone in this room",
+          `Project: ${ROOM.project}`,
+          `Task: ${ROOM.task}`,
+          "Announcement ID: announcement-8",
+          "",
+          "> No reply reference.",
+        ].join("\n"),
+      ]);
+      expect(harness.calls.entries.map((entry) => entry.customType)).toEqual([
+        INBOUND_NOTICE_TYPE,
+        INBOUND_NOTICE_TYPE,
       ]);
 
       await shutdown();

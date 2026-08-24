@@ -83,13 +83,38 @@ export interface SendFrame {
   readonly reply_to?: string;
 }
 
+/**
+ * Requests delivery of `body` to every other peer in the sender's room.
+ *
+ * `to` is declared as `never` rather than omitted, and that is the point: the
+ * room-wide address *is* the absence of a peer component, so no reserved target
+ * value exists for a peer to register under and capture. Omitting the field
+ * would leave `{ type: "announce", ..., to }` a type error only for an object
+ * literal, since excess-property checking does not reach a widened object;
+ * declaring it `never` rejects the target wherever the frame is built.
+ * {@link encodeFrame} refuses one at runtime as well, for a frame assembled by
+ * spreading untyped input.
+ */
+export interface AnnounceFrame {
+  readonly type: "announce";
+  readonly id: string;
+  readonly body: string;
+  readonly reply_to?: string;
+  readonly to?: never;
+}
+
 /** Liveness probe; answered with `pong`. */
 export interface PingFrame {
   readonly type: "ping";
 }
 
-/** Every frame a client may write. Protocol v1 has exactly these four. */
-export type ClientFrame = HelloFrame | ListFrame | SendFrame | PingFrame;
+/** Every frame a client may write. Protocol v1 has exactly these five. */
+export type ClientFrame =
+  | HelloFrame
+  | ListFrame
+  | SendFrame
+  | AnnounceFrame
+  | PingFrame;
 
 /** Admission confirmation, carrying the negotiated protocol version. */
 export interface ReadyFrame {
@@ -112,6 +137,33 @@ export interface MessageFrame {
   readonly body: string;
   readonly reply_to?: string;
 }
+
+/**
+ * An announcement relayed from another peer of the room.
+ *
+ * The same fields as {@link MessageFrame} under a distinct `type`, which is how
+ * a recipient tells the two classes apart without parsing anything. That is the
+ * whole reason the class is a frame rather than a reserved value in `send.to`:
+ * a `message` carries no `to`, so a reserved target would have been invisible
+ * here.
+ */
+export interface NoticeFrame {
+  readonly type: "notice";
+  readonly id: string;
+  readonly from: string;
+  readonly body: string;
+  readonly reply_to?: string;
+}
+
+/**
+ * A delivery relayed from another peer, of either class.
+ *
+ * The union is what a host receives, because the class has to be a property of
+ * the delivery rather than something the host infers: the two differ in how the
+ * host must deliver them, and a host that could not tell them apart could
+ * honour neither rule. `type` is that property.
+ */
+export type DeliveryFrame = MessageFrame | NoticeFrame;
 
 /** Statuses `wire-protocol` defines for protocol v1. */
 export type KnownReceiptStatus =
@@ -138,6 +190,22 @@ export interface ReceiptFrame {
   readonly id: string;
   readonly to: string;
   readonly status: ReceiptStatus;
+}
+
+/**
+ * Relay-level outcome of one `announce`, as two counts.
+ *
+ * Not a {@link ReceiptStatus}: no member of that set is true of five recipients
+ * of which two were backpressured. Both counts are carried rather than one plus
+ * a total, because the announcer cannot derive the other -- it does not know the
+ * room's population at the instant the fanout ran, and a `list` beforehand would
+ * be a different instant.
+ */
+export interface AcceptedFrame {
+  readonly type: "accepted";
+  readonly id: string;
+  readonly delivered: number;
+  readonly shed: number;
 }
 
 /** Answer to `ping`. */
@@ -169,12 +237,14 @@ export interface ErrorFrame {
   readonly request_id?: string;
 }
 
-/** Every frame the relay may write. Protocol v1 has exactly these six. */
+/** Every frame the relay may write. Protocol v1 has exactly these eight. */
 export type ServerFrame =
   | ReadyFrame
   | PeersFrame
   | MessageFrame
+  | NoticeFrame
   | ReceiptFrame
+  | AcceptedFrame
   | PongFrame
   | ErrorFrame;
 
@@ -182,7 +252,9 @@ const SERVER_FRAME_TYPES: readonly ServerFrame["type"][] = [
   "ready",
   "peers",
   "message",
+  "notice",
   "receipt",
+  "accepted",
   "pong",
   "error",
 ];
@@ -302,9 +374,23 @@ export function encodePayload(frame: ClientFrame | ServerFrame): Uint8Array {
  * Encodes one frame as it goes on the wire: a big-endian `u32` payload length
  * followed by that many payload bytes.
  *
- * @throws {EncodeError} if the payload would exceed {@link MAX_FRAME_BYTES}.
+ * Refuses an `announce` carrying a target. {@link AnnounceFrame} already makes
+ * that a type error wherever the frame is built, so this catches only the case
+ * types cannot: a frame assembled by spreading a wider object. Refusing rather
+ * than dropping the field is deliberate -- a caller that supplied a target
+ * believed it was addressing one peer, and silently broadcasting instead would
+ * be worse than a stated refusal.
+ *
+ * @throws {EncodeError} if the payload would exceed {@link MAX_FRAME_BYTES}, or
+ * if an `announce` carries a target.
  */
 export function encodeFrame(frame: ClientFrame): Uint8Array {
+  if (frame.type === "announce" && "to" in frame) {
+    throw new EncodeError(
+      "an announce carries no target: the absence of a peer component is what addresses " +
+        "the room, so there is no target value to supply",
+    );
+  }
   const payload = encodePayload(frame);
   const framed = new Uint8Array(LENGTH_PREFIX_BYTES + payload.length);
   new DataView(framed.buffer).setUint32(0, payload.length, false);
@@ -587,27 +673,14 @@ export function validateServerFrame(value: unknown): ServerFrameOutcome {
       };
     }
 
-    case "message": {
-      const id = map["id"];
-      if (!isNonEmptyString(id)) return fieldInvalid("message", "id", id);
-      const from = map["from"];
-      if (!isNonEmptyString(from)) return fieldInvalid("message", "from", from);
-      const body = map["body"];
-      if (typeof body !== "string") {
-        return fieldInvalid("message", "body", body, "a string");
-      }
-      const replyTo = optionalString(map, "reply_to");
-      if (replyTo.kind === "invalid") {
-        return fieldInvalid("message", "reply_to", map["reply_to"], "a string");
-      }
-      return {
-        kind: "frame",
-        frame:
-          replyTo.value === null
-            ? { type: "message", id, from, body }
-            : { type: "message", id, from, body, reply_to: replyTo.value },
-      };
-    }
+    // One validator for both delivery classes. Shared rather than duplicated
+    // because the identity of the field sets *is* the contract: `notice`
+    // differs from `message` by its discriminator and by nothing else, which is
+    // what lets one body budget cover both. Two copies of these checks could
+    // drift apart with no test noticing.
+    case "message":
+    case "notice":
+      return validateDelivery(type, map);
 
     case "receipt": {
       const id = map["id"];
@@ -621,6 +694,33 @@ export function validateServerFrame(value: unknown): ServerFrameOutcome {
         return fieldInvalid("receipt", "status", status);
       }
       return { kind: "frame", frame: { type: "receipt", id, to, status } };
+    }
+
+    case "accepted": {
+      const id = map["id"];
+      if (!isNonEmptyString(id)) return fieldInvalid("accepted", "id", id);
+      // Spelled out per count, as `ready.protocol` is above: both are `u32` on
+      // the wire, and a negative or fractional count is not a smaller number of
+      // recipients but a frame this client should not have believed.
+      const delivered = map["delivered"];
+      if (
+        typeof delivered !== "number" ||
+        !Number.isInteger(delivered) ||
+        delivered < 0 ||
+        delivered > 0xffff_ffff
+      ) {
+        return fieldInvalid("accepted", "delivered", delivered, "a u32");
+      }
+      const shed = map["shed"];
+      if (
+        typeof shed !== "number" ||
+        !Number.isInteger(shed) ||
+        shed < 0 ||
+        shed > 0xffff_ffff
+      ) {
+        return fieldInvalid("accepted", "shed", shed, "a u32");
+      }
+      return { kind: "frame", frame: { type: "accepted", id, delivered, shed } };
     }
 
     case "error": {
@@ -656,6 +756,50 @@ export function validateServerFrame(value: unknown): ServerFrameOutcome {
       };
     }
   }
+}
+
+/**
+ * Validates one delivery frame, of either class.
+ *
+ * Built per class rather than from one object with a union discriminator,
+ * because TypeScript checks an object literal against each member of a target
+ * union separately: `{ type: "message" | "notice", ... }` is assignable to
+ * neither {@link MessageFrame} nor {@link NoticeFrame} on its own. The checks
+ * above the branch are what this function exists to share.
+ */
+function validateDelivery(
+  type: DeliveryFrame["type"],
+  map: Record<string, unknown>,
+): ServerFrameOutcome {
+  const id = map["id"];
+  if (!isNonEmptyString(id)) return fieldInvalid(type, "id", id);
+  const from = map["from"];
+  if (!isNonEmptyString(from)) return fieldInvalid(type, "from", from);
+  const body = map["body"];
+  if (typeof body !== "string") {
+    return fieldInvalid(type, "body", body, "a string");
+  }
+  const replyTo = optionalString(map, "reply_to");
+  if (replyTo.kind === "invalid") {
+    return fieldInvalid(type, "reply_to", map["reply_to"], "a string");
+  }
+
+  if (type === "notice") {
+    return {
+      kind: "frame",
+      frame:
+        replyTo.value === null
+          ? { type: "notice", id, from, body }
+          : { type: "notice", id, from, body, reply_to: replyTo.value },
+    };
+  }
+  return {
+    kind: "frame",
+    frame:
+      replyTo.value === null
+        ? { type: "message", id, from, body }
+        : { type: "message", id, from, body, reply_to: replyTo.value },
+  };
 }
 
 /**
