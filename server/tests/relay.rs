@@ -986,9 +986,9 @@ async fn an_over_budget_announcement_harms_nobody_else() {
         .expect_error_then_close(ErrorCode::FrameTooLarge)
         .await;
 
-    // The point of checking the budget on the way in, now sharper for a fanout
-    // than for a send: one over-budget frame would otherwise have been discovered
-    // once per recipient, on each of their connections.
+    // Both recipients survive because the announcer was refused before anything
+    // was routed, not because a recipient's writer is shielded: a fanout encodes
+    // once on the announcer's own task, so an unencodable frame fails there.
     for (name, peer) in [("first", &mut first), ("second", &mut second)] {
         assert_eq!(
             peer.recv_within(QUIET).await,
@@ -1190,6 +1190,54 @@ async fn an_announced_body_at_the_relayable_budget_is_delivered_intact() {
         }
         other => panic!("expected a notice, received {other:?}"),
     }
+}
+
+/// An `announce` carrying fields the relay does not define, the way a newer or
+/// buggier client might.
+#[derive(Serialize)]
+struct AnnounceWithExtras<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    id: &'a str,
+    body: &'a str,
+    priority: u32,
+    from: &'a str,
+}
+
+#[tokio::test]
+async fn unknown_fields_are_ignored_and_an_announced_sender_identity_is_not_trusted() {
+    let relay = Relay::start().await;
+    let here = room("announce-extras");
+
+    let mut announcer = Client::join(&relay, &here, "macbook-reviewer").await;
+    let mut recipient = Client::join(&relay, &here, "windows-main").await;
+
+    let payload = protocol::encode(&AnnounceWithExtras {
+        kind: "announce",
+        id: "a1",
+        body: "with extras",
+        priority: 9,
+        from: "impersonated",
+    })
+    .expect("encode");
+    announcer.send_payload(payload.to_vec()).await;
+
+    assert_eq!(announcer.recv().await, accepted("a1", 1, 0));
+    let delivered = recipient.recv().await;
+    assert_eq!(
+        delivered,
+        notice("a1", "macbook-reviewer", "with extras"),
+        "an unknown field must be ignored and `from` must be the announcer's registered \
+         peer name"
+    );
+    // Stated separately from the equality above because it is the stronger
+    // property: the forged name must reach no field of the notice, not merely
+    // lose to the registered one in `from`.
+    assert!(
+        !format!("{delivered:?}").contains("impersonated"),
+        "a client-supplied sender identity must not survive anywhere in the delivered \
+         frame; observed {delivered:?}"
+    );
 }
 
 // -------------------------------------------------------------- replacement
@@ -2057,7 +2105,11 @@ async fn an_oversized_reply_to_cannot_close_the_recipient() {
 
     // The body budget guards `body` only. An oversized `reply_to` with an empty
     // body passes every check, and the `message` built from it exceeds the frame
-    // cap -- so the encode failure would land on the recipient.
+    // cap -- so without this check the sender's own routing call would fail to
+    // encode it and `refuse_unwritable` would close the sender with a generic
+    // `frame_too_large`. The check is what turns that into the recoverable
+    // `invalid_identifier` naming the offending field, which is what the
+    // assertion below pins.
     let payload = send_payload_with_long_reply_to(MAX_FRAME_BYTES, "recipient");
     assert_eq!(payload.len(), MAX_FRAME_BYTES, "fixture size");
     sender.send_payload(payload).await;
@@ -2237,8 +2289,9 @@ async fn a_body_one_byte_over_the_budget_is_refused_and_the_recipient_survives()
         .expect_error_then_close(ErrorCode::FrameTooLarge)
         .await;
 
-    // The point of the budget: the sender's mistake must not reach, or close,
-    // the recipient's connection.
+    // The recipient survives because the sender was refused before anything was
+    // routed, not because its writer is protected: a delivery is encoded on the
+    // sender's own routing call, so the failure never reaches here.
     assert_eq!(
         recipient.recv_within(QUIET).await,
         None,
