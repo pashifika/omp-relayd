@@ -34,6 +34,13 @@ pub const MAX_IDENTIFIER_BYTES: usize = 64;
 /// UTF-8 bytes.
 pub const MAX_CORRELATION_BYTES: usize = 128;
 
+/// Length of a payload address in its unpadded base64url form.
+///
+/// A SHA-256 digest is 256 bits, which is 43 characters unpadded — 21 fewer
+/// than hex for the same bits, in an alphabet that excludes `/`, `+`, and `=`
+/// and so needs no escaping as a URL path component.
+pub const DIGEST_CHARS: usize = 43;
+
 /// Headroom reserved for the worst-case `message` envelope.
 ///
 /// The worst case is a maximal `id` and `reply_to` (128 bytes each), a maximal
@@ -705,6 +712,59 @@ pub fn validate_correlation_id(value: &str) -> Result<(), IdentifierError> {
             limit: MAX_CORRELATION_BYTES,
             found: value.len(),
         });
+    }
+    Ok(())
+}
+
+/// Why a digest was rejected.
+///
+/// Its own type rather than [`IdentifierError`], because a digest is neither an
+/// identifier nor a correlation token: it has one exact length and one closed
+/// alphabet, and reporting "too long" for a 44-character value would describe a
+/// limit that does not exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DigestError {
+    /// Not exactly [`DIGEST_CHARS`] characters.
+    #[error("must be exactly {DIGEST_CHARS} characters, found {found}")]
+    WrongLength {
+        /// Characters found.
+        found: usize,
+    },
+    /// Contains a character outside the unpadded base64url alphabet.
+    #[error("contains {character:?}, which is not unpadded base64url")]
+    NotBase64Url {
+        /// The first offending character.
+        character: char,
+    },
+}
+
+/// Validates a payload address.
+///
+/// Exactly [`DIGEST_CHARS`] characters of unpadded base64url: `A`-`Z`, `a`-`z`,
+/// `0`-`9`, `-`, and `_`. Separate from [`validate_identifier`] and
+/// [`validate_correlation_id`] because a digest is neither: it is a fixed-width
+/// encoding of 256 bits, so its rule is an equality rather than a limit.
+///
+/// The alphabet is what makes a digest safe as a URL path component with no
+/// escaping, and the exact length is what stops one being a relative path
+/// segment: `.` and `..` fail on length, `/` and `=` fail on alphabet.
+///
+/// # Errors
+///
+/// Returns the first rule the value breaks, length before alphabet.
+pub fn validate_digest(value: &str) -> Result<(), DigestError> {
+    // Counted in characters rather than bytes so a multi-byte character is
+    // reported as the alphabet violation it is, not as a length that happens to
+    // differ.
+    let found = value.chars().count();
+    if found != DIGEST_CHARS {
+        return Err(DigestError::WrongLength { found });
+    }
+    if let Some(character) = value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(DigestError::NotBase64Url { character });
     }
     Ok(())
 }

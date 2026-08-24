@@ -6,13 +6,15 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use omp_relayd::blob;
 use omp_relayd::protocol::{self, ClientFrame, PROTOCOL_VERSION, RoomId, ServerFrame};
 use omp_relayd::relay::{self, Deadlines, ServerState};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -32,31 +34,98 @@ pub struct Relay {
     pub addr: SocketAddr,
     /// The registry the relay is using, for assertions that look inside.
     pub state: Arc<ServerState>,
+    store: Option<Arc<blob::Store>>,
+    store_base: Option<PathBuf>,
+    maintenance: Option<blob::Maintenance>,
     shutdown: watch::Sender<bool>,
     accept_loop: Option<JoinHandle<()>>,
 }
 
 impl Relay {
-    /// Starts a relay with the protocol's deadlines.
+    /// Starts a relay with the protocol's deadlines and no payload store.
     pub async fn start() -> Self {
         Self::with_deadlines(Deadlines::default()).await
     }
 
     /// Starts a relay with deadlines shortened for a timeout test.
     pub async fn with_deadlines(deadlines: Deadlines) -> Self {
+        Self::build(deadlines, None).await
+    }
+
+    /// Starts a relay with a payload store rooted in its own temporary
+    /// directory.
+    ///
+    /// `name` distinguishes one test's store from another's, which matters more
+    /// than usual here: a store's first act is to remove whatever a predecessor
+    /// of the same name left behind, so two tests sharing a name would remove
+    /// each other's payloads.
+    pub async fn with_store(name: &str) -> Self {
+        Self::with_store_and_deadlines(name, Deadlines::default()).await
+    }
+
+    /// A store-backed relay whose deadlines a timeout test can shorten.
+    pub async fn with_store_and_deadlines(name: &str, deadlines: Deadlines) -> Self {
+        let base =
+            std::env::temp_dir().join(format!("omp-relayd-it-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (store, maintenance) = blob::Store::open(&base, name)
+            .await
+            .expect("the payload store opens");
+        let mut relay = Self::build(deadlines, Some(Arc::clone(&store))).await;
+        relay.store = Some(store);
+        relay.store_base = Some(base);
+        relay.maintenance = Some(maintenance);
+        relay
+    }
+
+    async fn build(deadlines: Deadlines, blobs: Option<Arc<blob::Store>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind an ephemeral loopback port");
         let addr = listener.local_addr().expect("read the bound address");
-        let state = Arc::new(ServerState::with_deadlines(deadlines));
+        let mut state = ServerState::with_deadlines(deadlines);
+        if let Some(blobs) = blobs {
+            state = state.with_blobs(blobs);
+        }
+        let state = Arc::new(state);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let accept_loop = tokio::spawn(relay::serve(listener, Arc::clone(&state), shutdown_rx));
 
         Self {
             addr,
             state,
+            store: None,
+            store_base: None,
+            maintenance: None,
             shutdown,
             accept_loop: Some(accept_loop),
+        }
+    }
+
+    /// The payload store, for a test that reserves or inspects directly.
+    pub fn store(&self) -> &Arc<blob::Store> {
+        self.store
+            .as_ref()
+            .expect("this relay was started without a payload store")
+    }
+
+    /// Reserves `bytes` under `digest`, as a `reserve` frame will once one
+    /// exists.
+    pub fn reserve(&self, room: &RoomId, digest: &str, bytes: u64) -> blob::Grant {
+        self.store()
+            .reserve(room, digest, bytes)
+            .expect("the reservation is granted")
+    }
+
+    /// Performs the removals the store has queued, so a test can assert the
+    /// filesystem rather than the queue.
+    ///
+    /// Deliberately not `Maintenance::run` to completion: its shutdown path
+    /// removes the whole store root, which would make every filesystem
+    /// assertion after it vacuously true.
+    pub async fn drain_removals(&mut self) {
+        if let Some(maintenance) = self.maintenance.as_mut() {
+            maintenance.drain().await;
         }
     }
 
@@ -77,6 +146,176 @@ impl Drop for Relay {
         // A test that never calls `shutdown` must not leave the accept loop
         // running for the rest of the binary.
         let _ = self.shutdown.send(true);
+        // Nor leave a store directory in the platform's temporary directory:
+        // the store removes its own root only on a graceful maintenance
+        // shutdown, which most tests never reach.
+        if let Some(base) = self.store_base.take() {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+}
+
+/// One HTTP response, as a transfer test needs to see it.
+#[derive(Debug)]
+pub struct HttpResponse {
+    /// Status code.
+    pub status: u16,
+    /// Header names lowercased, values as sent.
+    pub headers: Vec<(String, String)>,
+    /// Body bytes, empty for a `HEAD` or a status-only answer.
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// First value of `name`, which is lowercased before the lookup.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A transfer route for `room` and `digest`, with the room's components
+/// percent-encoded as a client must send them.
+pub fn blob_path(room: &RoomId, digest: &str) -> String {
+    format!(
+        "/blob/{}/{}/{digest}",
+        percent_encode(&room.project),
+        percent_encode(&room.task)
+    )
+}
+
+/// Percent-encodes everything outside the unreserved set, and `.` as well.
+///
+/// `encodeURIComponent` leaves `.` alone, which would put a literal `..` in the
+/// path of a room named `..`/`..` -- admissible under every identifier rule. The
+/// store hashes the room's components, so nothing can traverse either way; what
+/// a literal `..` would break is reachability, because any intermediary that
+/// normalizes a path would rewrite the route out from under the request.
+/// Encoding the dot makes the segment opaque to normalization.
+pub fn percent_encode(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'~') {
+            out.push(char::from(*byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// Sends one request and reads the whole answer.
+///
+/// Reads while it writes, which is what a real HTTP client does and what this
+/// surface requires: a `PUT` refused before its body is read is answered at
+/// once and the connection closes, so a client that finished writing before it
+/// started reading would lose the answer to a connection reset. A write failure
+/// is therefore an expected outcome here rather than a test failure.
+///
+/// The write half is closed after the body, so a server still waiting on a
+/// declared length that will never arrive sees an end rather than a stall.
+///
+/// One request per connection with `Connection: close`, so the body is whatever
+/// arrives before the end and no response framing is reimplemented here.
+pub async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+) -> HttpResponse {
+    let stream = TcpStream::connect(addr)
+        .await
+        .expect("connect to the relay");
+    let (mut reading, mut writing) = stream.into_split();
+
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        let _ = std::fmt::Write::write_fmt(&mut request, format_args!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    let body = body.to_vec();
+
+    let writer = tokio::spawn(async move {
+        writing.write_all(request.as_bytes()).await?;
+        if !body.is_empty() {
+            writing.write_all(&body).await?;
+        }
+        writing.flush().await?;
+        writing.shutdown().await
+    });
+
+    let mut raw = Vec::new();
+    let read = timeout(READ_TIMEOUT, reading.read_to_end(&mut raw))
+        .await
+        .expect("the response arrives");
+    // Ignored deliberately: see above.
+    let _ = writer.await;
+
+    assert!(
+        !(read.is_err() && raw.is_empty()),
+        "the connection failed before any response arrived: {read:?}"
+    );
+    parse_response(&raw)
+}
+
+/// A `PUT` declaring `body.len()` bytes and sending them.
+pub async fn http_put(addr: SocketAddr, path: &str, body: &[u8]) -> HttpResponse {
+    http(
+        addr,
+        "PUT",
+        path,
+        &[("Content-Length", body.len().to_string())],
+        body,
+    )
+    .await
+}
+
+/// A `PUT` whose declared length is chosen independently of what it sends.
+pub async fn http_put_declaring(
+    addr: SocketAddr,
+    path: &str,
+    declared: usize,
+    body: &[u8],
+) -> HttpResponse {
+    http(
+        addr,
+        "PUT",
+        path,
+        &[("Content-Length", declared.to_string())],
+        body,
+    )
+    .await
+}
+
+/// Splits a raw response into status, headers, and body.
+fn parse_response(raw: &[u8]) -> HttpResponse {
+    let separator = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header terminator in {} bytes", raw.len()));
+    let head = std::str::from_utf8(&raw[..separator]).expect("headers are UTF-8");
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().expect("a status line");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status code in {status_line:?}"));
+
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+
+    HttpResponse {
+        status,
+        headers,
+        body: raw[separator + 4..].to_vec(),
     }
 }
 

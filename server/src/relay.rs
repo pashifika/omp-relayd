@@ -20,12 +20,13 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until, timeout};
 
+use crate::blob;
 use crate::protocol::{
     self, ClientFrame, ErrorCode, PROTOCOL_VERSION, ReceiptStatus, RoomId, ServerFrame,
 };
@@ -167,6 +168,10 @@ pub struct ServerState {
     rooms: RwLock<Rooms>,
     next_connection_id: AtomicU64,
     deadlines: Deadlines,
+    /// Absent when the relay runs without a payload store, which is every unit
+    /// test that does not exercise one. Routing never consults it: a reference
+    /// is relayed uninterpreted.
+    blobs: Option<Arc<blob::Store>>,
 }
 
 impl Default for ServerState {
@@ -176,7 +181,7 @@ impl Default for ServerState {
 }
 
 impl ServerState {
-    /// Empty registry with the protocol's deadlines.
+    /// Empty registry with the protocol's deadlines and no payload store.
     pub fn new() -> Self {
         Self::with_deadlines(Deadlines::default())
     }
@@ -188,7 +193,20 @@ impl ServerState {
             // Ids start at 1 so that 0 is never a live connection.
             next_connection_id: AtomicU64::new(1),
             deadlines,
+            blobs: None,
         }
+    }
+
+    /// Attaches the payload store whose rooms this registry's rooms govern.
+    #[must_use]
+    pub fn with_blobs(mut self, blobs: Arc<blob::Store>) -> Self {
+        self.blobs = Some(blobs);
+        self
+    }
+
+    /// The payload store, when one is attached.
+    pub fn blobs(&self) -> Option<&Arc<blob::Store>> {
+        self.blobs.as_ref()
     }
 
     /// The deadlines this relay enforces.
@@ -255,20 +273,45 @@ impl ServerState {
     /// evicting the replacement that already took its name. Returns whether an
     /// entry was removed.
     fn deregister(&self, room: &RoomId, peer: &str, connection_id: u64) -> bool {
-        let mut rooms = self.write_rooms();
+        let emptied = {
+            let mut rooms = self.write_rooms();
 
-        let Some(peers) = rooms.get_mut(room) else {
-            return false;
+            let Some(peers) = rooms.get_mut(room) else {
+                return false;
+            };
+            if peers.get(peer).map(|handle| handle.connection_id) != Some(connection_id) {
+                return false;
+            }
+            peers.remove(peer);
+
+            // An emptied room is dropped so that a long-lived relay's memory
+            // tracks live peers rather than every room name it has ever seen.
+            let emptied = peers.is_empty();
+            if emptied {
+                rooms.remove(room);
+            }
+            emptied
         };
-        if peers.get(peer).map(|handle| handle.connection_id) != Some(connection_id) {
-            return false;
-        }
-        peers.remove(peer);
 
-        // An emptied room is dropped so that a long-lived relay's memory
-        // tracks live peers rather than every room name it has ever seen.
-        if peers.is_empty() {
-            rooms.remove(room);
+        // Outside the registry guard: `forget_room` takes the store's own lock,
+        // and holding two is a lock order nothing else needs to know about.
+        //
+        // Immediate, and that is the specified rule rather than the preferred
+        // one. A grace period is genuinely wanted -- a room can empty for a few
+        // seconds without anyone intending it to end, one peer finishing while
+        // another is mid-reconnect, and a payload removed in that window reports
+        // itself to the recipient as expired, which is somebody else's cause.
+        // The reason it is not here, the two flows that lose a payload, the four
+        // constraints such a timer must respect -- the configuration stance, the
+        // payload time to live it must not extend past, the offline-queue rule it
+        // must not become, and the bound on retained room names -- and the two
+        // layers it could live at are recorded in
+        // `local_docs/omp-relay-room-idle-close/README.md`. Read that before
+        // adding a timer here: a naive one breaks the payload time to live.
+        if emptied {
+            if let Some(blobs) = &self.blobs {
+                blobs.forget_room(room);
+            }
         }
         true
     }
@@ -487,7 +530,7 @@ pub async fn serve(
                         tracing::debug!(%peer_addr, %error, "could not disable Nagle batching");
                     }
                     tracing::info!(%peer_addr, "connection accepted");
-                    connections.spawn(run_connection(
+                    connections.spawn(dispatch(
                         stream,
                         Arc::clone(&state),
                         child_shutdown.clone(),
@@ -519,6 +562,98 @@ pub async fn serve(
             "graceful shutdown: exiting without waiting further"
         );
     }
+}
+
+/// Sends one accepted connection to the protocol its first byte names.
+///
+/// The discrimination is exact rather than heuristic:
+///
+/// ```text
+///   valid frame length  <=  65536  =  0x00010000
+///                               ^
+///                               every valid length prefix begins with 0x00
+///
+///   every HTTP method begins with printable ASCII  ("G" = 0x47)
+/// ```
+///
+/// It is also a distinction the framing layer already drew. A `GET / HTTP/1.1`
+/// sent to this port before this change declared a length of 0x47455420 --
+/// 1195725856 bytes -- exceeded the cap, and was answered `frame_too_large`. So
+/// this adds a branch rather than a new classification.
+///
+/// The byte is read with [`TcpStream::peek`], which leaves it in the socket's
+/// queue. That answers the design's open question -- whether `hyper` can be
+/// handed a pushed-back byte or needs a replaying reader -- by making the
+/// question moot: neither protocol ever learns that anything looked first, so
+/// there is no wrapping reader to maintain and nothing that could desynchronize
+/// a stream by replaying a byte twice.
+///
+/// The peek is bounded by the handshake deadline, because until a byte arrives
+/// the relay cannot tell a slow client from a silent one, and a silent
+/// connection must still be closed with its cause stated.
+async fn dispatch(
+    stream: TcpStream,
+    state: Arc<ServerState>,
+    shutdown: watch::Receiver<bool>,
+    peer_addr: SocketAddr,
+) {
+    let deadlines = state.deadlines();
+    let mut first = [0_u8; 1];
+    // Cloned so the receiver handed to whichever protocol takes this connection
+    // is untouched by this wait.
+    let mut waiting = shutdown.clone();
+
+    let peeked = tokio::select! {
+        () = wait_for_flag(&mut waiting) => return,
+        peeked = timeout(deadlines.hello, stream.peek(&mut first)) => peeked,
+    };
+
+    match peeked {
+        // Nothing arrived. The frame protocol is what a silent connection would
+        // most likely have spoken, and its handshake deadline is the one that
+        // just elapsed, so the close states that cause rather than a generic
+        // one.
+        Err(_elapsed) => {
+            tracing::info!(%peer_addr, deadline = ?deadlines.hello, "handshake deadline elapsed");
+            let (_reader, mut writer) = protocol::framed_split(stream);
+            close_with(
+                &mut writer,
+                ErrorCode::HelloTimeout,
+                format!("no hello within {:?}", deadlines.hello),
+            )
+            .await;
+            return;
+        }
+        // Hung up before saying anything: nothing to diagnose.
+        Ok(Ok(0)) => return,
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%peer_addr, %error, "could not read the first byte");
+            return;
+        }
+    }
+
+    // A zero first byte is a length prefix. So is every byte of a frame
+    // connection's first four, but one is enough to separate the two protocols.
+    if first[0] == 0 {
+        run_connection(stream, state, shutdown, peer_addr).await;
+        return;
+    }
+
+    let Some(blobs) = state.blobs() else {
+        // No payload store, so the frame protocol is all this relay speaks.
+        // Handed on unchanged, which reports the over-long frame this is.
+        tracing::debug!(
+            %peer_addr,
+            first_byte = first[0],
+            "no payload store; reading as a frame connection"
+        );
+        run_connection(stream, state, shutdown, peer_addr).await;
+        return;
+    };
+
+    tracing::debug!(%peer_addr, "connection taken as a payload transfer");
+    crate::http::serve_connection(stream, Arc::clone(blobs), peer_addr).await;
 }
 
 /// Drives one client connection from handshake to close.
@@ -1755,6 +1890,8 @@ async fn wait_for_flag(flag: &mut watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::*;
@@ -2390,5 +2527,114 @@ mod tests {
             vec![large, diagnostic],
             "the cancelled frame must arrive whole and be followed by the diagnostic"
         );
+    }
+
+    /// A store rooted in its own temporary directory, attached to a registry.
+    async fn state_with_store(name: &str) -> (Arc<ServerState>, Arc<blob::Store>, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "omp-relayd-relay-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let (store, _maintenance) = blob::Store::open(&base, name)
+            .await
+            .expect("the payload store opens");
+        let state = Arc::new(ServerState::new().with_blobs(Arc::clone(&store)));
+        (state, store, base)
+    }
+
+    /// Stores `bytes` in `room` through the store's own reserve-and-upload path.
+    async fn store_payload(store: &Arc<blob::Store>, room: &RoomId, bytes: &[u8]) -> String {
+        let address = blob::digest(bytes);
+        store
+            .reserve(room, &address, bytes.len() as u64)
+            .expect("the reservation is granted");
+        let blob::Accepted::Upload(mut upload) = store
+            .begin_upload(room, &address, bytes.len() as u64)
+            .expect("the upload is accepted")
+        else {
+            panic!("nothing is held yet");
+        };
+        upload.write(bytes).await.expect("the chunk is written");
+        upload.finish().await.expect("the upload finishes");
+        address
+    }
+
+    /// 1.9: the removal rides the registry event the relay already observes.
+    #[tokio::test]
+    async fn the_last_peer_leaving_takes_the_rooms_payloads_with_it() {
+        let (state, store, base) = state_with_store("room-drop").await;
+        let room = room();
+        let address = store_payload(&store, &room, b"a diff worth reviewing").await;
+        assert_eq!(
+            store.payload_len(&room, &address),
+            Some(22),
+            "the payload was not stored"
+        );
+
+        let (outbound, _rx) = peer_queue();
+        let (registration, _evicted) = register_in(&state, &room, "macbook", outbound);
+        assert!(
+            state.deregister(&room, "macbook", registration.connection_id),
+            "the peer was not registered"
+        );
+
+        assert_eq!(
+            store.payload_len(&room, &address),
+            None,
+            "an emptied room kept its payloads fetchable"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other half of the same rule: a room that still holds a peer keeps
+    /// its payloads, so the removal is triggered by emptying rather than by any
+    /// departure.
+    #[tokio::test]
+    async fn a_room_that_still_holds_a_peer_keeps_its_payloads() {
+        let (state, store, base) = state_with_store("room-still-held").await;
+        let room = room();
+        let address = store_payload(&store, &room, b"a log bundle").await;
+
+        let (first, _first_rx) = peer_queue();
+        let (second, _second_rx) = peer_queue();
+        let (leaving, _evicted_a) = register_in(&state, &room, "macbook", first);
+        let (_staying, _evicted_b) = register_in(&state, &room, "linux-box", second);
+
+        assert!(state.deregister(&room, "macbook", leaving.connection_id));
+        assert_eq!(
+            store.payload_len(&room, &address),
+            Some(12),
+            "a departure that did not empty the room removed its payloads"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A superseded connection's late deregistration must not take the
+    /// replacement's payloads: it does not remove the registry entry, so it must
+    /// not remove the room's bytes either.
+    #[tokio::test]
+    async fn a_superseded_connection_leaves_the_rooms_payloads_alone() {
+        let (state, store, base) = state_with_store("room-superseded").await;
+        let room = room();
+        let address = store_payload(&store, &room, b"still wanted").await;
+
+        let (first, _first_rx) = peer_queue();
+        let (second, _second_rx) = peer_queue();
+        let (superseded, _evicted_a) = register_in(&state, &room, "macbook", first);
+        let (_replacement, _evicted_b) = register_in(&state, &room, "macbook", second);
+
+        assert!(
+            !state.deregister(&room, "macbook", superseded.connection_id),
+            "the superseded connection removed the replacement's entry"
+        );
+        assert_eq!(
+            store.payload_len(&room, &address),
+            Some(12),
+            "a superseded connection removed the replacement's payloads"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
