@@ -1701,9 +1701,9 @@ describe("the session runtime", () => {
 
       // Explicit `steer`, even while idle. Omitting `deliverAs` would enter
       // `AgentSession.prompt()`, whose non-streaming path auto-reads `@filepath`
-      // mentions (agent-session.ts:5789-5798). A queued steer schedules the idle
-      // drain and may resume from any transcript tail
-      // (agent-session.ts:6204-6228, 6247-6253), so it still starts a turn.
+      // mentions (agent-session.ts:5811-5820 in OMP 18.0.4). A queued steer
+      // schedules the idle drain and may resume from any transcript tail
+      // (agent-session.ts:6226-6250, 6269-6275), so it still starts a turn.
       expect(harness.calls.userMessages).toEqual([
         { content: NOTICE_TEXT, options: { deliverAs: "steer" } },
       ]);

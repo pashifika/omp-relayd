@@ -806,14 +806,15 @@ export default function ompRelay(pi: ExtensionAPI): void {
           // A `message` always steers: `deliverAs: "steer"` queues on the
           // steering queue, and the runtime's drain gate resumes from *any*
           // transcript tail when that queue is non-empty
-          // (agent-session.ts:6247-6253), so it starts a turn on an idle
-          // session and steers into a running one.
+          // (agent-session.ts:6269-6275 in OMP 18.0.4), so it starts a turn on
+          // an idle session and steers into a running one.
           //
           // A `notice` must not interrupt work in flight, so it defers with
           // `followUp` while the model is streaming. Idle, it steers -- there is
           // nothing to interrupt, and `followUp` would not start a turn at all:
           // a follow-up-only resume needs an `assistant`/`toolResult` tail
-          // (agent-session.ts:6259-6265), which a fresh session does not have.
+          // (agent-session.ts:6281-6288 in OMP 18.0.4), which a fresh session
+          // does not have.
           //
           // The idle test can race a run that begins before the delivery lands,
           // in which case the notice becomes a steer into it. Accepted rather
@@ -843,10 +844,11 @@ export default function ompRelay(pi: ExtensionAPI): void {
           // `developer` (compaction/messages.ts:194-211), ranking a remote peer
           // above the local operator. Not a bare `sendUserMessage`: with no
           // `deliverAs` it takes the prompt path, which auto-reads `@path` file
-          // mentions out of the remote body (agent-session.ts:5789-5798) — and
-          // neither `expandPromptTemplates: false` nor the `> ` body quoting
-          // stops that, because a preceding space already satisfies the mention
-          // boundary. That applies to a notice exactly as it does to a message,
+          // mentions out of the remote body (agent-session.ts:5811-5820 in OMP
+          // 18.0.4) — and neither `expandPromptTemplates: false` nor the
+          // `> ` body quoting stops that, because a preceding space already
+          // satisfies the mention boundary. That applies to a notice exactly
+          // as it does to a message,
           // which is why the idle branch here is `steer` and not an omitted
           // `deliverAs`.
           pi.sendUserMessage(injection.text, {
