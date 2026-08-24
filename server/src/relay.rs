@@ -20,7 +20,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -530,7 +530,7 @@ pub async fn serve(
                         tracing::debug!(%peer_addr, %error, "could not disable Nagle batching");
                     }
                     tracing::info!(%peer_addr, "connection accepted");
-                    connections.spawn(run_connection(
+                    connections.spawn(dispatch(
                         stream,
                         Arc::clone(&state),
                         child_shutdown.clone(),
@@ -562,6 +562,98 @@ pub async fn serve(
             "graceful shutdown: exiting without waiting further"
         );
     }
+}
+
+/// Sends one accepted connection to the protocol its first byte names.
+///
+/// The discrimination is exact rather than heuristic:
+///
+/// ```text
+///   valid frame length  <=  65536  =  0x00010000
+///                               ^
+///                               every valid length prefix begins with 0x00
+///
+///   every HTTP method begins with printable ASCII  ("G" = 0x47)
+/// ```
+///
+/// It is also a distinction the framing layer already drew. A `GET / HTTP/1.1`
+/// sent to this port before this change declared a length of 0x47455420 --
+/// 1195725856 bytes -- exceeded the cap, and was answered `frame_too_large`. So
+/// this adds a branch rather than a new classification.
+///
+/// The byte is read with [`TcpStream::peek`], which leaves it in the socket's
+/// queue. That answers the design's open question -- whether `hyper` can be
+/// handed a pushed-back byte or needs a replaying reader -- by making the
+/// question moot: neither protocol ever learns that anything looked first, so
+/// there is no wrapping reader to maintain and nothing that could desynchronize
+/// a stream by replaying a byte twice.
+///
+/// The peek is bounded by the handshake deadline, because until a byte arrives
+/// the relay cannot tell a slow client from a silent one, and a silent
+/// connection must still be closed with its cause stated.
+async fn dispatch(
+    stream: TcpStream,
+    state: Arc<ServerState>,
+    shutdown: watch::Receiver<bool>,
+    peer_addr: SocketAddr,
+) {
+    let deadlines = state.deadlines();
+    let mut first = [0_u8; 1];
+    // Cloned so the receiver handed to whichever protocol takes this connection
+    // is untouched by this wait.
+    let mut waiting = shutdown.clone();
+
+    let peeked = tokio::select! {
+        () = wait_for_flag(&mut waiting) => return,
+        peeked = timeout(deadlines.hello, stream.peek(&mut first)) => peeked,
+    };
+
+    match peeked {
+        // Nothing arrived. The frame protocol is what a silent connection would
+        // most likely have spoken, and its handshake deadline is the one that
+        // just elapsed, so the close states that cause rather than a generic
+        // one.
+        Err(_elapsed) => {
+            tracing::info!(%peer_addr, deadline = ?deadlines.hello, "handshake deadline elapsed");
+            let (_reader, mut writer) = protocol::framed_split(stream);
+            close_with(
+                &mut writer,
+                ErrorCode::HelloTimeout,
+                format!("no hello within {:?}", deadlines.hello),
+            )
+            .await;
+            return;
+        }
+        // Hung up before saying anything: nothing to diagnose.
+        Ok(Ok(0)) => return,
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%peer_addr, %error, "could not read the first byte");
+            return;
+        }
+    }
+
+    // A zero first byte is a length prefix. So is every byte of a frame
+    // connection's first four, but one is enough to separate the two protocols.
+    if first[0] == 0 {
+        run_connection(stream, state, shutdown, peer_addr).await;
+        return;
+    }
+
+    let Some(blobs) = state.blobs() else {
+        // No payload store, so the frame protocol is all this relay speaks.
+        // Handed on unchanged, which reports the over-long frame this is.
+        tracing::debug!(
+            %peer_addr,
+            first_byte = first[0],
+            "no payload store; reading as a frame connection"
+        );
+        run_connection(stream, state, shutdown, peer_addr).await;
+        return;
+    };
+
+    tracing::debug!(%peer_addr, "connection taken as a payload transfer");
+    crate::http::serve_connection(stream, Arc::clone(blobs), peer_addr).await;
 }
 
 /// Drives one client connection from handshake to close.

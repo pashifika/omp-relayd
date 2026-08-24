@@ -11,6 +11,8 @@
 //! * [`relay`] owns the registry, routing, and the per-connection task.
 //! * [`blob`] owns the room-scoped payload store: content addressing, the
 //!   ceilings, the time to live, and the removal rules.
+//! * [`http`] owns payload transfer, which shares the frame listener because
+//!   two ports would be two exposure decisions.
 //!
 //! The binary is a thin wrapper: it resolves a bind address, initializes
 //! logging, opens the store, and hands a listener to [`relay::serve`].
@@ -18,5 +20,6 @@
 //! tests drive a real loopback listener instead of a child process.
 
 pub mod blob;
+pub mod http;
 pub mod protocol;
 pub mod relay;

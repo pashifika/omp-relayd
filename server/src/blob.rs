@@ -162,9 +162,6 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// something this process defines.
 pub const STORE_BASE_DIR: &str = "omp-relayd";
 
-/// Length of a digest in its unpadded base64url form.
-pub const DIGEST_CHARS: usize = 43;
-
 /// Unpadded base64url, whose alphabet excludes `/`, `+`, and `=`, so a digest is
 /// safe as a URL path component with no escaping.
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -959,14 +956,17 @@ impl Maintenance {
         }
     }
 
-    /// Performs every queued removal now.
+    /// Performs every removal queued so far, without shutting down.
     ///
-    /// Test-only, and it exists so a test can assert the filesystem rather than
-    /// the queue: the [`Drop`] path cannot await, so it hands paths to this
-    /// task, and a test that ran the task concurrently would be asserting
-    /// against a race instead of against the rule.
-    #[cfg(test)]
-    async fn drain(&mut self) {
+    /// The removal path exists because [`Drop`] cannot await, so a test that
+    /// asserts the filesystem has to perform the queued work first -- and a test
+    /// that ran [`Self::run`] concurrently would be asserting against a race
+    /// instead of against the rule, while one that ran it to completion would
+    /// find the whole store root removed by its shutdown path.
+    ///
+    /// It is the same loop body [`Self::run`] uses, so nothing here is a
+    /// separate implementation that could drift from production behaviour.
+    pub async fn drain(&mut self) {
         while let Ok(path) = self.removals.try_recv() {
             remove_path(&path).await;
         }
@@ -1209,14 +1209,15 @@ mod tests {
         let value = digest(b"anything");
         assert_eq!(
             value.len(),
-            DIGEST_CHARS,
+            protocol::DIGEST_CHARS,
             "digest {value} has the wrong length"
         );
-        assert!(
-            value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
-            "digest {value} left the base64url alphabet"
+        // The wire rule and the encoder are asserted against each other rather
+        // than each against a literal, so neither can drift alone.
+        assert_eq!(
+            protocol::validate_digest(&value),
+            Ok(()),
+            "the store produced an address the wire rule rejects: {value}"
         );
     }
 

@@ -21,6 +21,30 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
     "std",
 ] }
+# Payload transfer speaks HTTP, and the choice is about the *client* side rather
+# than this one: Bun's `fetch` is built in, `curl` works for diagnosis, a browser
+# can confirm a payload by hand, and `Content-Length` gives a ceiling check
+# before a byte of body is read. A custom framed protocol would need an
+# implementation in both languages and buy none of that.
+#
+# `hyper` with a function service, three routes and one method each. Rejected --
+# `axum`, whose router and tower middleware stack are the parts that would go
+# unused. Rejected -- a hand-written HTTP/1.1 parser, defensible for exactly one
+# route and not for the moment `HEAD` or a future `Range` needs correct header
+# handling; request smuggling and header edge cases are a bad place to economize
+# on a dependency.
+#
+# `hyper-util` is not a fourth choice. `hyper` 1.x deliberately dropped its
+# `tokio` dependency and moved the adapter here, so "hyper 1.x on tokio" is these
+# two crates. Writing the adapter by hand means reimplementing `hyper::rt::Read`
+# over `ReadBufCursor`, which without `unsafe` -- forbidden in this crate -- costs
+# a copy per read and forty lines of pin projection to maintain.
+#
+# All of them are pure Rust with no C build step, which is the cost that ruled
+# out SQLite for a container built natively on two architectures.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 rmp-serde = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 # Pure Rust with no C build step, which is the specific cost that ruled out
@@ -48,7 +72,10 @@ tokio = { version = "1.44", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "0.7", features = ["codec"] }
+# `io` bridges a payload file to a response body without buffering it, so a
+# `GET` streams from the filesystem rather than reading a whole payload into
+# memory first.
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
