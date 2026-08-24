@@ -821,10 +821,12 @@ export class RelayClient {
         { status: reserved.status },
       );
     }
-    // A grant always states a lifetime; `protocol.ts` rejects one that does not,
-    // so this is a total function rather than a default standing in for a
-    // missing field.
-    const expiresIn = reserved.expires_in ?? 0;
+    // `protocol.ts` rejects a grant that states no lifetime, so every grant
+    // reaching here carries one. The cast is what the open `ReserveStatus`
+    // costs -- a non-literal status leaves no discriminant that narrows the
+    // field to present -- and not a default: a `?? 0` here would manufacture
+    // exactly the number that rejection exists to keep a sender from stating.
+    const expiresIn = reserved.expires_in as number;
 
     await this.#transfer("PUT", digest, {
       body: bytes,
@@ -1089,6 +1091,19 @@ export class RelayClient {
    * A `pull` is the runtime asking for more, which it does once the previous
    * chunk has left for the socket — so a pull is evidence the transfer moved,
    * and it is the only such evidence `fetch` offers on the request side.
+   *
+   * Measured, because "the runtime buffers ahead and a pull proves nothing"
+   * is the obvious objection: a 4 MiB `PUT` against a TCP server throttled to
+   * one read per 50 ms produced 64 pulls spread over 587 ms of an 849 ms
+   * transfer, clustering at 482/587/587/587 ms as the sink drained. Buffering
+   * ahead would have finished all 64 in ~15 ms. Bun's `fetch` propagates socket
+   * back-pressure into `pull`, so the bound tracks the network.
+   *
+   * The residual is the tail: ~262 ms elapsed after the final pull while
+   * socket-buffered bytes were still going out, covered by one arming of the
+   * bound. That tail is roughly the socket buffer divided by the link rate, so
+   * it exceeds {@link TRANSFER_STALL_MS} only below about 0.4 Mbit/s — a link
+   * on which a 4 MiB payload was never going to arrive anyway.
    */
   #progressing(
     payload: Uint8Array<ArrayBuffer>,
@@ -1302,17 +1317,22 @@ export class RelayClient {
   }
 
   /**
-   * Routes an `error` frame to the request it answers, or to the connection.
+   * Routes an `error` frame to the request it answers, to the capability it
+   * denies, or to the connection.
    *
    * `wire-protocol` obliges the relay to echo the correlation token of a
    * recoverable rejection, so an error naming a pending request is that
    * request's answer and settles it immediately instead of leaving the caller
    * to wait out the full timeout.
    *
-   * An error that names nothing, or that arrives before `ready`, is about the
-   * connection. Every pre-readiness error is one: the relay rejects a handshake
-   * and closes, so recording the code here is what turns the imminent close
-   * into a stated cause rather than an anonymous disconnect.
+   * A nameless `unsupported_frame` is the exception, and the reason it exists is
+   * that a relay refusing a frame it cannot decode does not know that frame's
+   * correlation field either. See the branch below.
+   *
+   * Any other error that names nothing, or that arrives before `ready`, is about
+   * the connection. Every pre-readiness error is one: the relay rejects a
+   * handshake and closes, so recording the code here is what turns the imminent
+   * close into a stated cause rather than an anonymous disconnect.
    *
    * `peer_replaced` is the one code that ends the run rather than the
    * connection. See the branch below.
@@ -1344,6 +1364,42 @@ export class RelayClient {
           code: frame.code,
         }),
       });
+      if (settled) {
+        return;
+      }
+    }
+
+    // An older relay cannot decode `reserve` at all, so it does not know the
+    // `request_id` field either: its refusal names nothing, and the branch above
+    // never sees it. Answered here as a property of the relay rather than of one
+    // request, which is what a capability is -- every outstanding reservation
+    // gets the same answer because every one of them would get it. Without this
+    // the frame reads as a connection-level report and each caller waits out its
+    // five-second deadline to be told `timeout`, naming a silent relay as the
+    // cause of an answer that had already arrived. `reserve` is the only frame
+    // this can be about: the rest are protocol v1 throughout, so a relay that
+    // completed the handshake knows them.
+    if (
+      frame.code === "unsupported_frame" &&
+      frame.request_id === undefined &&
+      this.#state === "ready"
+    ) {
+      const prefix = `${replySpace("reserve")}:`;
+      let settled = false;
+      for (const key of [...this.#pending.keys()]) {
+        if (!key.startsWith(prefix)) {
+          continue;
+        }
+        // The `relay_error` shape `reserve`'s own handler already translates to
+        // `unsupported`, so the caller-facing wording lives in one place.
+        const answered = this.#settleKey(key, {
+          ok: false,
+          error: new RequestFailed("relay_error", `the relay rejected the request: ${detail}`, {
+            code: frame.code,
+          }),
+        });
+        settled = settled || answered;
+      }
       if (settled) {
         return;
       }

@@ -275,17 +275,23 @@ export type ReserveStatus = KnownReserveStatus | (string & {});
 /**
  * Answer to one `reserve`.
  *
- * `expires_in` accompanies a grant and only a grant. A refusal has no payload
- * and therefore no lifetime, so a number beside one would read as a promise
- * about something that will not exist; a frame carrying both is rejected rather
- * than accepted with the number ignored, because accepting it would let a relay
- * defect become a lifetime a sender then states to a recipient.
+ * `expires_in` accompanies a grant and only a grant, and both halves of that
+ * are enforced rather than assumed. A refusal has no payload and therefore no
+ * lifetime, so a number beside one would read as a promise about something that
+ * will not exist; a grant without one leaves this client with nothing to pass
+ * on. Either shape is rejected rather than accepted and patched over, because a
+ * relay defect must not become a lifetime a sender then states to a recipient
+ * -- whether the defect supplied the number or omitted it.
  */
 export interface ReservedFrame {
   readonly type: "reserved";
   readonly request_id: string;
   readonly status: ReserveStatus;
-  /** Seconds the payload remains fetchable once uploaded. */
+  /**
+   * Seconds the payload remains fetchable once uploaded. Present on every
+   * grant; optional here only because a refusal carries none, which the open
+   * {@link ReserveStatus} leaves no discriminant able to express.
+   */
   readonly expires_in?: number;
 }
 
@@ -835,6 +841,17 @@ export function validateServerFrame(value: unknown): ServerFrameOutcome {
         return {
           kind: "invalid",
           reason: `reserved.expires_in is present with status ${JSON.stringify(status)}, which is not a grant`,
+        };
+      }
+      // And the mirror, for the same reason read from the other side: a grant
+      // states a lifetime or it is not a usable grant. Accepting one that does
+      // not would leave this client inventing the number -- zero, or some
+      // "unknown" -- and a sender would then state that invention to a
+      // recipient as though the relay had said it.
+      if (!stated && status === "granted") {
+        return {
+          kind: "invalid",
+          reason: "reserved.expires_in is absent on a granted reservation, which must state a lifetime",
         };
       }
       return {

@@ -100,6 +100,14 @@ pub const MAX_STORE_BYTES: u64 = 8 * MAX_ROOM_BYTES;
 /// units of the frame cap bounds a room at 512 entries and the process at 4096,
 /// which is 573 KiB.
 ///
+/// A zero-byte reservation is charged one whole unit too, and that is not
+/// rounding for tidiness: `0u64.div_ceil(65536) * 65536` is 0, so a free zero
+/// leaves [`Store::reserve`] inserting an entry per distinct digest against an
+/// accounting that never moves -- and the entry bound above would hold for
+/// non-zero reservations and for nothing else. What this decides is what a zero
+/// *costs*, never whether it is allowed: a zero-length payload is legitimate
+/// and `Upload::commit` has a branch for one.
+///
 /// It costs nothing real. A payload that fits inside
 /// [`protocol::MAX_BODY_BYTES`] did not need to be an attachment: it fits in a
 /// message body, which is the cheaper path in every respect. So the granularity
@@ -246,9 +254,15 @@ pub enum UploadError {
 /// A granted reservation, as the reserving peer needs to see it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grant {
-    /// How long the payload will remain fetchable once uploaded. Stated to the
-    /// reserving peer so a sender can tell a recipient how long the reference
-    /// resolves, which is the whole reason the reply carries anything at all.
+    /// How long the payload will remain fetchable. Stated to the reserving peer
+    /// so a sender can tell a recipient how long the reference resolves, which
+    /// is the whole reason the reply carries anything at all.
+    ///
+    /// For a payload not yet held this is [`PAYLOAD_TIME_TO_LIVE`]; for one the
+    /// store already holds it is the life that payload has left, because a
+    /// lifetime is fixed at upload and never extended. Granting the constant
+    /// for an already-held payload would state a lifetime it does not have --
+    /// and the sender puts this number in front of a recipient.
     pub time_to_live: Duration,
 }
 
@@ -272,14 +286,28 @@ struct Payload {
     expires_at: Instant,
 }
 
+/// One upload in flight, as the index sees it.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    /// Which upload this entry belongs to.
+    ///
+    /// `(room, digest)` is not unique in time: a room can empty and be
+    /// recreated while an upload is in flight, and a later upload of the same
+    /// digest then owns this slot. Without the serial, the first upload's
+    /// [`Drop`] would remove the second's entry and credit its allowance.
+    serial: u64,
+    /// Allowance charged against the room and the process.
+    charged: u64,
+}
+
 /// One room's accounting. The room's *directory* is named by a digest of its
 /// components; this map is memory and is keyed by the room itself.
 #[derive(Debug, Default)]
 struct RoomState {
     reserved: HashMap<String, Reservation>,
-    /// Digest to allowance held by an upload currently in flight. An entry here
-    /// is not fetchable: a fetch reports absent until the rename lands.
-    uploading: HashMap<String, u64>,
+    /// Digest to the upload currently in flight for it. An entry here is not
+    /// fetchable: a fetch reports absent until the rename lands.
+    uploading: HashMap<String, InFlight>,
     stored: HashMap<String, Payload>,
     /// Sum of every allowance above. Maintained rather than recomputed so a
     /// reservation costs one addition instead of a walk.
@@ -304,13 +332,17 @@ struct Index {
 pub struct Store {
     root: PathBuf,
     index: Mutex<Index>,
-    /// Paths handed to [`Maintenance`] for removal. Unbounded because the
-    /// alternative is blocking a [`Drop`] on a filesystem tree, and because
-    /// every entry is bounded by the ceilings that admitted it.
-    removals: mpsc::UnboundedSender<PathBuf>,
-    /// Distinguishes concurrent uploads of the same digest, so two of them
-    /// cannot write the same temporary file.
-    next_temp: AtomicU64,
+    /// Removals handed to [`Maintenance`]. Unbounded because the alternative is
+    /// blocking a [`Drop`] on a filesystem tree, and because every entry is
+    /// bounded by the ceilings that admitted it.
+    removals: mpsc::UnboundedSender<Removal>,
+    /// Serial numbers, for the two places `(room, digest)` is not enough.
+    ///
+    /// It names a temporary file, so two concurrent uploads of one digest cannot
+    /// write the same one; and it identifies an upload, so a guard whose room
+    /// was recreated under it cannot act on a successor's entry. Both are the
+    /// same need: the key is unique among live payloads and not unique in time.
+    next_serial: AtomicU64,
 }
 
 impl Store {
@@ -329,9 +361,24 @@ impl Store {
     /// # Errors
     ///
     /// Returns the first filesystem error that prevents the directory from
-    /// existing, being private, or being empty.
+    /// existing, being private, or being empty. Also refuses a `base` that
+    /// already exists and is not a real directory this user owns, which is what
+    /// keeps the removal above from following someone else's symlink.
     pub async fn open(base: &Path, instance: &str) -> io::Result<(Arc<Self>, Maintenance)> {
         let root = base.join(instance_dir_name(instance));
+
+        // The base comes first, and the order is the fix rather than tidying:
+        // `base` is a predictable path -- the literal `/tmp/omp-relayd` under a
+        // default `TMPDIR` -- so a local user can pre-create it. `remove_dir_all`
+        // refuses to follow a symlinked *root*, but nothing protects a symlinked
+        // *ancestor*, so removing a predecessor's tree beneath an unverified base
+        // is a recursive delete of whatever the base resolves to. Only the final
+        // component is created here; its parents are the platform's temporary
+        // directory and not this store's to police.
+        if let Some(parent) = base.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        create_private_dir_if_absent(base).await?;
 
         // A predecessor's tree, if any. `NotFound` is the ordinary case.
         match fs::remove_dir_all(&root).await {
@@ -342,7 +389,6 @@ impl Store {
             Err(error) => return Err(error),
         }
 
-        fs::create_dir_all(base).await?;
         create_private_dir(&root).await?;
 
         let (removals, receiver) = mpsc::unbounded_channel();
@@ -350,7 +396,7 @@ impl Store {
             root,
             index: Mutex::new(Index::default()),
             removals,
-            next_temp: AtomicU64::new(0),
+            next_serial: AtomicU64::new(0),
         });
         let maintenance = Maintenance {
             store: Arc::clone(&store),
@@ -402,19 +448,29 @@ impl Store {
                     .reserved
                     .get(digest)
                     .map_or(0, |reservation| reservation.charged),
+                // Not a flag but the life this payload has left, which is what
+                // a grant for it must state.
                 state
                     .stored
                     .get(digest)
-                    .is_some_and(|payload| payload.expires_at > now),
+                    .filter(|payload| payload.expires_at > now)
+                    .map(|payload| payload.expires_at.saturating_duration_since(now)),
             ),
-            None => (0, 0, false),
+            None => (0, 0, None),
         };
 
-        if held {
+        if let Some(remaining) = held {
             // Nothing to charge: the payload is already held, and an upload of
             // it will be answered "already held" without writing anything.
+            //
+            // The grant states `remaining` rather than `PAYLOAD_TIME_TO_LIVE`
+            // because a lifetime is fixed at upload and never extended -- see
+            // that constant. Re-attaching an artifact already held is exactly
+            // what content addressing makes common, and a fresh constant here
+            // would be a lifetime the payload does not have, stated by the
+            // sender to a recipient.
             return Ok(Grant {
-                time_to_live: PAYLOAD_TIME_TO_LIVE,
+                time_to_live: remaining,
             });
         }
 
@@ -519,6 +575,9 @@ impl Store {
         }
 
         state.reserved.remove(digest);
+        // One serial per upload, taken while the entry is inserted, so the guard
+        // this returns can prove the entry is still the one it created.
+        let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         match state.uploading.entry(digest.to_owned()) {
             // A concurrent upload of the same digest already holds an
             // allowance; this one returns the reservation's rather than
@@ -530,7 +589,10 @@ impl Store {
                 return Err(UploadRefusal::Unreserved);
             }
             Entry::Vacant(slot) => {
-                slot.insert(reservation.charged);
+                slot.insert(InFlight {
+                    serial,
+                    charged: reservation.charged,
+                });
             }
         }
 
@@ -538,6 +600,7 @@ impl Store {
             store: Arc::clone(self),
             room: room.clone(),
             digest: digest.to_owned(),
+            serial,
             declared,
             hasher: Sha256::new(),
             written: 0,
@@ -548,35 +611,65 @@ impl Store {
     }
 
     /// Returns an in-flight upload's allowance, having stored nothing.
-    fn abandon_upload(&self, room: &RoomId, digest: &str) {
+    ///
+    /// Acts only on the entry `serial` created. A room can empty and be
+    /// recreated while an upload is in flight, and a later upload of the same
+    /// digest then owns this slot: without the check, the abandoned upload would
+    /// remove its successor's entry and credit its allowance, leaving the
+    /// successor to fail its own commit as [`UploadError::RoomGone`] and remove
+    /// a file the index says is stored.
+    fn abandon_upload(&self, room: &RoomId, digest: &str, serial: u64) {
         let mut index = self.index();
         let Index { rooms, charged } = &mut *index;
         let Some(state) = rooms.get_mut(room) else {
             return;
         };
-        if let Some(released) = state.uploading.remove(digest) {
-            state.charged = state.charged.saturating_sub(released);
-            *charged = charged.saturating_sub(released);
+        let mine = state
+            .uploading
+            .get(digest)
+            .copied()
+            .filter(|flight| flight.serial == serial);
+        if let Some(flight) = mine {
+            state.uploading.remove(digest);
+            state.charged = state.charged.saturating_sub(flight.charged);
+            *charged = charged.saturating_sub(flight.charged);
         }
         Self::drop_room_if_idle(&mut index, room);
     }
 
     /// Converts an in-flight upload into a stored payload.
-    fn commit_upload(&self, room: &RoomId, digest: &str, bytes: u64) -> Result<(), UploadError> {
+    ///
+    /// Keyed by `serial` as well as `(room, digest)`, for the reason
+    /// [`Self::abandon_upload`] states: an entry inserted by a *later* upload is
+    /// not this one's to settle.
+    fn commit_upload(
+        &self,
+        room: &RoomId,
+        digest: &str,
+        serial: u64,
+        bytes: u64,
+    ) -> Result<(), UploadError> {
         let mut index = self.index();
         let Index { rooms, charged } = &mut *index;
         let Some(state) = rooms.get_mut(room) else {
             return Err(UploadError::RoomGone);
         };
-        let Some(held) = state.uploading.remove(digest) else {
+        let mine = state
+            .uploading
+            .get(digest)
+            .copied()
+            .filter(|flight| flight.serial == serial);
+        let Some(flight) = mine else {
             return Err(UploadError::RoomGone);
         };
+        state.uploading.remove(digest);
         // The upload may have declared fewer bytes than were reserved, and the
         // charge is per unit, so the difference goes back to the budget.
+        let held = flight.charged;
         let settled = charge_for(bytes);
         state.charged = state.charged + settled - held;
         *charged = *charged + settled - held;
-        state.stored.insert(
+        let replaced = state.stored.insert(
             digest.to_owned(),
             Payload {
                 bytes,
@@ -584,6 +677,16 @@ impl Store {
                 expires_at: Instant::now() + PAYLOAD_TIME_TO_LIVE,
             },
         );
+        // A payload of this digest that expired and has not been swept yet.
+        // `reserve` charged the room for this upload anew -- its `held` check
+        // requires an unexpired payload -- so the entry just displaced owns a
+        // charge nothing will ever release: the sweep cannot see it, because the
+        // map slot now holds the fresh, unexpired entry. Released here or held
+        // for the room's whole life.
+        if let Some(replaced) = replaced {
+            state.charged = state.charged.saturating_sub(replaced.charged);
+            *charged = charged.saturating_sub(replaced.charged);
+        }
         Ok(())
     }
 
@@ -604,7 +707,7 @@ impl Store {
                 None => return,
             }
         };
-        self.queue_removal(self.room_dir(room));
+        self.queue_removal(Removal::Room(room.clone()));
         tracing::debug!(%room, released_bytes = released, "room payloads removed");
     }
 
@@ -615,7 +718,7 @@ impl Store {
     pub fn sweep(&self) -> Swept {
         let now = Instant::now();
         let mut swept = Swept::default();
-        let mut files = Vec::new();
+        let mut removals = Vec::new();
         let mut idle_rooms = Vec::new();
 
         {
@@ -634,12 +737,14 @@ impl Store {
                     }
                     live
                 });
-                let dir = self.room_dir(room);
                 state.stored.retain(|digest, payload| {
                     let live = payload.expires_at > now;
                     if !live {
                         released += payload.charged;
-                        files.push(dir.join(digest));
+                        removals.push(Removal::Payload {
+                            room: room.clone(),
+                            digest: digest.clone(),
+                        });
                         swept.payloads += 1;
                     }
                     live
@@ -656,8 +761,8 @@ impl Store {
             }
         }
 
-        for file in files {
-            self.queue_removal(file);
+        for removal in removals {
+            self.queue_removal(removal);
         }
         swept
     }
@@ -675,19 +780,82 @@ impl Store {
         }
     }
 
-    fn queue_removal(&self, path: PathBuf) {
+    fn queue_removal(&self, removal: Removal) {
         // Ignored: a closed channel means maintenance has stopped, which
         // happens only on the shutdown path that removes the whole root.
-        let _ = self.removals.send(path);
+        let _ = self.removals.send(removal);
+    }
+
+    /// The path a queued removal should unlink, or `None` when the index has
+    /// acquired an owner for it since it was queued.
+    ///
+    /// A removal is performed later than the index change that ordered it, and
+    /// in between the same digest can be re-uploaded or the room recreated -- so
+    /// the queued path can name a payload that is now *live*, and unlinking it
+    /// would leave the index promising a file that is gone.
+    ///
+    /// The critical section is the lookups and nothing else: naming a path
+    /// digests the room's components, which is work with no business under the
+    /// index lock.
+    fn removable(&self, removal: &Removal) -> Option<PathBuf> {
+        match removal {
+            Removal::Payload { room, digest } => {
+                let owned = {
+                    let index = self.index();
+                    // `uploading` counts as an owner: between an upload's rename
+                    // and its commit the index holds no `stored` entry, and the
+                    // file at the address is already the new one.
+                    index.rooms.get(room).is_some_and(|state| {
+                        state.stored.contains_key(digest) || state.uploading.contains_key(digest)
+                    })
+                };
+                (!owned).then(|| self.payload_path(room, digest))
+            }
+            // A room's directory is named by a digest of its components, so a
+            // recreated room of the same name shares it: a directory-wide
+            // removal cannot separate the dead room's files from the live one's.
+            // Skipped while the room exists again, which leaves the stragglers
+            // to that room's own end rather than taking a live payload with
+            // them.
+            Removal::Room(room) => {
+                let owned = self.index().rooms.contains_key(room);
+                (!owned).then(|| self.room_dir(room))
+            }
+            // A temporary name carries a serial no other upload can produce, so
+            // no index entry can own it.
+            Removal::Temp(path) => Some(path.clone()),
+        }
     }
 
     fn temp_path(&self, room: &RoomId, digest: &str) -> PathBuf {
-        let n = self.next_temp.fetch_add(1, Ordering::Relaxed);
-        // Leading dot and a per-store counter: in the same directory, so the
+        let n = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        // Leading dot and a per-store serial: in the same directory, so the
         // rename onto the final name is atomic, and distinct from any concurrent
         // upload of the same digest.
         self.room_dir(room).join(format!(".{digest}.{n}"))
     }
+}
+
+/// One removal handed to [`Maintenance`].
+///
+/// A payload and a room name what they are rather than where they are, because
+/// a path alone is not enough to remove safely later: the index change that
+/// ordered the removal and the unlink that performs it are separated by the
+/// queue, and in between the same digest can be re-uploaded or the room
+/// recreated. See [`Store::removable`].
+#[derive(Debug)]
+enum Removal {
+    /// One expired payload's file.
+    Payload {
+        /// Room whose index entry named the payload.
+        room: RoomId,
+        /// Address the payload was stored under.
+        digest: String,
+    },
+    /// One ended room's whole directory.
+    Room(RoomId),
+    /// One abandoned upload's temporary file.
+    Temp(PathBuf),
 }
 
 /// What one sweep removed.
@@ -730,6 +898,9 @@ pub struct Upload {
     store: Arc<Store>,
     room: RoomId,
     digest: String,
+    /// Which entry in the room's `uploading` map is this upload's. See
+    /// [`InFlight::serial`].
+    serial: u64,
     declared: u64,
     hasher: Sha256,
     written: u64,
@@ -806,8 +977,27 @@ impl Upload {
                 // told anything. Only [`Drop`], which cannot await, needs the
                 // queue -- so "a refused upload leaves nothing behind" is an
                 // observable fact rather than an eventual one.
+                //
+                // Ownership is re-checked first, because a failed `commit_upload`
+                // leaves the *final* path here, and it fails for two reasons: the
+                // room ended, or a successor owns this digest's entry. In the
+                // second case the path holds the successor's payload, which the
+                // index says is stored, so removing it would leave a live entry
+                // naming a file that is gone. Every other failure holds a
+                // temporary name no entry can own, which the first half admits
+                // without taking the index lock.
                 if let Some(temp) = self.temp.take() {
-                    remove_path(&temp).await;
+                    let owned = temp == self.store.payload_path(&self.room, &self.digest)
+                        && self
+                            .store
+                            .removable(&Removal::Payload {
+                                room: self.room.clone(),
+                                digest: self.digest.clone(),
+                            })
+                            .is_none();
+                    if !owned {
+                        remove_path(&temp).await;
+                    }
                 }
                 Err(error)
             }
@@ -861,12 +1051,15 @@ impl Upload {
         // what a fetch consults, so a file is unreachable until the entry that
         // governs its lifetime exists. Committing first would open a window in
         // which the index promises a file that is not there yet.
-        if let Err(error) = self
-            .store
-            .commit_upload(&self.room, &self.digest, self.written)
+        if let Err(error) =
+            self.store
+                .commit_upload(&self.room, &self.digest, self.serial, self.written)
         {
-            // The room ended under the upload, so the renamed file is now
-            // unreferenced. Removed on the caller's path in `finish`.
+            // The room ended under the upload, or a later upload of this digest
+            // owns its entry now, so the renamed file is not this upload's to
+            // account for. Handed to the caller's path in `finish`, which
+            // re-checks ownership before unlinking it: under a successor, the
+            // file at this address is the successor's payload.
             self.temp = Some(final_path);
             return Err(error);
         }
@@ -880,9 +1073,14 @@ impl Drop for Upload {
         if self.settled {
             return;
         }
-        self.store.abandon_upload(&self.room, &self.digest);
+        self.store
+            .abandon_upload(&self.room, &self.digest, self.serial);
+        // `Removal::Temp` is not ownership-checked, which is sound only because
+        // this is always a temporary name: the one place that puts the *final*
+        // path in `self.temp` is `commit`, and `finish` takes it back out before
+        // its first await, so no suspension leaves that path here to be queued.
         if let Some(temp) = self.temp.take() {
-            self.store.queue_removal(temp);
+            self.store.queue_removal(Removal::Temp(temp));
         }
         tracing::debug!(
             room = %self.room,
@@ -902,7 +1100,7 @@ impl Drop for Upload {
 #[derive(Debug)]
 pub struct Maintenance {
     store: Arc<Store>,
-    removals: mpsc::UnboundedReceiver<PathBuf>,
+    removals: mpsc::UnboundedReceiver<Removal>,
 }
 
 impl Maintenance {
@@ -931,7 +1129,12 @@ impl Maintenance {
                         );
                     }
                 }
-                Some(path) = self.removals.recv() => remove_path(&path).await,
+                // `&self.store` rather than a method on `self`: the branch above
+                // holds `self.removals` borrowed for as long as this arm runs,
+                // and two disjoint fields are what the borrow checker permits.
+                Some(removal) = self.removals.recv() => {
+                    Self::remove(&self.store, &removal).await;
+                }
             }
         }
 
@@ -939,8 +1142,8 @@ impl Maintenance {
         // first is not strictly needed -- the root removal subsumes every path
         // beneath it -- but it keeps the two orders equivalent if the root ever
         // stops being the common ancestor.
-        while let Ok(path) = self.removals.try_recv() {
-            remove_path(&path).await;
+        while let Ok(removal) = self.removals.try_recv() {
+            Self::remove(&self.store, &removal).await;
         }
         match fs::remove_dir_all(self.store.root()).await {
             Ok(()) => tracing::info!(
@@ -967,8 +1170,25 @@ impl Maintenance {
     /// It is the same loop body [`Self::run`] uses, so nothing here is a
     /// separate implementation that could drift from production behaviour.
     pub async fn drain(&mut self) {
-        while let Ok(path) = self.removals.try_recv() {
+        while let Ok(removal) = self.removals.try_recv() {
+            Self::remove(&self.store, &removal).await;
+        }
+    }
+
+    /// Performs one queued removal, unless the index has acquired an owner for
+    /// its path since it was queued.
+    ///
+    /// The re-check is [`Store::removable`], and it is here rather than at
+    /// queueing time because the window this closes is exactly the gap between
+    /// the two.
+    async fn remove(store: &Store, removal: &Removal) {
+        if let Some(path) = store.removable(removal) {
             remove_path(&path).await;
+        } else {
+            tracing::debug!(
+                ?removal,
+                "a queued removal was skipped: the index owns its path again"
+            );
         }
     }
 }
@@ -999,17 +1219,78 @@ async fn remove_path(path: &Path) {
 /// trusted host, where a world-traversable temporary directory would expose to
 /// every local user exactly the payload content the logging rules forbid
 /// recording.
+///
+/// The mode goes into the creation syscall where the platform offers one, rather
+/// than into a `chmod` after it: create-then-chmod leaves the directory briefly
+/// at `0777 & umask`, and that window is observable to exactly the local user
+/// the mode exists for.
+#[cfg(unix)]
 async fn create_private_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir(path).await?;
-    set_private(path).await
+    fs::DirBuilder::new().mode(0o700).create(path).await
 }
 
+#[cfg(not(unix))]
+async fn create_private_dir(path: &Path) -> io::Result<()> {
+    // No portable equivalent for the mode. The supported deployment is a Linux
+    // container.
+    fs::create_dir(path).await
+}
+
+/// Creates the directory, or checks that what is already there is one of ours.
 async fn create_private_dir_if_absent(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path).await {
-        Ok(()) => set_private(path).await,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+    match create_private_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_private_dir(path).await
+        }
         Err(error) => Err(error),
     }
+}
+
+/// Checks that an existing path is a real directory belonging to this user, and
+/// leaves it private.
+///
+/// [`Store::open`]'s `base` is a predictable path any local user can pre-create,
+/// and a `0700` directory inside one somebody else controls is a mode defeated
+/// one level up: they can rename or replace it, and every room path underneath
+/// then resolves where they choose. A symlink is worse still, because it moves
+/// an ancestor of the tree `Store::open` removes at startup.
+///
+/// Two assertions, and the second is the load-bearing one. `symlink_metadata`
+/// rejects a symlink and anything that is not a directory. [`set_private`] then
+/// asserts ownership by succeeding: `chmod(2)` is `EPERM` unless the effective
+/// user owns the directory, which is an ownership proof this crate can make
+/// without asking for the current uid -- `std` offers no such call, and a fourth
+/// dependency for one number is the wrong trade. The incoming mode is
+/// deliberately not gated on: an operator is told to mount this exact path as a
+/// sized filesystem, a fresh mount is typically `0755`, and refusing it would
+/// break the documented deployment to close nothing the `chmod` does not.
+///
+/// The boundary: a relay running as `root`, or with `CAP_DAC_OVERRIDE`, can
+/// `chmod` a directory it does not own, so for such a process this proves only
+/// that the path is a real directory. That case is stated rather than closed --
+/// the container deployment does not run as root, and `unsafe_code` is
+/// `forbid`den here, so the alternative is a dependency.
+async fn verify_private_dir(path: &Path) -> io::Result<()> {
+    // `symlink_metadata`, never `metadata`: the question is what this path *is*,
+    // and `metadata` answers for whatever a symlink points at -- which is the
+    // substitution being rejected.
+    let found = fs::symlink_metadata(path).await?;
+    if !found.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} is not a directory but a {}",
+                path.display(),
+                if found.file_type().is_symlink() {
+                    "symbolic link"
+                } else {
+                    "file"
+                }
+            ),
+        ));
+    }
+    set_private(path).await
 }
 
 #[cfg(unix)]
@@ -1025,8 +1306,11 @@ async fn set_private(_path: &Path) -> io::Result<()> {
 }
 
 /// Rounds a byte count up to whole units of [`MIN_CHARGE_BYTES`].
+///
+/// Zero rounds up to one unit rather than to nothing, because an entry that
+/// costs nothing is an entry no ceiling bounds. See [`MIN_CHARGE_BYTES`].
 fn charge_for(bytes: u64) -> u64 {
-    bytes.div_ceil(MIN_CHARGE_BYTES) * MIN_CHARGE_BYTES
+    bytes.max(1).div_ceil(MIN_CHARGE_BYTES) * MIN_CHARGE_BYTES
 }
 
 /// Directory name for one relay instance.
@@ -1729,6 +2013,275 @@ mod tests {
         );
     }
 
+    // A lifetime is fixed at upload and never extended, so a reservation of a
+    // payload already held must state the life it has left. The sender puts this
+    // number in front of a recipient -- "the relay holds it for about two hours"
+    // -- and re-attaching an artifact already held is what content addressing
+    // makes common.
+    #[tokio::test(start_paused = true)]
+    async fn reserving_an_already_held_payload_grants_the_life_it_has_left() {
+        let fixture = Fixture::open("held-remaining-life").await;
+        let room = room("project", "task");
+        let bytes = b"attached twice".to_vec();
+        let address = put(&fixture.store, &room, &bytes).await;
+
+        // Most of the way through: ten seconds before the sweep would take it.
+        let remaining = Duration::from_secs(10);
+        let elapsed = PAYLOAD_TIME_TO_LIVE
+            .checked_sub(remaining)
+            .expect("ten seconds is shorter than the payload lifetime");
+        tokio::time::advance(elapsed).await;
+
+        let grant = fixture
+            .store
+            .reserve(&room, &address, bytes.len() as u64)
+            .expect("a reservation of a held payload is granted");
+        assert_eq!(
+            grant.time_to_live, remaining,
+            "granted {:?} for a payload with {remaining:?} left, {:?} into a \
+             {PAYLOAD_TIME_TO_LIVE:?} lifetime",
+            grant.time_to_live, elapsed
+        );
+    }
+
+    // The sweep runs every `SWEEP_INTERVAL`, so a payload spends up to a minute
+    // expired and still present. A resend landing in that window replaces the
+    // entry, and the replaced entry's charge has no owner left: the sweep cannot
+    // see it, because the map slot holds the fresh one. Resending is exactly
+    // what a recipient whose fetch failed is told to ask for.
+    #[tokio::test(start_paused = true)]
+    async fn re_uploading_before_the_sweep_charges_for_one_payload() {
+        let fixture = Fixture::open("pre-sweep-reupload").await;
+        let room = room("project", "task");
+        let bytes = b"resent after it expired".to_vec();
+
+        let address = put(&fixture.store, &room, &bytes).await;
+        let one_payload = charge_for(bytes.len() as u64);
+
+        tokio::time::advance(PAYLOAD_TIME_TO_LIVE + Duration::from_secs(1)).await;
+        assert_eq!(
+            fixture.store.payload_len(&room, &address),
+            None,
+            "the payload must be expired for this to be the window under test"
+        );
+
+        let resent = put(&fixture.store, &room, &bytes).await;
+        assert_eq!(resent, address, "the same bytes must have the same address");
+
+        let (room_charged, store_charged) = {
+            let index = fixture.store.index();
+            (
+                index.rooms.get(&room).map_or(0, |state| state.charged),
+                index.charged,
+            )
+        };
+        assert_eq!(
+            (room_charged, store_charged),
+            (one_payload, one_payload),
+            "one payload is held, so both totals must be {one_payload}: the room \
+             holds {room_charged} and the store {store_charged}"
+        );
+        assert_eq!(
+            fixture.store.payload_len(&room, &address),
+            Some(bytes.len() as u64),
+            "the resent payload must be fetchable"
+        );
+    }
+
+    // `(room, digest)` is not unique in time: a room can empty and be recreated
+    // while an upload is in flight. Without the per-upload serial the first
+    // upload's `Drop` removed the second's entry and credited its allowance, and
+    // the second then failed its own commit and removed the file it had just
+    // published.
+    #[tokio::test]
+    async fn an_abandoned_upload_cannot_settle_its_successors_entry() {
+        let mut fixture = Fixture::open("upload-aba").await;
+        let room = room("project", "task");
+        let bytes = b"the successor's bytes".to_vec();
+        let address = digest(&bytes);
+        let declared = bytes.len() as u64;
+
+        fixture
+            .store
+            .reserve(&room, &address, declared)
+            .expect("reservation granted");
+        let Accepted::Upload(mut first) = fixture
+            .store
+            .begin_upload(&room, &address, declared)
+            .expect("upload accepted")
+        else {
+            panic!("nothing is held yet");
+        };
+        first.write(&bytes[..4]).await.expect("first chunk");
+
+        // The room's last peer deregisters under the upload, and a new peer
+        // recreates the room and sends the same artifact.
+        fixture.store.forget_room(&room);
+        fixture
+            .store
+            .reserve(&room, &address, declared)
+            .expect("the recreated room grants a reservation");
+        let Accepted::Upload(mut second) = fixture
+            .store
+            .begin_upload(&room, &address, declared)
+            .expect("the recreated room accepts an upload")
+        else {
+            panic!("the recreated room holds nothing");
+        };
+        second.write(&bytes).await.expect("every byte");
+
+        // The first upload's connection closes.
+        drop(first);
+
+        assert_eq!(
+            second.finish().await.expect("the successor commits"),
+            declared,
+            "the successor's own upload must settle"
+        );
+        // The abandoned partial file and the forgotten room's directory are both
+        // queued; neither may take the successor's payload with it.
+        fixture.drain().await;
+
+        let path = fixture.store.payload_path(&room, &address);
+        assert_eq!(
+            (fixture.store.payload_len(&room, &address), path.is_file()),
+            (Some(declared), true),
+            "the index reports {:?} and the file at {} {}: they must agree",
+            fixture.store.payload_len(&room, &address),
+            path.display(),
+            if path.is_file() { "exists" } else { "is gone" }
+        );
+        assert_eq!(
+            tree(fixture.store.root()),
+            vec![PathBuf::from(room_dir_name(&room)).join(&address)],
+            "expected exactly the successor's payload under the root"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("payload is readable"),
+            bytes,
+            "the file at the address is not the successor's bytes"
+        );
+    }
+
+    // The same interleaving, but the predecessor *finishes* instead of being
+    // dropped: it renames its own bytes onto the address the successor already
+    // published, and its `commit_upload` is refused for the same reason. The
+    // refusal used to unlink that path unconditionally, which left a live index
+    // entry naming a file that is gone -- a `HEAD` reporting a length beside a
+    // `GET` answering `404`, for the payload's whole remaining life, because
+    // `begin_upload` answers `AlreadyHeld` and no re-upload can repair it.
+    #[tokio::test]
+    async fn a_refused_commit_cannot_unlink_its_successors_payload() {
+        let mut fixture = Fixture::open("upload-refused").await;
+        let room = room("project", "task");
+        let bytes = b"the successor's bytes".to_vec();
+        let address = digest(&bytes);
+        let declared = bytes.len() as u64;
+
+        fixture
+            .store
+            .reserve(&room, &address, declared)
+            .expect("reservation granted");
+        let Accepted::Upload(mut first) = fixture
+            .store
+            .begin_upload(&room, &address, declared)
+            .expect("upload accepted")
+        else {
+            panic!("nothing is held yet");
+        };
+        // Every byte, so the predecessor reaches the rename and the commit
+        // rather than failing its own length check.
+        first.write(&bytes).await.expect("every byte");
+
+        fixture.store.forget_room(&room);
+        fixture
+            .store
+            .reserve(&room, &address, declared)
+            .expect("the recreated room grants a reservation");
+        let Accepted::Upload(mut second) = fixture
+            .store
+            .begin_upload(&room, &address, declared)
+            .expect("the recreated room accepts an upload")
+        else {
+            panic!("the recreated room holds nothing");
+        };
+        second.write(&bytes).await.expect("every byte");
+        assert_eq!(
+            second.finish().await.expect("the successor commits"),
+            declared,
+            "the successor's own upload must settle"
+        );
+
+        let error = first
+            .finish()
+            .await
+            .expect_err("the predecessor's entry is gone, so its commit is refused");
+        assert!(
+            matches!(error, UploadError::RoomGone),
+            "expected the room-gone refusal that a successor's entry produces, got {error}"
+        );
+        fixture.drain().await;
+
+        let path = fixture.store.payload_path(&room, &address);
+        assert_eq!(
+            (fixture.store.payload_len(&room, &address), path.is_file()),
+            (Some(declared), true),
+            "the index reports {:?} and the file at {} {}: they must agree",
+            fixture.store.payload_len(&room, &address),
+            path.display(),
+            if path.is_file() { "exists" } else { "is gone" }
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("payload is readable"),
+            bytes,
+            "the file at the address is not the successor's bytes"
+        );
+    }
+
+    // The sweep removes an index entry under the lock and queues the file for
+    // later. A resend of the same digest landing before the queue drains gets a
+    // live index entry, and the stale removal must not unlink its file -- which
+    // is what a `HEAD` reporting a length beside a `GET` answering `404` is.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_removal_cannot_unlink_a_re_uploaded_payload() {
+        let mut fixture = Fixture::open("stale-removal").await;
+        let room = room("project", "task");
+        let bytes = b"expired, then sent again".to_vec();
+
+        let address = put(&fixture.store, &room, &bytes).await;
+        tokio::time::advance(PAYLOAD_TIME_TO_LIVE + Duration::from_secs(1)).await;
+        assert_eq!(
+            fixture.store.sweep(),
+            Swept {
+                payloads: 1,
+                reservations: 0
+            },
+            "the expired payload must be swept for its removal to be queued"
+        );
+
+        // The window: the removal is queued and `Maintenance` has not run.
+        let resent = put(&fixture.store, &room, &bytes).await;
+        assert_eq!(resent, address, "the same bytes must have the same address");
+
+        fixture.drain().await;
+
+        let path = fixture.store.payload_path(&room, &address);
+        assert_eq!(
+            (fixture.store.payload_len(&room, &address), path.is_file()),
+            (Some(bytes.len() as u64), true),
+            "the index reports {:?} and the file at {} {}: a fetch and a length \
+             request must agree",
+            fixture.store.payload_len(&room, &address),
+            path.display(),
+            if path.is_file() { "exists" } else { "is gone" }
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("payload is readable"),
+            bytes,
+            "the file at the address is not the resent bytes"
+        );
+    }
+
     #[tokio::test]
     async fn a_stored_payload_holds_the_bytes_it_was_given() {
         let fixture = Fixture::open("round-trip").await;
@@ -1756,7 +2309,9 @@ mod tests {
 
     #[tokio::test]
     async fn charging_is_rounded_up_to_whole_units() {
-        assert_eq!(charge_for(0), 0);
+        // A zero costs a whole unit, like everything else. `div_ceil` alone
+        // makes it free, and a free entry is one no ceiling bounds.
+        assert_eq!(charge_for(0), MIN_CHARGE_BYTES);
         assert_eq!(charge_for(1), MIN_CHARGE_BYTES);
         assert_eq!(charge_for(MIN_CHARGE_BYTES), MIN_CHARGE_BYTES);
         assert_eq!(charge_for(MIN_CHARGE_BYTES + 1), 2 * MIN_CHARGE_BYTES);
@@ -1764,6 +2319,239 @@ mod tests {
         // The bound the granularity buys: entries per room and per process.
         assert_eq!(MAX_ROOM_BYTES / MIN_CHARGE_BYTES, 512);
         assert_eq!(MAX_STORE_BYTES / MIN_CHARGE_BYTES, 4096);
+    }
+
+    // The entry bound `MIN_CHARGE_BYTES` exists for, asserted against the one
+    // input that used to bypass it: a zero-byte reservation was charged nothing,
+    // so `reserved` grew one entry per distinct digest while both ceiling
+    // comparisons passed trivially.
+    #[tokio::test]
+    async fn a_room_admits_only_its_entry_bound_of_zero_byte_reservations() {
+        let fixture = Fixture::open("zero-byte-entries").await;
+        let room = room("project", "task");
+
+        let bound = MAX_ROOM_BYTES / MIN_CHARGE_BYTES;
+        let mut admitted = 0_u64;
+        // Stops one past the bound rather than running until the test times
+        // out, so an unbounded room fails with a count instead of hanging.
+        while admitted <= bound
+            && fixture
+                .store
+                .reserve(&room, &digest(&admitted.to_le_bytes()), 0)
+                .is_ok()
+        {
+            admitted += 1;
+        }
+        let refusal = fixture.store.reserve(&room, &digest(b"one more"), 0);
+
+        println!(
+            "the room admitted {admitted} zero-byte reservation(s) against a \
+             bound of {bound}, then answered {refusal:?}"
+        );
+        assert_eq!(
+            admitted, bound,
+            "the room admitted {admitted} zero-byte reservations where \
+             MAX_ROOM_BYTES / MIN_CHARGE_BYTES is {bound}"
+        );
+        assert_eq!(
+            refusal,
+            Err(Refusal::RoomFull),
+            "a zero-byte reservation past the room's entry bound was granted"
+        );
+    }
+
+    // The invariant the charge above must not disturb: a zero costs a whole
+    // unit, and that decides its price rather than its admissibility. Nothing
+    // covered this end to end, and `commit`'s "never wrote a chunk" branch is
+    // reachable only by an upload that writes nothing at all -- so this stores
+    // one without calling `write`.
+    #[tokio::test]
+    async fn a_zero_length_payload_is_still_stored_and_charged_one_unit() {
+        let fixture = Fixture::open("zero-length-payload").await;
+        let room = room("project", "task");
+        let address = digest(b"");
+
+        fixture
+            .store
+            .reserve(&room, &address, 0)
+            .expect("a zero-byte reservation is granted");
+        let Accepted::Upload(upload) = fixture
+            .store
+            .begin_upload(&room, &address, 0)
+            .expect("a zero-byte upload is accepted")
+        else {
+            panic!("a payload the store does not hold was answered already-held");
+        };
+        let stored = upload.finish().await;
+
+        println!(
+            "a zero-length upload finished with {stored:?}, is {:?} byte(s) \
+             long, and cost {} byte(s) of the room",
+            fixture.store.payload_len(&room, &address),
+            charge_for(0)
+        );
+        assert_eq!(
+            stored.map_err(|error| error.to_string()),
+            Ok(0),
+            "a zero-length payload was refused"
+        );
+        assert_eq!(
+            fixture.store.payload_len(&room, &address),
+            Some(0),
+            "a zero-length payload is not fetchable"
+        );
+        assert!(
+            fixture.store.payload_path(&room, &address).is_file(),
+            "a zero-length payload has no file at {}",
+            fixture.store.payload_path(&room, &address).display()
+        );
+    }
+
+    /// A scratch directory this test owns, holding a base it can pre-create.
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "omp-relayd-test-base-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the scratch directory is created");
+        path
+    }
+
+    // `base` is a predictable path -- `/tmp/omp-relayd` under a default
+    // `TMPDIR` -- and `create_dir_all` accepted whatever was already there.
+    // `remove_dir_all` will not follow a symlinked root, but the root's
+    // *ancestor* is the base, so opening through a symlinked base made startup
+    // a recursive delete of someone else's tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_base_is_refused_rather_than_opened_through() {
+        let scratch = scratch("symlink");
+        let base = scratch.join("base");
+        let target = scratch.join("target");
+        std::fs::create_dir_all(&target).expect("the symlink target is created");
+        std::os::unix::fs::symlink(&target, &base).expect("the base is a symlink");
+
+        // A real tree where the instance root would resolve, so "the refusal
+        // removed nothing" is observed rather than argued. The assertion is on
+        // the *inner* path: startup recreates the root it removed, so checking
+        // the root itself would be satisfied by the empty directory a recursive
+        // delete left behind.
+        let bystander = target.join(instance_dir_name("symlinked-base"));
+        let inside = bystander.join("payload-dir");
+        std::fs::create_dir_all(&inside).expect("a tree under the symlink target");
+
+        let refusal = Store::open(&base, "symlinked-base").await;
+
+        println!(
+            "opening a store on a symlinked base answered {:?}; {} still \
+             present: {}",
+            refusal.as_ref().err(),
+            inside.display(),
+            inside.is_dir()
+        );
+        assert!(
+            refusal.is_err(),
+            "a base that is a symlink to {} was opened through",
+            target.display()
+        );
+        assert!(
+            inside.is_dir(),
+            "the refusal still removed {} under the symlink target",
+            inside.display()
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // The ordinary path, and the one a reader hits first: a base nobody created
+    // yet becomes a real, owner-only directory.
+    #[tokio::test]
+    async fn a_fresh_base_is_created_as_a_real_private_directory() {
+        let scratch = scratch("fresh");
+        // Two levels below the scratch directory, because only the final
+        // component is created privately and the parents must still be made.
+        let base = scratch.join("parent").join("base");
+
+        let (store, _maintenance) = Store::open(&base, "fresh-base")
+            .await
+            .expect("a store opens on a base that does not exist yet");
+
+        let found = std::fs::symlink_metadata(&base).expect("the base exists");
+        println!(
+            "the base {} is a directory: {}, a symlink: {}; the root is {}",
+            base.display(),
+            found.file_type().is_dir(),
+            found.file_type().is_symlink(),
+            store.root().display()
+        );
+        assert!(
+            found.file_type().is_dir() && !found.file_type().is_symlink(),
+            "the base at {} is a {:?} rather than a real directory",
+            base.display(),
+            found.file_type()
+        );
+        assert!(
+            store.root().starts_with(&base),
+            "the root {} is not under the base {}",
+            store.root().display(),
+            base.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = found.permissions().mode() & 0o777;
+            println!("the base {} is mode {mode:04o}", base.display());
+            assert_eq!(
+                mode,
+                0o700,
+                "the base at {} is mode {mode:04o}, not 0700",
+                base.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // The deployment the documentation recommends: an operator mounts this exact
+    // path as a sized filesystem, and a fresh mount is typically `0755`. Gating
+    // on the incoming mode would refuse it, which is a worse failure than the
+    // one being closed -- unconditional rather than conditional on a hostile
+    // local user. Ownership is asserted by the `chmod` succeeding, so the mode
+    // is normalized instead of demanded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_base_this_user_owns_at_a_looser_mode_is_accepted_and_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = scratch("operator-mount");
+        let base = scratch.join("base");
+        std::fs::create_dir(&base).expect("the operator's base is created");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("the operator's base is 0755");
+
+        let opened = Store::open(&base, "operator-mount").await;
+        let mode = std::fs::symlink_metadata(&base)
+            .expect("the base exists")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        println!(
+            "a base this user owns at 0755 opened: {}, and is now mode \
+             {mode:04o}",
+            opened.is_ok()
+        );
+        assert!(
+            opened.is_ok(),
+            "a base this user owns at 0755 was refused: {:?}",
+            opened.err()
+        );
+        assert_eq!(
+            mode,
+            0o700,
+            "the accepted base at {} was left at mode {mode:04o}",
+            base.display()
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[tokio::test]

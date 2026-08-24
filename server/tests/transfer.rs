@@ -8,14 +8,16 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omp_relayd::blob::{self, MAX_PAYLOAD_BYTES, MAX_ROOM_BYTES};
+use omp_relayd::http::{BODY_PROGRESS_TIMEOUT, HEADER_READ_TIMEOUT};
 use omp_relayd::protocol::{ClientFrame, ErrorCode, MAX_FRAME_BYTES, ServerFrame};
 use omp_relayd::relay::Deadlines;
 use support::{Client, Relay, blob_path, http, http_put, http_put_declaring, length_prefix, room};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 /// A payload larger than one write, so the streaming paths are what run.
 ///
@@ -640,4 +642,281 @@ async fn a_relay_without_a_store_reads_a_transfer_request_as_a_frame() {
     client
         .expect_error_then_close(ErrorCode::FrameTooLarge)
         .await;
+}
+
+// Nothing bounded a transfer connection after the first-byte dispatch. The
+// accept path's handshake window ends the moment a non-zero byte arrives, and
+// the builder carried no timer -- so `hyper`'s nominal header timeout was
+// inactive and one byte followed by silence held a task and a file descriptor
+// for as long as the client cared to.
+#[tokio::test]
+async fn a_connection_that_sends_one_byte_and_stalls_is_closed() {
+    let relay = Relay::with_store("header-bound").await;
+    let mut stream = TcpStream::connect(relay.addr)
+        .await
+        .expect("connect to the relay");
+
+    // A non-zero first byte is what sends this connection to the transfer
+    // dispatch, and `G` is the byte a real `GET` starts with. Nothing follows
+    // it.
+    stream.write_all(b"G").await.expect("write the first byte");
+    stream.flush().await.expect("flush");
+
+    let started = Instant::now();
+    let mut answered = Vec::new();
+    let outcome = timeout(HEADER_READ_TIMEOUT * 3, stream.read_to_end(&mut answered)).await;
+    let elapsed = started.elapsed();
+
+    println!(
+        "the stalled transfer connection ended after {elapsed:?} against a \
+         {HEADER_READ_TIMEOUT:?} bound, having answered {} byte(s): {outcome:?}",
+        answered.len()
+    );
+    assert!(
+        outcome.is_ok(),
+        "the connection was still open {elapsed:?} after one byte, with a \
+         {HEADER_READ_TIMEOUT:?} header bound"
+    );
+    assert!(
+        elapsed >= HEADER_READ_TIMEOUT,
+        "closed after {elapsed:?}, before the {HEADER_READ_TIMEOUT:?} bound \
+         elapsed: something other than the header bound closed it"
+    );
+}
+
+// Round 1 bounded a head and left a body unbounded, and the body is the
+// expensive half: `Store::begin_upload` moves the room's allowance out of the
+// reservation table, the sweep scans `reserved` and `stored` but never
+// `uploading`, and only the upload's `Drop` gives the allowance back. So a peer
+// that declared a maximal length and then stopped sending held a room's whole
+// budget for as long as it kept the socket open, with the store holding no
+// payload at all.
+#[tokio::test]
+async fn an_upload_that_stops_sending_is_failed_and_gives_its_allowance_back() {
+    let mut relay = Relay::with_store("stalled-body").await;
+    let room = room("stalled-body");
+
+    let bytes = payload(usize::try_from(MAX_PAYLOAD_BYTES).expect("fits"));
+    let digest = blob::digest(&bytes);
+    relay.reserve(&room, &digest, MAX_PAYLOAD_BYTES);
+
+    // The rest of the room's ceiling, so the probe below can only succeed once
+    // the stalled upload's allowance comes back. Without it the probe succeeds
+    // against a nearly empty room and proves nothing.
+    let units = MAX_ROOM_BYTES / MAX_PAYLOAD_BYTES;
+    for n in 1..units {
+        relay.reserve(&room, &blob::digest(&n.to_le_bytes()), MAX_PAYLOAD_BYTES);
+    }
+    assert!(
+        relay
+            .store()
+            .reserve(&room, &blob::digest(b"probe"), MAX_PAYLOAD_BYTES)
+            .is_err(),
+        "the room was not full before the upload stalled"
+    );
+
+    let mut upload = TcpStream::connect(relay.addr).await.expect("connect");
+    let head = format!(
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        blob_path(&room, &digest),
+        relay.addr,
+        bytes.len()
+    );
+    // Timed from before the head, so the relay's own bound necessarily started
+    // later: a lower bound measured from here cannot be met by a shorter one.
+    let started = Instant::now();
+    upload.write_all(head.as_bytes()).await.expect("head");
+    upload
+        .write_all(&bytes[..128 * 1024])
+        .await
+        .expect("first chunk");
+    upload.flush().await.expect("flush");
+    // Genuinely in flight before it stalls, or this would assert cleanup of an
+    // upload that never started.
+    wait_for_a_partial_file(&relay).await;
+
+    // Nothing more is ever sent and the socket stays open, so only the body
+    // bound can end this.
+    let mut answered = Vec::new();
+    let outcome = timeout(BODY_PROGRESS_TIMEOUT * 3, upload.read_to_end(&mut answered)).await;
+    let elapsed = started.elapsed();
+    let status = String::from_utf8_lossy(&answered)
+        .lines()
+        .next()
+        .unwrap_or("nothing")
+        .to_owned();
+
+    // The allowance comes back on the relay's own task, so this is waited for
+    // rather than assumed.
+    let mut released = None;
+    for _ in 0..200 {
+        if let Ok(grant) = relay
+            .store()
+            .reserve(&room, &blob::digest(b"probe"), MAX_PAYLOAD_BYTES)
+        {
+            released = Some(grant);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    println!(
+        "the stalled upload ended after {elapsed:?} against a \
+         {BODY_PROGRESS_TIMEOUT:?} bound with {outcome:?}, answering \
+         {status:?}; the room then answered a maximal reservation with \
+         {released:?}"
+    );
+    assert!(
+        outcome.is_ok(),
+        "the upload was still open {elapsed:?} after it stopped sending, with \
+         a {BODY_PROGRESS_TIMEOUT:?} body bound"
+    );
+    assert!(
+        elapsed >= BODY_PROGRESS_TIMEOUT,
+        "the upload was failed after {elapsed:?}, before the \
+         {BODY_PROGRESS_TIMEOUT:?} bound elapsed: something other than the \
+         body bound ended it"
+    );
+    assert!(
+        status.contains("408"),
+        "the stalled upload was answered {status:?} rather than a 408"
+    );
+    assert!(
+        released.is_some(),
+        "the stalled upload's allowance was never returned: a maximal \
+         reservation is still refused after {elapsed:?}"
+    );
+    assert_eq!(
+        relay.store().payload_len(&room, &digest),
+        None,
+        "a stalled upload became fetchable"
+    );
+
+    relay.drain_removals().await;
+    let leftovers = files_under(relay.store().root());
+    assert!(
+        leftovers.is_empty(),
+        "the stalled upload left {leftovers:?} on disk"
+    );
+}
+
+// The complementary half, and without it the bound above is indistinguishable
+// from a total-transfer deadline -- which is the defect that fails a maximal
+// payload on a slow link *because it was working*. The gaps here are shorter
+// than the bound and their sum is longer than it, which is exactly the shape a
+// slow link produces.
+#[tokio::test]
+async fn an_upload_that_keeps_moving_outlives_the_body_bound() {
+    let relay = Relay::with_store("slow-but-moving").await;
+    let room = room("slow-but-moving");
+
+    // Two chunks, so there are two gaps and their sum exceeds the bound.
+    let bytes = payload(96 * 1024);
+    let digest = blob::digest(&bytes);
+    relay.reserve(&room, &digest, bytes.len() as u64);
+
+    let mut upload = TcpStream::connect(relay.addr).await.expect("connect");
+    let head = format!(
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        blob_path(&room, &digest),
+        relay.addr,
+        bytes.len()
+    );
+    upload.write_all(head.as_bytes()).await.expect("head");
+
+    // Three fifths of the bound: comfortably inside it, and two of them are
+    // comfortably past it.
+    let gap = BODY_PROGRESS_TIMEOUT * 3 / 5;
+    let started = Instant::now();
+    for chunk in bytes.chunks(48 * 1024) {
+        tokio::time::sleep(gap).await;
+        upload.write_all(chunk).await.expect("chunk");
+        upload.flush().await.expect("flush");
+    }
+
+    let mut answered = Vec::new();
+    let outcome = timeout(BODY_PROGRESS_TIMEOUT, upload.read_to_end(&mut answered)).await;
+    let elapsed = started.elapsed();
+    let status = String::from_utf8_lossy(&answered)
+        .lines()
+        .next()
+        .unwrap_or("nothing")
+        .to_owned();
+
+    println!(
+        "an upload in {gap:?} steps ran {elapsed:?} against a \
+         {BODY_PROGRESS_TIMEOUT:?} bound and was answered {status:?} \
+         ({outcome:?}); the store holds {:?} byte(s)",
+        relay.store().payload_len(&room, &digest)
+    );
+    assert!(
+        elapsed > BODY_PROGRESS_TIMEOUT,
+        "the transfer took {elapsed:?}, inside the {BODY_PROGRESS_TIMEOUT:?} \
+         bound: this test proves nothing unless it outlasts it"
+    );
+    assert!(
+        status.contains("201"),
+        "an upload that kept moving in {gap:?} steps was answered {status:?}"
+    );
+    assert_eq!(
+        relay.store().payload_len(&room, &digest),
+        Some(bytes.len() as u64),
+        "an upload that kept moving did not become the payload it sent"
+    );
+}
+
+// A removal is queued under the index lock and performed later, so between the
+// two the same room can be recreated and the same digest re-uploaded. The stale
+// removal must not unlink the replacement: a `HEAD` reporting a length beside a
+// `GET` answering `404` is the inconsistency this pins.
+#[tokio::test]
+async fn a_queued_room_removal_cannot_unlink_a_re_uploaded_payload() {
+    let mut relay = Relay::with_store("stale-room-removal").await;
+    let here = room("stale-room-removal");
+    let bytes = payload(4096);
+    let digest = blob::digest(&bytes);
+    let path = blob_path(&here, &digest);
+
+    relay.reserve(&here, &digest, bytes.len() as u64);
+    assert_eq!(
+        http_put(relay.addr, &path, &bytes).await.status,
+        201,
+        "the first upload must be stored"
+    );
+
+    // The room's last peer deregisters: the index entry goes at once and the
+    // directory is queued, because the caller is a connection task's `Drop`.
+    relay.store().forget_room(&here);
+
+    // The window: a new peer joins, and the artifact is sent again.
+    relay.reserve(&here, &digest, bytes.len() as u64);
+    assert_eq!(
+        http_put(relay.addr, &path, &bytes).await.status,
+        201,
+        "the resent upload must be stored"
+    );
+
+    // The queued removal, performed.
+    relay.drain_removals().await;
+
+    let length = http(relay.addr, "HEAD", &path, &[], &[]).await;
+    let fetched = http(relay.addr, "GET", &path, &[], &[]).await;
+    println!(
+        "after the queued removal: HEAD {} content-length {:?}, GET {} with {} \
+         byte(s)",
+        length.status,
+        length.header("content-length"),
+        fetched.status,
+        fetched.body.len()
+    );
+    assert_eq!(
+        (length.status, fetched.status),
+        (200, 200),
+        "a length request and a fetch must agree: HEAD {length:?}, GET \
+         {fetched:?}"
+    );
+    assert_eq!(
+        fetched.body, bytes,
+        "the fetched bytes are not the resent payload"
+    );
 }

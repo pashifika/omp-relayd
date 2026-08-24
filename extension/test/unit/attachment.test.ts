@@ -14,6 +14,7 @@ import { encode as rawEncode } from "@msgpack/msgpack";
 
 import {
   RelayClient,
+  REQUEST_TIMEOUT_MS,
   RequestFailed,
   TRANSFER_CHUNK_BYTES,
   TRANSFER_STALL_MS,
@@ -133,6 +134,26 @@ const errorWith =
     }
   };
 
+/**
+ * Admits, then answers every reservation with `code` and no correlation token.
+ *
+ * What an older relay does, as distinct from {@link errorWith}: a relay that
+ * cannot decode `reserve` does not know that frame's `request_id` field either,
+ * so its refusal names nothing. A double that echoed the token would put the
+ * client on the recoverable-rejection path and leave the only reachable case
+ * untested.
+ */
+const namelessError =
+  (code: string, message: string): Script =>
+  (frame, session) => {
+    if (isFrame(frame, "hello")) {
+      session.send({ type: "ready", protocol: PROTOCOL_VERSION });
+    }
+    if (isFrame(frame, "reserve")) {
+      session.send({ type: "error", code, message } as never);
+    }
+  };
+
 const escaped: unknown[] = [];
 const onUnhandledRejection = (error: unknown): void => void escaped.push(error);
 
@@ -232,10 +253,11 @@ describe("reserving", () => {
   );
 
   test("a relay that does not know the frame is reported as unsupported", async () => {
-    // What an older relay does: an unrecognized frame is answered
-    // `unsupported_frame` on a connection that stays open.
+    // An unrecognized frame is answered `unsupported_frame` on a connection that
+    // stays open, and answered without a correlation token: the relay could not
+    // decode the frame, so it never read the field that names it.
     const { relay, harness, close } = await joined(
-      errorWith("unsupported_frame", "this protocol version does not implement that frame"),
+      namelessError("unsupported_frame", "this protocol version does not implement that frame"),
     );
     try {
       const outcome = await settlement(harness.client.attach(new Uint8Array([1])));
@@ -245,6 +267,26 @@ describe("reserving", () => {
       expect((outcome.reason as RequestFailed).reason).toBe("unsupported");
       expect((outcome.reason as RequestFailed).code).toBe("unsupported_frame");
       expect(relay.transfers).toEqual([]);
+
+      // Promptly, not eventually. The clock is this test's and was never
+      // advanced, so the reservation's own deadline could not have produced this
+      // answer: it was created, never fired, and cancelled when the frame
+      // settled the caller. Before the fix that read a nameless error as a
+      // connection-level report, this timer was the only thing that ever
+      // answered, and it said `timeout`.
+      const deadlines = harness.scheduler.history.filter(
+        (timer) => timer.kind === "timeout" && timer.delay === REQUEST_TIMEOUT_MS,
+      );
+      expect(deadlines).toHaveLength(1);
+      expect(deadlines[0]?.fired).toBe(0);
+      expect(deadlines[0]?.cancelled).toBe(true);
+      expect(harness.client.pendingRequests).toBe(0);
+      console.log(
+        `nameless unsupported_frame settled as ${(outcome.reason as RequestFailed).reason}; ` +
+          `the ${REQUEST_TIMEOUT_MS} ms deadline fired ${String(deadlines[0]?.fired)} time(s), ` +
+          `cancelled=${String(deadlines[0]?.cancelled)}`,
+      );
+
       // The connection survives, which is what makes this a capability answer
       // rather than an outage.
       expect(harness.client.state).toBe("ready");

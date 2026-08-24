@@ -1353,8 +1353,8 @@ struct Submission {
 
 /// Validates and routes one `send`, then reports its receipt.
 ///
-/// The three checks are ordered by consequence. An invalid correlation id and
-/// an invalid target are recoverable and keep the connection open; an
+/// The checks are ordered by consequence. An invalid correlation id, target,
+/// `reply_to`, or `attachment` is recoverable and keeps the connection open; an
 /// over-budget body is not, so it is checked last, once the frame is known to
 /// be one the relay would otherwise have delivered.
 fn handle_send(
@@ -1427,6 +1427,29 @@ fn handle_send(
         );
     }
 
+    // An `attachment` is validated here and never resolved here. Validated,
+    // because a recipient validates the field on arrival and treats an invalid
+    // frame as unrecoverable: an unvalidated reference relayed to a room would
+    // let one peer's malformed value close every other connection in it, and an
+    // over-long one would break the frame-budget proof, which reserves exactly
+    // `DIGEST_CHARS` for this field. Never resolved, because the routing path
+    // performs no store lookup: a reference to a payload that was never
+    // uploaded is well-formed and costs nothing here, and whether it resolves is
+    // the recipient's question at the moment it asks.
+    if let Some(error) = attachment
+        .as_deref()
+        .and_then(|value| protocol::validate_digest(value).err())
+    {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("send.attachment {error}")),
+                request_id: Some(id),
+            },
+        );
+    }
+
     // Checked before routing, so an unrelayable body is refused here, by name,
     // on the sender's own connection. Encoding a delivery happens on this task,
     // so the failure was never the recipient's to absorb. Both outcomes close
@@ -1447,11 +1470,8 @@ fn handle_send(
     };
 
     // `body` is moved into the delivered frame and is never a log field; only
-    // its size is observable in logs. `attachment` moves with it, unchanged and
-    // uninterpreted: the routing path performs no store lookup, so a reference
-    // to a payload that was never uploaded costs nothing here and is routed like
-    // any other. Whether it resolves is the recipient's question at the moment
-    // it asks.
+    // its size is observable in logs. `attachment` moves with it: validated
+    // above and uninterpreted beyond that, so the reference travels unchanged.
     let body_bytes = body.len();
     let outcome = state.route(
         &registered.room,
@@ -1480,10 +1500,10 @@ fn handle_send(
 ///
 /// The checks are ordered as on the `send` path and for the same reasons. `id`
 /// first, because no rejection can name the frame it answers without it.
-/// `reply_to` second, because it is the one recoverable rejection here that
-/// *can* name it. The body budget last, because it is the one that closes the
-/// connection, so it is reached only once the frame is known to be one the
-/// relay would otherwise have delivered.
+/// `reply_to` and `attachment` next, because they are the recoverable
+/// rejections here that *can* name it. The body budget last, because it is the
+/// one that closes the connection, so it is reached only once the frame is known
+/// to be one the relay would otherwise have delivered.
 ///
 /// There is no target check, and no place for one: an `announce` carries no
 /// target field at all.
@@ -1527,6 +1547,27 @@ fn handle_announce(
         );
     }
 
+    // Validated before anything is fanned out, and this is the path where that
+    // matters most: one encoded notice reaches every peer in the room, each of
+    // which validates the field on arrival and closes its connection on an
+    // invalid frame. Unvalidated, a single malformed value from one peer
+    // disconnected every other peer here. The rule is the digest rule because
+    // the field is an address; see the `send` path for why it is validated and
+    // not resolved.
+    if let Some(error) = attachment
+        .as_deref()
+        .and_then(|value| protocol::validate_digest(value).err())
+    {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("announce.attachment {error}")),
+                request_id: Some(id),
+            },
+        );
+    }
+
     if let Some(body_bytes) = protocol::body_over_budget(&body) {
         return refuse_over_budget(replies, registered, "announced body", body_bytes);
     }
@@ -1541,9 +1582,9 @@ fn handle_announce(
     };
 
     // `body` is moved into the notice and is never a log field; only its size is
-    // observable in logs. `attachment` moves with it, unchanged and
-    // uninterpreted, and reaches every recipient because it is part of the one
-    // encoded payload the fanout hands out.
+    // observable in logs. `attachment` moves with it: validated above and
+    // uninterpreted beyond that, and it reaches every recipient because it is
+    // part of the one encoded payload the fanout hands out.
     let body_bytes = body.len();
     let notice = ServerFrame::Notice {
         id: id.clone(),
