@@ -6,7 +6,7 @@ services:
     # working tree, and a clone still starts before a version has been published.
     build:
       context: .
-    image: pashifika/omp-relayd:0.1.0
+    image: pashifika/omp-relayd:0.2.0
     restart: unless-stopped
 
     # The relay has no authentication and no encryption, so the default binding
