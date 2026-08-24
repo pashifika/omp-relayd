@@ -29,6 +29,7 @@ import type { RelayConfig } from "../../src/config.ts";
 import {
   encodeFrame,
   FrameAccumulator,
+  MAX_BODY_BYTES,
   MAX_IDENTIFIER_BYTES,
   PROTOCOL_VERSION,
   validateServerFrame,
@@ -516,4 +517,138 @@ describe("protocol version", () => {
     console.log(`ready.protocol observed on the wire: ${frame.protocol}`);
     expect(frame.protocol).toBe(PROTOCOL_VERSION);
   });
+});
+
+describe("an attachment against the real relay", () => {
+  test("one peer attaches a file and another fetches identical bytes", async () => {
+    const port = shared().port;
+    const sender = peerFor(configFor(port, "attach-sender"));
+    const recipient = peerFor(configFor(port, "attach-recipient"));
+
+    try {
+      sender.client.start();
+      recipient.client.start();
+      await Promise.all([sender.ready.until(1), recipient.ready.until(1)]);
+
+      // Larger than the body budget, so this payload could not have travelled as
+      // a message at all. A byte pattern with a period that is not a power of two
+      // makes a truncated or reordered transfer visible rather than accidentally
+      // equal.
+      const payload = new Uint8Array(200_000);
+      for (let index = 0; index < payload.length; index += 1) {
+        payload[index] = index % 251;
+      }
+      expect(payload.byteLength).toBeGreaterThan(MAX_BODY_BYTES);
+
+      const attached = await sender.client.attach(payload);
+      expect(attached.bytes).toBe(payload.byteLength);
+      expect(attached.expiresIn).toBeGreaterThan(0);
+
+      const receipt = await sender.client.send({
+        to: "attach-recipient",
+        body: "the artifact is attached",
+        attachment: attached.digest,
+      });
+      expect(receipt.status).toBe("routed");
+
+      await recipient.deliveries.until(1);
+      const delivered = recipient.deliveries.last;
+      expect(delivered?.attachment).toBe(attached.digest);
+
+      // The recipient resolves the reference from its own configuration, and gets
+      // back exactly what the sender put in.
+      const fetched = await recipient.client.fetchAttachment(delivered?.attachment ?? "");
+      expect(fetched.byteLength).toBe(payload.byteLength);
+      expect(Bun.deepEquals(fetched, payload)).toBe(true);
+
+      // The length request answers without a transfer, and answers about the same
+      // payload.
+      expect(await recipient.client.lengthOf(attached.digest)).toBe(payload.byteLength);
+
+      console.log(
+        `attached ${payload.byteLength} bytes (over the ${MAX_BODY_BYTES}-byte body budget) ` +
+          `as ${attached.digest}, held ${attached.expiresIn} s; fetched bytes identical`,
+      );
+    } finally {
+      await sender.client.stop();
+      await recipient.client.stop();
+    }
+  }, 30_000);
+
+  test("an announcement's reference reaches every peer and resolves for each", async () => {
+    const port = shared().port;
+    const announcer = peerFor(configFor(port, "announce-sender"));
+    const first = peerFor(configFor(port, "announce-first"));
+    const second = peerFor(configFor(port, "announce-second"));
+
+    try {
+      announcer.client.start();
+      first.client.start();
+      second.client.start();
+      await Promise.all([
+        announcer.ready.until(1),
+        first.ready.until(1),
+        second.ready.until(1),
+      ]);
+
+      const payload = new TextEncoder().encode("the schema landed: ".repeat(1000));
+      const attached = await announcer.client.attach(payload);
+
+      const accepted = await announcer.client.announce({
+        body: "schema attached",
+        attachment: attached.digest,
+      });
+      expect(accepted.delivered).toBe(2);
+      expect(accepted.shed).toBe(0);
+
+      await Promise.all([first.deliveries.until(1), second.deliveries.until(1)]);
+      for (const peer of [first, second]) {
+        expect(peer.deliveries.last?.type).toBe("notice");
+        expect(peer.deliveries.last?.attachment).toBe(attached.digest);
+        const fetched = await peer.client.fetchAttachment(attached.digest);
+        expect(Bun.deepEquals(fetched, payload)).toBe(true);
+      }
+    } finally {
+      await announcer.client.stop();
+      await first.client.stop();
+      await second.client.stop();
+    }
+  }, 30_000);
+
+  test("a room's payloads are gone once its last peer has left", async () => {
+    const port = shared().port;
+    // A room of its own, so leaving it does not disturb the other tests'.
+    const room = { project: "omp-relayd", task: "attachment-lifetime" };
+    const config = (peer: string): RelayConfig => ({
+      transport: { mode: "local", host: "127.0.0.1", port },
+      room,
+      peer,
+    });
+
+    const owner = peerFor(config("lifetime-owner"));
+    owner.client.start();
+    await owner.ready.until(1);
+    const attached = await owner.client.attach(new TextEncoder().encode("transient"));
+    expect(await owner.client.lengthOf(attached.digest)).toBe(9);
+    await owner.client.stop();
+
+    // A later peer in the same room finds the payload gone: removal happens when
+    // the last peer deregisters, so a reference does not outlive its room.
+    const later = peerFor(config("lifetime-later"));
+    try {
+      later.client.start();
+      await later.ready.until(1);
+      expect(await later.client.lengthOf(attached.digest)).toBeNull();
+
+      const outcome = await settlement(later.client.fetchAttachment(attached.digest));
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status !== "rejected") return;
+      expect((outcome.reason as RequestFailed).reason).toBe("unavailable");
+      console.log(
+        `${attached.digest} was ${9} bytes while its room held a peer, and absent after it emptied`,
+      );
+    } finally {
+      await later.client.stop();
+    }
+  }, 30_000);
 });

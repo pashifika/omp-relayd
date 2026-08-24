@@ -50,6 +50,18 @@ export const MAX_CORRELATION_BYTES = 128;
  */
 export const MAX_BODY_BYTES = MAX_FRAME_BYTES - 512;
 
+/**
+ * Length of a payload address in its unpadded base64url form.
+ *
+ * A SHA-256 digest is 256 bits, which is 43 characters unpadded — 21 fewer than
+ * hex for the same bits, in an alphabet that excludes `/`, `+`, and `=` and so
+ * needs no escaping as a URL path component.
+ */
+export const DIGEST_CHARS = 43;
+
+/** One character of the unpadded base64url alphabet. */
+const BASE64URL_CHARACTER = /^[A-Za-z0-9_-]$/;
+
 // ---------------------------------------------------------------------------
 // Frame inventory
 // ---------------------------------------------------------------------------
@@ -81,6 +93,15 @@ export interface SendFrame {
   readonly to: string;
   readonly body: string;
   readonly reply_to?: string;
+  /**
+   * Address of a stored payload this message refers to.
+   *
+   * Never set speculatively. A client attaches one only after a `reserve` was
+   * granted, because an older relay ignores a field it does not recognize and
+   * would route a message referring to an attachment nothing carried -- silent
+   * at both ends.
+   */
+  readonly attachment?: string;
 }
 
 /**
@@ -101,6 +122,24 @@ export interface AnnounceFrame {
   readonly body: string;
   readonly reply_to?: string;
   readonly to?: never;
+  /** Same rules as {@link SendFrame.attachment}. */
+  readonly attachment?: string;
+}
+
+/**
+ * Asks the relay to hold `bytes` for a payload addressed `digest`.
+ *
+ * Sent before an upload and before any frame carrying the resulting reference,
+ * and it is what makes the optional `attachment` field safe to use at all: a
+ * relay that does not implement attachments answers this with an `error` whose
+ * code is `unsupported_frame` and keeps the connection open, so a client learns
+ * loudly rather than sending a reference nothing can resolve.
+ */
+export interface ReserveFrame {
+  readonly type: "reserve";
+  readonly request_id: string;
+  readonly digest: string;
+  readonly bytes: number;
 }
 
 /** Liveness probe; answered with `pong`. */
@@ -108,12 +147,13 @@ export interface PingFrame {
   readonly type: "ping";
 }
 
-/** Every frame a client may write. Protocol v1 has exactly these five. */
+/** Every frame a client may write. Protocol v1 has exactly these six. */
 export type ClientFrame =
   | HelloFrame
   | ListFrame
   | SendFrame
   | AnnounceFrame
+  | ReserveFrame
   | PingFrame;
 
 /** Admission confirmation, carrying the negotiated protocol version. */
@@ -136,6 +176,16 @@ export interface MessageFrame {
   readonly from: string;
   readonly body: string;
   readonly reply_to?: string;
+  /**
+   * Address of a stored payload the sender referred to.
+   *
+   * Surfaced, never resolved. Neither this client nor its host fetches a
+   * referenced payload while delivering the frame that referenced it: doing so
+   * would let a remote peer cause the local machine to download arbitrary bytes
+   * at a moment nothing local chose, and put them on the path toward the model's
+   * context. Fetching is a deliberate, separate act.
+   */
+  readonly attachment?: string;
 }
 
 /**
@@ -153,6 +203,8 @@ export interface NoticeFrame {
   readonly from: string;
   readonly body: string;
   readonly reply_to?: string;
+  /** Same rules as {@link MessageFrame.attachment}. */
+  readonly attachment?: string;
 }
 
 /**
@@ -208,6 +260,35 @@ export interface AcceptedFrame {
   readonly shed: number;
 }
 
+/** Statuses a `reserved` frame carries in protocol v1. */
+export type KnownReserveStatus = "granted" | "payload_too_large" | "room_full" | "store_full";
+
+/**
+ * Open for the same reason as {@link ReceiptStatus}: a relay one version ahead
+ * must not have its answers discarded, which would turn an additive change into
+ * a silent failure. Anything other than `granted` is a refusal, whatever it is
+ * called, and a client that treats an unrecognized status as a refusal is
+ * correct rather than lenient.
+ */
+export type ReserveStatus = KnownReserveStatus | (string & {});
+
+/**
+ * Answer to one `reserve`.
+ *
+ * `expires_in` accompanies a grant and only a grant. A refusal has no payload
+ * and therefore no lifetime, so a number beside one would read as a promise
+ * about something that will not exist; a frame carrying both is rejected rather
+ * than accepted with the number ignored, because accepting it would let a relay
+ * defect become a lifetime a sender then states to a recipient.
+ */
+export interface ReservedFrame {
+  readonly type: "reserved";
+  readonly request_id: string;
+  readonly status: ReserveStatus;
+  /** Seconds the payload remains fetchable once uploaded. */
+  readonly expires_in?: number;
+}
+
 /** Answer to `ping`. */
 export interface PongFrame {
   readonly type: "pong";
@@ -237,7 +318,7 @@ export interface ErrorFrame {
   readonly request_id?: string;
 }
 
-/** Every frame the relay may write. Protocol v1 has exactly these eight. */
+/** Every frame the relay may write. Protocol v1 has exactly these nine. */
 export type ServerFrame =
   | ReadyFrame
   | PeersFrame
@@ -245,6 +326,7 @@ export type ServerFrame =
   | NoticeFrame
   | ReceiptFrame
   | AcceptedFrame
+  | ReservedFrame
   | PongFrame
   | ErrorFrame;
 
@@ -255,6 +337,7 @@ const SERVER_FRAME_TYPES: readonly ServerFrame["type"][] = [
   "notice",
   "receipt",
   "accepted",
+  "reserved",
   "pong",
   "error",
 ];
@@ -723,6 +806,48 @@ export function validateServerFrame(value: unknown): ServerFrameOutcome {
       return { kind: "frame", frame: { type: "accepted", id, delivered, shed } };
     }
 
+    case "reserved": {
+      const requestId = map["request_id"];
+      if (!isNonEmptyString(requestId)) {
+        return fieldInvalid("reserved", "request_id", requestId);
+      }
+      const status = map["status"];
+      if (!isNonEmptyString(status)) {
+        return fieldInvalid("reserved", "status", status);
+      }
+      const expiresIn = map["expires_in"];
+      const stated = expiresIn !== undefined && expiresIn !== null;
+      if (
+        stated &&
+        (typeof expiresIn !== "number" ||
+          !Number.isInteger(expiresIn) ||
+          expiresIn < 0 ||
+          expiresIn > 0xffff_ffff)
+      ) {
+        return fieldInvalid("reserved", "expires_in", expiresIn, "a u32");
+      }
+      // A lifetime beside a refusal is rejected rather than ignored. The
+      // sender's whole use for this number is to state it to a recipient, so a
+      // relay defect here would become a promise about a payload that will not
+      // exist -- and the recipient would read its absence as expiry, which is
+      // somebody else's cause.
+      if (stated && status !== "granted") {
+        return {
+          kind: "invalid",
+          reason: `reserved.expires_in is present with status ${JSON.stringify(status)}, which is not a grant`,
+        };
+      }
+      return {
+        kind: "frame",
+        frame: {
+          type: "reserved",
+          request_id: requestId,
+          status,
+          ...(stated ? { expires_in: expiresIn as number } : {}),
+        },
+      };
+    }
+
     case "error": {
       const code = map["code"];
       if (!isNonEmptyString(code)) return fieldInvalid("error", "code", code);
@@ -783,23 +908,30 @@ function validateDelivery(
   if (replyTo.kind === "invalid") {
     return fieldInvalid(type, "reply_to", map["reply_to"], "a string");
   }
-
-  if (type === "notice") {
-    return {
-      kind: "frame",
-      frame:
-        replyTo.value === null
-          ? { type: "notice", id, from, body }
-          : { type: "notice", id, from, body, reply_to: replyTo.value },
-    };
+  const attachment = optionalString(map, "attachment");
+  if (attachment.kind === "invalid") {
+    return fieldInvalid(type, "attachment", map["attachment"], "a string");
   }
-  return {
-    kind: "frame",
-    frame:
-      replyTo.value === null
-        ? { type: "message", id, from, body }
-        : { type: "message", id, from, body, reply_to: replyTo.value },
+  // Validated on arrival, because everything downstream uses it as a URL path
+  // component and as the name of a local file. A relay that sent something else
+  // would otherwise have its value carried into both.
+  if (attachment.value !== null && digestProblem(attachment.value) !== null) {
+    return fieldInvalid(
+      type,
+      "attachment",
+      map["attachment"],
+      `${DIGEST_CHARS} characters of unpadded base64url`,
+    );
+  }
+
+  const optional = {
+    ...(replyTo.value === null ? {} : { reply_to: replyTo.value }),
+    ...(attachment.value === null ? {} : { attachment: attachment.value }),
   };
+  if (type === "notice") {
+    return { kind: "frame", frame: { type: "notice", id, from, body, ...optional } };
+  }
+  return { kind: "frame", frame: { type: "message", id, from, body, ...optional } };
 }
 
 /**
@@ -943,6 +1075,71 @@ export function correlationProblem(value: string): IdentifierProblem | null {
     return { kind: "too_long", limit: MAX_CORRELATION_BYTES, found: bytes };
   }
   return null;
+}
+
+/** Why a payload address was rejected. */
+export type DigestProblem =
+  | { readonly kind: "wrong_length"; readonly expected: number; readonly found: number }
+  | { readonly kind: "not_base64url"; readonly character: string };
+
+/** Renders a digest problem as the diagnostic half of a validation message. */
+export function describeDigestProblem(problem: DigestProblem): string {
+  switch (problem.kind) {
+    case "wrong_length":
+      return `must be exactly ${problem.expected} characters, found ${problem.found}`;
+    case "not_base64url":
+      return `contains ${JSON.stringify(problem.character)}, which is not unpadded base64url`;
+  }
+}
+
+/**
+ * Validates a payload address: exactly {@link DIGEST_CHARS} characters of
+ * unpadded base64url.
+ *
+ * Its own rule rather than {@link identifierProblem} or
+ * {@link correlationProblem}, because a digest is neither: it is a fixed-width
+ * encoding of 256 bits, so its rule is an equality rather than a limit, and both
+ * of those would accept the 42-character value this one rejects.
+ *
+ * The alphabet is what makes a digest safe as a URL path component with no
+ * escaping, and the exact length is what stops one being a relative path
+ * segment: `.` and `..` fail on length, `/` and `=` fail on alphabet.
+ *
+ * @returns the first rule broken, or `null` when the value is a valid address.
+ */
+export function digestProblem(value: string): DigestProblem | null {
+  // Counted in code points rather than UTF-16 units, so a multi-byte character
+  // is reported as the alphabet violation it is rather than as a length that
+  // happens to differ.
+  const found = [...value].length;
+  if (found !== DIGEST_CHARS) {
+    return { kind: "wrong_length", expected: DIGEST_CHARS, found };
+  }
+  for (const character of value) {
+    if (!BASE64URL_CHARACTER.test(character)) {
+      return { kind: "not_base64url", character };
+    }
+  }
+  return null;
+}
+
+/**
+ * The SHA-256 of `bytes`, as unpadded base64url: the address a payload is
+ * stored under.
+ *
+ * Computed here and never taken from a caller, because the address is what makes
+ * a fetch verifiable: a caller-supplied digest would let a defect anywhere
+ * upstream put a payload at an address that does not describe it, and every
+ * recipient trusting the address would receive content it does not name.
+ *
+ * Web Crypto rather than a hashing dependency: `crypto.subtle` is built into
+ * Bun, and the relay's `sha2` output is pinned against this encoding by a test
+ * on each side.
+ */
+export async function digestOf(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  const hashed = await crypto.subtle.digest("SHA-256", bytes);
+  // `base64url` is Node's and Bun's name for the unpadded URL-safe alphabet.
+  return Buffer.from(hashed).toString("base64url");
 }
 
 /**

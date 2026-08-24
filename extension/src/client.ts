@@ -26,7 +26,10 @@ import {
   bodyOverBudget,
   correlationProblem,
   describe,
+  describeDigestProblem,
   describeIdentifierProblem,
+  digestOf,
+  digestProblem,
   encodeFrame,
   FrameAccumulator,
   MAX_BODY_BYTES,
@@ -39,6 +42,8 @@ import {
   type ErrorFrame,
   type PeersFrame,
   type ReceiptFrame,
+  type ReservedFrame,
+  type ReserveStatus,
   type ServerFrame,
 } from "./protocol.ts";
 
@@ -73,6 +78,21 @@ export const HEARTBEAT_INTERVAL_MS = 30_000;
  * leaving the client `connecting` for the life of the process.
  */
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * Ceiling on one payload transfer with no answer.
+ *
+ * Deliberately not {@link REQUEST_TIMEOUT_MS}. That deadline is right for a
+ * frame exchange, where an answer either comes promptly or is not coming; a
+ * transfer's duration scales with the payload, so the same bound would fail a
+ * large payload on a slow link *because it was working*.
+ *
+ * Ten seconds is a bound on silence rather than on the transfer: `fetch`
+ * resolves as soon as response headers arrive, so this covers the round trip to
+ * the first byte and not the body that follows it. A relay that is up answers a
+ * `reserve`d upload's headers in milliseconds on a LAN.
+ */
+export const TRANSFER_STALL_MS = 10_000;
 
 /** Delay before the first reconnect attempt of an outage. */
 export const RECONNECT_INITIAL_MS = 500;
@@ -182,7 +202,34 @@ export type RequestFailureReason =
   /** The relay answered with an `error` frame naming this request. */
   | "relay_error"
   /** The relay answered with a frame of the wrong type for this request. */
-  | "unexpected_reply";
+  | "unexpected_reply"
+  /**
+   * The relay does not implement attachments, so nothing can be reserved.
+   *
+   * Distinct from `relay_error` because it is the answer the capability probe
+   * exists to produce: a relay one version behind answers `reserve` with
+   * `unsupported_frame` on an open connection, and the caller reports that
+   * attachments are unavailable rather than treating its connection as broken.
+   */
+  | "unsupported"
+  /**
+   * A ceiling refused the reservation. {@link RequestFailed.status} names which.
+   *
+   * An answer rather than a fault: the relay understood the request and acted on
+   * it. Kept apart from `relay_error` so a caller can tell "wait, or send less"
+   * from "this connection is not working".
+   */
+  | "refused"
+  /** A payload transfer failed, stalled, or was cancelled. */
+  | "transfer_failed"
+  /**
+   * A payload is larger than the ceiling the caller set for it. Carries the
+   * size in {@link RequestFailed.bytes}, because deciding what to do next needs
+   * the number.
+   */
+  | "over_ceiling"
+  /** The address names no payload the relay holds, or it has expired. */
+  | "unavailable";
 
 /** A request that will not be answered. Rejects the caller's promise. */
 export class RequestFailed extends Error {
@@ -198,15 +245,25 @@ export class RequestFailed extends Error {
   readonly reason: RequestFailureReason;
   /** The relay's code, when {@link reason} is `relay_error`. */
   readonly code: ErrorCode | null;
+  /** Which ceiling refused, when {@link reason} is `refused`. */
+  readonly status: ReserveStatus | null;
+  /** The payload's size, when {@link reason} is `over_ceiling`. */
+  readonly bytes: number | null;
 
   constructor(
     reason: RequestFailureReason,
     message: string,
-    code: ErrorCode | null = null,
+    detail: {
+      readonly code?: ErrorCode;
+      readonly status?: ReserveStatus;
+      readonly bytes?: number;
+    } = {},
   ) {
     super(message);
     this.reason = reason;
-    this.code = code;
+    this.code = detail.code ?? null;
+    this.status = detail.status ?? null;
+    this.bytes = detail.bytes ?? null;
   }
 }
 
@@ -219,6 +276,14 @@ export interface SendRequest {
   readonly body: string;
   readonly replyTo?: string;
   readonly id?: string;
+  /**
+   * Address of a payload already uploaded through {@link RelayClient.attach}.
+   *
+   * A caller that has not reserved and uploaded must not set this: the relay
+   * relays it uninterpreted, so a reference to nothing arrives looking exactly
+   * like a reference to something.
+   */
+  readonly attachment?: string;
 }
 
 /**
@@ -232,10 +297,40 @@ export interface AnnounceRequest {
   readonly body: string;
   readonly replyTo?: string;
   readonly id?: string;
+  /** Same rules as {@link SendRequest.attachment}. */
+  readonly attachment?: string;
+}
+
+/** A payload the relay now holds, as its sender needs to describe it. */
+export interface Attachment {
+  /** The address, to be carried on a `send` or an `announce`. */
+  readonly digest: string;
+  /** Byte length uploaded. */
+  readonly bytes: number;
+  /**
+   * Seconds the reference remains resolvable, as the relay stated it.
+   *
+   * Passed on rather than kept, because the sender's job is to say so in the
+   * body: a recipient reading late finds expiry, and expiry reported as failure
+   * is somebody else's cause.
+   */
+  readonly expiresIn: number;
 }
 
 /** Which request a pending entry belongs to, for its diagnostics. */
-export type RequestKind = "list" | "send" | "announce";
+export type RequestKind = "list" | "send" | "announce" | "reserve";
+
+/**
+ * The reply spaces a correlation token may occupy.
+ *
+ * Enumerated rather than left implicit, so every place that has to consider all
+ * of them — routing an `error` frame that names a token but not a class — covers
+ * each by construction instead of by a list someone remembered to extend.
+ */
+export const REPLY_SPACES = ["list", "delivery", "reserve"] as const;
+
+/** One reply space. */
+export type ReplySpace = (typeof REPLY_SPACES)[number];
 
 /**
  * Which reply space a request's correlation token occupies.
@@ -248,15 +343,27 @@ export type RequestKind = "list" | "send" | "announce";
  * may get. Sharing the space is what turns that ambiguity into a refusal of the
  * second request instead of a reply settling the wrong caller.
  *
- * `list` keeps its own space. Its token is a different field answered by a
- * different frame, and nothing is gained by forbidding a coincidence there.
+ * `list` and `reserve` keep their own. Each carries its token in a different
+ * field answered by a different frame, and nothing is gained by forbidding a
+ * coincidence between them.
  */
-function replySpace(kind: RequestKind): "list" | "delivery" {
-  return kind === "list" ? "list" : "delivery";
+function replySpace(kind: RequestKind): ReplySpace {
+  switch (kind) {
+    case "list":
+      return "list";
+    case "reserve":
+      return "reserve";
+    case "send":
+    case "announce":
+      return "delivery";
+  }
 }
 
 type RequestOutcome =
-  | { readonly ok: true; readonly frame: PeersFrame | ReceiptFrame | AcceptedFrame }
+  | {
+      readonly ok: true;
+      readonly frame: PeersFrame | ReceiptFrame | AcceptedFrame | ReservedFrame;
+    }
   | { readonly ok: false; readonly error: RequestFailed };
 
 interface PendingRequest {
@@ -301,6 +408,20 @@ export function backoffDelay(attempt: number, random: () => number): number {
   const base = Math.min(exponential, RECONNECT_CAP_MS);
   const jittered = base * (1 + RECONNECT_JITTER * (random() * 2 - 1));
   return Math.min(Math.round(jittered), RECONNECT_CAP_MS);
+}
+
+/**
+ * Percent-encodes one room component for a transfer route.
+ *
+ * Beyond `encodeURIComponent` in one respect: `.` is encoded too. A room named
+ * `..`/`..` is admissible under every identifier rule, and `encodeURIComponent`
+ * leaves the dot alone -- which would put a literal `..` in the path. The relay
+ * hashes a room's components, so nothing can traverse either way; what a literal
+ * `..` would break is reachability, because any intermediary that normalizes a
+ * path would rewrite the route out from under the request.
+ */
+function pathSegment(value: string): string {
+  return encodeURIComponent(value).replaceAll(".", "%2E");
 }
 
 /**
@@ -374,6 +495,15 @@ export class RelayClient {
    */
   #statedCause: string | null = null;
 
+  /**
+   * Transfers in flight, so shutdown can cancel them.
+   *
+   * A transfer outlives the frame exchange that authorized it and runs on no
+   * connection this client owns, so nothing else would end one: a host tearing
+   * down a session would return from `stop()` with a download still writing.
+   */
+  #transfers = new Set<AbortController>();
+
   constructor(options: RelayClientOptions) {
     this.#config = options.config;
     this.#scheduler = options.scheduler ?? ambientScheduler;
@@ -421,6 +551,15 @@ export class RelayClient {
     this.#clearHeartbeat();
     this.#timedOut.clear();
     this.#failPending(new RequestFailed("stopped", "the client was stopped"));
+
+    // Cancelled before anything can return early, because a transfer is the one
+    // thing here that does not end when the connection does: it runs on its own
+    // socket, and a client with no frame connection may still have one in
+    // flight.
+    for (const controller of this.#transfers) {
+      controller.abort(new Error("the client was stopped"));
+    }
+    this.#transfers.clear();
 
     const socket = this.#socket;
     this.#socket = null;
@@ -517,6 +656,12 @@ export class RelayClient {
         `send body is ${oversized} UTF-8 bytes, over the ${MAX_BODY_BYTES}-byte budget`,
       );
     }
+    if (request.attachment !== undefined) {
+      const broken = digestProblem(request.attachment);
+      if (broken !== null) {
+        return refuse(`send attachment ${describeDigestProblem(broken)}`);
+      }
+    }
 
     this.#issue(
       id,
@@ -527,6 +672,7 @@ export class RelayClient {
         to: request.to,
         body: request.body,
         ...(request.replyTo === undefined ? {} : { reply_to: request.replyTo }),
+        ...(request.attachment === undefined ? {} : { attachment: request.attachment }),
       },
       (outcome) => {
         if (!outcome.ok) {
@@ -584,6 +730,12 @@ export class RelayClient {
         `announce body is ${oversized} UTF-8 bytes, over the ${MAX_BODY_BYTES}-byte budget`,
       );
     }
+    if (request.attachment !== undefined) {
+      const broken = digestProblem(request.attachment);
+      if (broken !== null) {
+        return refuse(`announce attachment ${describeDigestProblem(broken)}`);
+      }
+    }
 
     this.#issue(
       id,
@@ -593,6 +745,7 @@ export class RelayClient {
         id,
         body: request.body,
         ...(request.replyTo === undefined ? {} : { reply_to: request.replyTo }),
+        ...(request.attachment === undefined ? {} : { attachment: request.attachment }),
       },
       (outcome) => {
         if (!outcome.ok) {
@@ -610,6 +763,267 @@ export class RelayClient {
       },
     );
     return promise;
+  }
+
+  // -------------------------------------------------------------------------
+  // Attachments
+  // -------------------------------------------------------------------------
+
+  /**
+   * Reserves room for a payload and uploads it, returning its reference.
+   *
+   * The order is the contract. The reservation comes first because it is what
+   * authorizes the upload at all — the transfer route carries no credential, so
+   * write authority is the `hello` handshake this connection already completed —
+   * and because it is the capability probe: a relay that does not implement
+   * attachments answers `unsupported_frame`, and this rejects with
+   * `unsupported` so a caller reports that rather than attaching a reference
+   * nothing can resolve.
+   *
+   * The address is computed here, from the bytes, and never taken from a caller.
+   * A caller-supplied digest would let a defect anywhere upstream put a payload
+   * at an address that does not describe it, and every recipient trusting the
+   * address would receive content the address does not name.
+   *
+   * @throws RequestFailed with `unsupported`, `refused`, or `transfer_failed`.
+   */
+  async attach(bytes: Uint8Array<ArrayBuffer>): Promise<Attachment> {
+    const digest = await digestOf(bytes);
+    const reserved = await this.reserve(digest, bytes.byteLength);
+
+    if (reserved.status !== "granted") {
+      throw new RequestFailed(
+        "refused",
+        `the relay refused to hold ${bytes.byteLength} bytes: ${reserved.status}`,
+        { status: reserved.status },
+      );
+    }
+    // A grant always states a lifetime; `protocol.ts` rejects one that does not,
+    // so this is a total function rather than a default standing in for a
+    // missing field.
+    const expiresIn = reserved.expires_in ?? 0;
+
+    await this.#transfer("PUT", digest, {
+      body: bytes,
+      headers: { "content-length": String(bytes.byteLength) },
+      expect: [201, 204],
+    });
+
+    return { digest, bytes: bytes.byteLength, expiresIn };
+  }
+
+  /**
+   * Asks the relay to hold `bytes` for the payload addressed `digest`.
+   *
+   * Exposed separately from {@link attach} so a caller can probe without
+   * uploading, and because the reply carries the lifetime a sender has to state.
+   */
+  reserve(digest: string, bytes: number): Promise<ReservedFrame> {
+    const requestId = crypto.randomUUID();
+    const { promise, resolve, reject } = Promise.withResolvers<ReservedFrame>();
+
+    const broken = digestProblem(digest);
+    if (broken !== null) {
+      reject(
+        new RequestFailed("invalid_request", `reserve digest ${describeDigestProblem(broken)}`),
+      );
+      return promise;
+    }
+    if (!Number.isInteger(bytes) || bytes < 0) {
+      reject(
+        new RequestFailed("invalid_request", `reserve bytes must be a non-negative integer, got ${bytes}`),
+      );
+      return promise;
+    }
+
+    this.#issue(
+      requestId,
+      "reserve",
+      { type: "reserve", request_id: requestId, digest, bytes },
+      (outcome) => {
+        if (!outcome.ok) {
+          // A relay that does not know the frame answers `unsupported_frame`,
+          // which arrives here as a `relay_error`. Translated so the caller
+          // branches on the capability rather than on a code.
+          if (outcome.error.reason === "relay_error" && outcome.error.code === "unsupported_frame") {
+            reject(
+              new RequestFailed(
+                "unsupported",
+                "this relay does not implement attachments, so nothing can be reserved",
+                { code: outcome.error.code },
+              ),
+            );
+            return;
+          }
+          reject(outcome.error);
+        } else if (outcome.frame.type === "reserved") {
+          resolve(outcome.frame);
+        } else {
+          reject(
+            new RequestFailed(
+              "unexpected_reply",
+              `reserve ${requestId} was answered with a ${outcome.frame.type} frame`,
+            ),
+          );
+        }
+      },
+    );
+    return promise;
+  }
+
+  /**
+   * The byte length of a stored payload, without transferring it.
+   *
+   * Strictly more informative than a size carried on the frame that referenced
+   * it: this reports the size *and* whether the payload still exists, which a
+   * value fixed at send time cannot.
+   *
+   * @returns the length, or `null` when the relay holds no such payload.
+   */
+  async lengthOf(digest: string): Promise<number | null> {
+    const broken = digestProblem(digest);
+    if (broken !== null) {
+      throw new RequestFailed(
+        "invalid_request",
+        `attachment digest ${describeDigestProblem(broken)}`,
+      );
+    }
+    const response = await this.#transfer("HEAD", digest, { expect: [200, 404] });
+    if (response.status === 404) {
+      return null;
+    }
+    const declared = Number(response.headers.get("content-length"));
+    return Number.isInteger(declared) && declared >= 0 ? declared : null;
+  }
+
+  /**
+   * Downloads a stored payload and verifies it against its own address.
+   *
+   * Verification is not optional here. The server hashes what it receives, so an
+   * address cannot lie about content; this side hashes what it downloads, so a
+   * truncated response, an interposed proxy, or a defect in either
+   * implementation is caught rather than delivered. One hashing pass against a
+   * network transfer of the same bytes.
+   *
+   * `maxBytes` is checked with the length-only request first, so a payload over
+   * the ceiling costs no transfer at all.
+   *
+   * @throws RequestFailed with `unavailable`, `over_ceiling`, or
+   * `transfer_failed`.
+   */
+  async fetchAttachment(
+    digest: string,
+    options: { readonly maxBytes?: number } = {},
+  ): Promise<Uint8Array<ArrayBuffer>> {
+    if (options.maxBytes !== undefined) {
+      const length = await this.lengthOf(digest);
+      if (length === null) {
+        throw new RequestFailed(
+          "unavailable",
+          `the relay holds no payload at ${digest}; it was never uploaded or its time to live has elapsed`,
+        );
+      }
+      if (length > options.maxBytes) {
+        throw new RequestFailed(
+          "over_ceiling",
+          `the payload is ${length} bytes, over the ${options.maxBytes}-byte ceiling; nothing was transferred`,
+          { bytes: length },
+        );
+      }
+    }
+
+    const response = await this.#transfer("GET", digest, { expect: [200, 404] });
+    if (response.status === 404) {
+      throw new RequestFailed(
+        "unavailable",
+        `the relay holds no payload at ${digest}; it was never uploaded or its time to live has elapsed`,
+      );
+    }
+
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const computed = await digestOf(bytes);
+    if (computed !== digest) {
+      // Nothing is handed back. A payload that does not match its address is not
+      // a smaller or older version of what was asked for; it is content the
+      // address does not describe.
+      throw new RequestFailed(
+        "transfer_failed",
+        `the downloaded payload hashes to ${computed}, not to the address ${digest} it was fetched from`,
+      );
+    }
+    return bytes;
+  }
+
+  /**
+   * Performs one transfer request against this client's own relay.
+   *
+   * Every part of the URL comes from local state: the host and port from this
+   * client's configuration, and the room from the connection this client
+   * established. Nothing from a delivered frame reaches it but the digest, so
+   * the worst a hostile sender can do is name an address the local relay does
+   * not hold. A location supplied over the wire would let it aim this fetch at a
+   * host of its choosing.
+   *
+   * Bounded by progress rather than by {@link REQUEST_TIMEOUT_MS}. That deadline
+   * is right for a frame exchange, where an answer either comes promptly or is
+   * not coming; a transfer's duration scales with the payload, so the same bound
+   * would fail a large payload on a slow link *because it was working*. The
+   * stall bound restarts on every chunk, and every timer comes from the host's
+   * scheduler so a test drives them.
+   */
+  async #transfer(
+    method: "PUT" | "GET" | "HEAD",
+    digest: string,
+    options: {
+      readonly body?: Uint8Array<ArrayBuffer>;
+      readonly headers?: Record<string, string>;
+      readonly expect: readonly number[];
+    },
+  ): Promise<Response> {
+    if (this.#stopped) {
+      throw new RequestFailed("stopped", "the client is not running");
+    }
+    const room = this.#config.room;
+    const { host, port } = this.#config.transport;
+    // Bracketed for an IPv6 literal, which a URL requires and a `host:port`
+    // configuration value does not carry.
+    const authority = host.includes(":") ? `[${host}]` : host;
+    const url = `http://${authority}:${port}/blob/${pathSegment(room.project)}/${pathSegment(room.task)}/${digest}`;
+
+    const controller = new AbortController();
+    this.#transfers.add(controller);
+    // Restarted by nothing: `fetch` gives no progress events, so the bound is on
+    // the whole request rather than on the gaps within it. Named for what it is.
+    const stall = this.#scheduler.setTimeout(() => {
+      controller.abort(new Error(`no progress within ${TRANSFER_STALL_MS} ms`));
+    }, TRANSFER_STALL_MS);
+
+    try {
+      const response = await fetch(url, {
+        method,
+        signal: controller.signal,
+        ...(options.body === undefined ? {} : { body: options.body }),
+        ...(options.headers === undefined ? {} : { headers: options.headers }),
+      });
+      if (!options.expect.includes(response.status)) {
+        throw new RequestFailed(
+          "transfer_failed",
+          `${method} ${digest} was answered ${response.status}`,
+        );
+      }
+      return response;
+    } catch (error) {
+      if (error instanceof RequestFailed) {
+        throw error;
+      }
+      throw new RequestFailed(
+        "transfer_failed",
+        `${method} ${digest} failed: ${describe(error)}`,
+      );
+    } finally {
+      this.#scheduler.clearTimeout(stall);
+      this.#transfers.delete(controller);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -769,6 +1183,10 @@ export class RelayClient {
         this.#settle(frame.id, "announce", { ok: true, frame });
         break;
 
+      case "reserved":
+        this.#settle(frame.request_id, "reserve", { ok: true, frame });
+        break;
+
       case "error":
         this.#handleError(socket, frame);
         break;
@@ -814,7 +1232,9 @@ export class RelayClient {
     if (frame.request_id !== undefined && this.#state === "ready") {
       const settled = this.#settleEither(frame.request_id, {
         ok: false,
-        error: new RequestFailed("relay_error", `the relay rejected the request: ${detail}`, frame.code),
+        error: new RequestFailed("relay_error", `the relay rejected the request: ${detail}`, {
+          code: frame.code,
+        }),
       });
       if (settled) {
         return;
@@ -1072,12 +1492,20 @@ export class RelayClient {
    * An `error` names a token and not a class, which is precisely why `send` and
    * `announce` share one space: with both outstanding under one token this
    * function would have to guess, and it would guess in silence.
+   *
+   * Iterates {@link REPLY_SPACES} rather than naming the spaces, so a request
+   * class added later is covered by construction. `reserve` was the case that
+   * showed why: with the spaces listed here by hand, a refused reservation's
+   * `error` frame would have matched nothing and its caller would have waited
+   * out the full request deadline for an answer that had already arrived.
    */
   #settleEither(token: string, outcome: RequestOutcome): boolean {
-    return (
-      this.#settleKey(`delivery:${token}`, outcome) ||
-      this.#settleKey(`list:${token}`, outcome)
-    );
+    for (const space of REPLY_SPACES) {
+      if (this.#settleKey(`${space}:${token}`, outcome)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   #settleKey(key: string, outcome: RequestOutcome): boolean {

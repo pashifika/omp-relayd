@@ -4,10 +4,15 @@ import type {
   ExtensionMode,
 } from "@oh-my-pi/pi-coding-agent";
 
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
   RelayClient,
   RequestFailed,
   type AnnounceRequest,
+  type Attachment,
   type ClientState,
   type Scheduler,
   type SendRequest,
@@ -27,7 +32,9 @@ import {
 import {
   correlationProblem,
   describe,
+  describeDigestProblem,
   describeIdentifierProblem,
+  digestProblem,
   identifierProblem,
   type AcceptedFrame,
   type DeliveryFrame,
@@ -71,6 +78,15 @@ export const OUTBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.sent";
  */
 export const OUTBOUND_ANNOUNCE_TYPE = "io.github.pashifika.omp-relay.announced";
 
+/**
+ * Where a fetched payload lands, under the process's temporary directory.
+ *
+ * Owner-only, and named for the product rather than for a room: the file's own
+ * name is the payload's address, which is unique across every room by
+ * construction.
+ */
+const ATTACHMENT_DIR = "omp-relay-attachments";
+
 export interface MeshArguments {
   readonly action?: unknown;
   readonly to?: unknown;
@@ -79,6 +95,12 @@ export interface MeshArguments {
   readonly project?: unknown;
   readonly task?: unknown;
   readonly as?: unknown;
+  /** Local file to attach to a `send` or an `announce`. */
+  readonly attach?: unknown;
+  /** The reference a `fetch` resolves. */
+  readonly reference?: unknown;
+  /** Byte ceiling above which a `fetch` transfers nothing. */
+  readonly max_bytes?: unknown;
 }
 
 export interface MeshClient {
@@ -86,6 +108,15 @@ export interface MeshClient {
   list(): Promise<PeersFrame>;
   send(request: SendRequest): Promise<ReceiptFrame>;
   announce(request: AnnounceRequest): Promise<AcceptedFrame>;
+  /** Reserves room for `bytes`, uploads it, and returns the reference. */
+  attach(bytes: Uint8Array<ArrayBuffer>): Promise<Attachment>;
+  /** Downloads a referenced payload, verifying it against its own address. */
+  fetchAttachment(
+    digest: string,
+    options?: { readonly maxBytes?: number },
+  ): Promise<Uint8Array<ArrayBuffer>>;
+  /** The byte length of a referenced payload, or `null` when it is absent. */
+  lengthOf(digest: string): Promise<number | null>;
 }
 
 export interface MeshToolResult {
@@ -101,6 +132,8 @@ export interface InboundDetails {
   readonly task: string;
   readonly body: string;
   readonly reply_to?: string;
+  /** The reference as received. No payload byte is ever recorded. */
+  readonly attachment?: string;
 }
 
 /** The exact values of one outbound message and the receipt that acknowledged it. */
@@ -112,6 +145,8 @@ export interface OutboundDetails {
   readonly body: string;
   readonly status: string;
   readonly reply_to?: string;
+  /** The reference this message carried, when it carried one. */
+  readonly attachment?: string;
 }
 
 /**
@@ -129,6 +164,8 @@ export interface AnnouncedDetails {
   readonly delivered: number;
   readonly shed: number;
   readonly reply_to?: string;
+  /** The reference this announcement carried, when it carried one. */
+  readonly attachment?: string;
 }
 
 /**
@@ -181,11 +218,12 @@ export type JoinOutcome =
 /**
  * What {@link executeMesh} needs from the session runtime.
  *
- * An interface rather than the client alone, because three of the four actions
- * now reach past the connection: `join` replaces it, and `send` and `announce`
- * each persist a record beside it. Keeping those behind named members is what
- * lets the tool's behaviour — including its refusal to register a
- * non-interactive session — be exercised without a socket.
+ * An interface rather than the client alone, because most of the actions reach
+ * past the connection: `join` replaces it, `send` and `announce` each persist a
+ * record beside it, and the attachment paths touch the filesystem. Keeping those
+ * behind named members is what lets the tool's behaviour — including its refusal
+ * to register a non-interactive session, and every attachment rule — be
+ * exercised without a socket and without a real file.
  */
 export interface MeshHost {
   /**
@@ -202,6 +240,22 @@ export interface MeshHost {
   join(parameters: JoinParameters): Promise<JoinOutcome>;
   recordSend(details: OutboundDetails): void;
   recordAnnounce(details: AnnouncedDetails): void;
+  /**
+   * Reads a local file the caller named, for attaching.
+   *
+   * Behind the host because the failure is the interesting case: an unreadable
+   * or absent path must be refused before any frame is written, and asserting
+   * that costs a real unreadable file otherwise.
+   */
+  readAttachment(path: string): Promise<Uint8Array<ArrayBuffer>>;
+  /**
+   * Writes a fetched payload to a file this extension owns, returning its path.
+   *
+   * The name is derived from `digest` alone. A filename supplied by a remote
+   * peer would become a path component on this machine; no frame carries one,
+   * and none is accepted if a future one does.
+   */
+  saveAttachment(digest: string, bytes: Uint8Array<ArrayBuffer>): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +332,77 @@ function requestFailure(error: unknown): MeshToolResult {
   });
 }
 
-function receiptResult(receipt: ReceiptFrame): MeshToolResult {
+/**
+ * Names a refused reservation, and never a message sent without its attachment.
+ *
+ * A caller that attached a file asked for one thing: the message *and* the
+ * material. Sending the body alone would report success for a request that was
+ * not performed, and the recipient would read prose referring to material that
+ * never arrived.
+ */
+function attachmentFailure(action: "send" | "announce", error: unknown): MeshToolResult {
+  if (error instanceof RequestFailed && error.reason === "refused") {
+    // The recovery differs by which bound refused. A payload over the
+    // per-payload maximum will never fit, so waiting is the wrong advice; a full
+    // room or store is capacity, which does free up.
+    const recovery =
+      error.status === "payload_too_large"
+        ? "The payload is over the per-payload maximum, so waiting will not help: split it, " +
+          "send a smaller part, or describe it in the body instead."
+        : "This is capacity rather than a size limit: the room's payloads are removed when " +
+          "its last peer leaves and each payload expires on its own, so retrying later or " +
+          "attaching something smaller can succeed.";
+    return result(
+      `OMP Relay refused to hold the attachment (${error.status ?? "refused"}), so no ${action} ` +
+        `was performed and nothing reached the room. ${recovery}`,
+      {
+        action,
+        status: "refused",
+        reason: "attachment_refused",
+        ...(error.status === null ? {} : { refusal: error.status }),
+      },
+    );
+  }
+  if (error instanceof RequestFailed && error.reason === "unsupported") {
+    return result(
+      `This relay does not implement attachments, so nothing was ${action === "send" ? "sent" : "announced"}. ` +
+        `Include the material in the message body, or split it, and say why.`,
+      { action, status: "unavailable", reason: "attachments_unsupported" },
+    );
+  }
+  return requestFailure(error);
+}
+
+/**
+ * Reports that a referenced payload is gone, as expiry rather than as a fault.
+ *
+ * The distinction decides what a caller does next. A transfer that failed is
+ * retried; a payload that is no longer held will not reappear, and the recovery
+ * is to ask its sender to send it again.
+ */
+function expiredResult(reference: string): MeshToolResult {
+  return result(
+    `The relay no longer holds the payload at ${reference}. This is expiry rather than ` +
+      "a failure: stored payloads have a limited lifetime and a room's payloads are " +
+      "removed when its last peer leaves. Ask the sender to send it again; retrying the " +
+      "fetch will not recover it.",
+    { action: "fetch", status: "unavailable", reference, reason: "expired" },
+  );
+}
+
+/** How a sender is told what it must pass on: the lifetime, in whole units. */
+function expiryNote(seconds: number | undefined): string {
+  if (seconds === undefined || seconds <= 0) return "";
+  const hours = Math.floor(seconds / 3600);
+  const stated = hours >= 1 ? `${hours} hour${hours === 1 ? "" : "s"}` : `${Math.floor(seconds / 60)} minutes`;
+  return ` The attachment is held for about ${stated}; say so in the body, because a recipient reading later will find it gone.`;
+}
+
+function receiptResult(
+  receipt: ReceiptFrame,
+  attachment?: string,
+  expiry?: number,
+): MeshToolResult {
   let text: string;
   switch (receipt.status) {
     case "routed":
@@ -297,11 +421,18 @@ function receiptResult(receipt: ReceiptFrame): MeshToolResult {
       text = `Relay returned receipt status ${JSON.stringify(receipt.status)} for message ${receipt.id}.`;
       break;
   }
-  return result(text, {
+  const rendered =
+    attachment === undefined
+      ? text
+      : `${text} It carries attachment reference ${attachment}, which the recipient fetches with ` +
+        `action "fetch".${expiryNote(expiry)}`;
+  return result(rendered, {
     action: "send",
     id: receipt.id,
     to: receipt.to,
     status: receipt.status,
+    ...(attachment === undefined ? {} : { attachment }),
+    ...(expiry === undefined ? {} : { expires_in: expiry }),
   });
 }
 
@@ -320,7 +451,11 @@ function receiptResult(receipt: ReceiptFrame): MeshToolResult {
  * peer that is not reading its socket, so an immediate resend adds to a queue
  * that is already full.
  */
-function acceptedResult(accepted: AcceptedFrame): MeshToolResult {
+function acceptedResult(
+  accepted: AcceptedFrame,
+  attachment?: string,
+  expiry?: number,
+): MeshToolResult {
   const { id, delivered, shed } = accepted;
   const peers = (count: number): string => (count === 1 ? "1 peer" : `${count} peers`);
 
@@ -332,11 +467,18 @@ function acceptedResult(accepted: AcceptedFrame): MeshToolResult {
   } else {
     text = `Announcement ${id} was queued for ${peers(delivered)} and shed by ${peers(shed)} that is not reading its connection; a shed peer is not reading, so resending would add to a queue that is already full.`;
   }
-  return result(text, {
+  const rendered =
+    attachment === undefined
+      ? text
+      : `${text} It carries attachment reference ${attachment}, which a recipient fetches with ` +
+        `action "fetch".${expiryNote(expiry)}`;
+  return result(rendered, {
     action: "announce",
     id,
     delivered,
     shed,
+    ...(attachment === undefined ? {} : { attachment }),
+    ...(expiry === undefined ? {} : { expires_in: expiry }),
   });
 }
 
@@ -446,9 +588,10 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
     args.action !== "join" &&
     args.action !== "list" &&
     args.action !== "send" &&
-    args.action !== "announce"
+    args.action !== "announce" &&
+    args.action !== "fetch"
   ) {
-    return validationFailure('action must be "join", "list", "send", or "announce"');
+    return validationFailure('action must be "join", "list", "send", "announce", or "fetch"');
   }
 
   if (args.action === "join") {
@@ -503,6 +646,9 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
         return validationFailure(`reply_to ${describeIdentifierProblem(replyProblem)}`);
       }
     }
+    if (args.attach !== undefined && typeof args.attach !== "string") {
+      return validationFailure("attach must be a string path when provided");
+    }
   }
 
   if (args.action === "announce") {
@@ -542,6 +688,37 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
         return validationFailure(`reply_to ${describeIdentifierProblem(replyProblem)}`);
       }
     }
+    if (args.attach !== undefined && typeof args.attach !== "string") {
+      return validationFailure("attach must be a string path when provided");
+    }
+  }
+
+  if (args.action === "fetch") {
+    // The fields that name a peer, a room, or a message have no meaning here,
+    // and accepting one silently would let a caller believe it had scoped a
+    // fetch that is scoped by the reference alone.
+    for (const field of ["to", "message", "reply_to", "project", "task", "as", "attach"] as const) {
+      if (args[field] !== undefined) {
+        return validationFailure(
+          `fetch takes no ${field}: a fetch is addressed by its reference alone, in the room ` +
+            "this session already joined",
+        );
+      }
+    }
+    if (typeof args.reference !== "string") {
+      return validationFailure("fetch requires a string reference");
+    }
+    // Checked here rather than left to the client, so a malformed reference is a
+    // validation error naming the field rather than a request failure.
+    const broken = digestProblem(args.reference);
+    if (broken !== null) {
+      return validationFailure(`reference ${describeDigestProblem(broken)}`);
+    }
+    if (args.max_bytes !== undefined) {
+      if (typeof args.max_bytes !== "number" || !Number.isInteger(args.max_bytes) || args.max_bytes < 0) {
+        return validationFailure("max_bytes must be a non-negative integer when provided");
+      }
+    }
   }
 
   const client = host.client;
@@ -566,14 +743,81 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
       return result(text, { action: "list", peers: [...peers.peers] });
     }
 
+    if (args.action === "fetch") {
+      const reference = args.reference as string;
+      const ceiling = args.max_bytes as number | undefined;
+
+      // The ceiling is honoured with the length-only request, so a payload over
+      // it costs no transfer. Asking first also distinguishes expiry from a
+      // transfer fault, which a caller recovers from differently: an expired
+      // payload is asked for again, a failed transfer is retried.
+      if (ceiling !== undefined) {
+        const length = await client.lengthOf(reference);
+        if (length === null) {
+          return expiredResult(reference);
+        }
+        if (length > ceiling) {
+          return result(
+            `The payload at ${reference} is ${length} bytes, over the ${ceiling}-byte ceiling; ` +
+              "nothing was transferred and no file was written. Raise max_bytes to fetch it.",
+            { action: "fetch", status: "over_ceiling", reference, bytes: length },
+          );
+        }
+      }
+
+      let bytes: Uint8Array<ArrayBuffer>;
+      try {
+        bytes = await client.fetchAttachment(reference);
+      } catch (error) {
+        if (error instanceof RequestFailed && error.reason === "unavailable") {
+          return expiredResult(reference);
+        }
+        throw error;
+      }
+
+      // The name comes from the reference, never from remote text. The result
+      // carries the path and no payload byte: a payload is by definition larger
+      // than a frame can carry, and spending the model's context on material it
+      // usually wants to search, apply, or run is what a path avoids.
+      const path = await host.saveAttachment(reference, bytes);
+      return result(
+        `Fetched ${bytes.byteLength} bytes to ${path}. Read, apply, or run it with ordinary ` +
+          "tools; its contents are not in this result.",
+        { action: "fetch", status: "fetched", reference, bytes: bytes.byteLength, path },
+      );
+    }
+
     if (args.action === "announce") {
       const id = crypto.randomUUID();
       const body = args.message as string;
       const replyTo = args.reply_to as string | undefined;
+      const attachPath = args.attach as string | undefined;
+
+      let attachment: string | undefined;
+      let expiry: number | undefined;
+      if (attachPath !== undefined) {
+        let payload: Uint8Array<ArrayBuffer>;
+        try {
+          payload = await host.readAttachment(attachPath);
+        } catch (error) {
+          return validationFailure(
+            `attach could not be read: ${singleLine(describe(error))}; nothing was announced`,
+          );
+        }
+        try {
+          const held = await client.attach(payload);
+          attachment = held.digest;
+          expiry = held.expiresIn;
+        } catch (error) {
+          return attachmentFailure("announce", error);
+        }
+      }
+
       const accepted = await client.announce({
         id,
         body,
         ...(replyTo === undefined ? {} : { replyTo }),
+        ...(attachment === undefined ? {} : { attachment }),
       });
 
       // Recorded for the reason a `send` is: an announcement carries `reply_to`
@@ -591,20 +835,47 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
           delivered: accepted.delivered,
           shed: accepted.shed,
           ...(replyTo === undefined ? {} : { reply_to: replyTo }),
+          ...(attachment === undefined ? {} : { attachment }),
         });
       }
-      return acceptedResult(accepted);
+      return acceptedResult(accepted, attachment, expiry);
     }
 
     const id = crypto.randomUUID();
     const to = args.to as string;
     const body = args.message as string;
     const replyTo = args.reply_to as string | undefined;
+    const attachPath = args.attach as string | undefined;
+
+    let attachment: string | undefined;
+    let expiry: number | undefined;
+    if (attachPath !== undefined) {
+      // Read before the reservation, so an unreadable path costs no frame. The
+      // failure is a validation error rather than a request failure because
+      // nothing was asked of the relay.
+      let payload: Uint8Array<ArrayBuffer>;
+      try {
+        payload = await host.readAttachment(attachPath);
+      } catch (error) {
+        return validationFailure(
+          `attach could not be read: ${singleLine(describe(error))}; no message was sent`,
+        );
+      }
+      try {
+        const held = await client.attach(payload);
+        attachment = held.digest;
+        expiry = held.expiresIn;
+      } catch (error) {
+        return attachmentFailure("send", error);
+      }
+    }
+
     const receipt = await client.send({
       id,
       to,
       body,
       ...(replyTo === undefined ? {} : { replyTo }),
+      ...(attachment === undefined ? {} : { attachment }),
     });
 
     // Recorded with the relay's own verdict rather than only when it routed.
@@ -624,9 +895,10 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
         body,
         status: receipt.status,
         ...(replyTo === undefined ? {} : { reply_to: replyTo }),
+        ...(attachment === undefined ? {} : { attachment }),
       });
     }
-    return receiptResult(receipt);
+    return receiptResult(receipt, attachment, expiry);
   } catch (error) {
     return requestFailure(error);
   }
@@ -666,6 +938,7 @@ export function buildInboundInjection(
     task: room.task,
     body: delivery.body,
     ...(delivery.reply_to === undefined ? {} : { reply_to: delivery.reply_to }),
+    ...(delivery.attachment === undefined ? {} : { attachment: delivery.attachment }),
   };
   const announcement = delivery.type === "notice";
   const lines = [
@@ -677,6 +950,17 @@ export function buildInboundInjection(
     `Task: ${singleLine(room.task)}`,
     `${announcement ? "Announcement" : "Message"} ID: ${singleLine(delivery.id)}`,
     ...(delivery.reply_to === undefined ? [] : [`Reply to: ${singleLine(delivery.reply_to)}`]),
+    // Stated, never resolved. Nothing has been downloaded: fetching on arrival
+    // would let a remote peer cause this machine to download arbitrary bytes at
+    // a moment nothing local chose, and put them on the path toward the model's
+    // context. Neutralized like every other remote value, and on its own
+    // provenance line so a body line cannot forge one.
+    ...(delivery.attachment === undefined
+      ? []
+      : [
+          `Attachment available, not downloaded: ${singleLine(delivery.attachment)}`,
+          'Fetch it deliberately with mesh action "fetch" if this work needs it.',
+        ]),
     "",
     ...quotedBody(delivery.body),
   ];
@@ -1015,9 +1299,9 @@ export default function ompRelay(pi: ExtensionAPI): void {
 
   const parameters = pi.zod.object({
     action: pi.zod
-      .enum(["join", "list", "send", "announce"])
+      .enum(["join", "list", "send", "announce", "fetch"])
       .describe(
-        "Connect to a room, list connected peers, send a message to one peer, or announce to every other peer in the room",
+        "Connect to a room, list connected peers, send a message to one peer, announce to every other peer in the room, or fetch a payload someone attached",
       ),
     project: pi.zod
       .string()
@@ -1037,6 +1321,24 @@ export default function ompRelay(pi: ExtensionAPI): void {
       .optional()
       .describe("Message body; required for send and for announce"),
     reply_to: pi.zod.string().optional().describe("Message identifier being answered"),
+    attach: pi.zod
+      .string()
+      .optional()
+      .describe(
+        "send and announce: path to a local file to attach, for material too large for a message body such as a diff, a log bundle, or a build artifact. The recipient is told a reference and fetches it deliberately.",
+      ),
+    reference: pi.zod
+      .string()
+      .optional()
+      .describe("fetch only: the attachment reference a delivery reported"),
+    max_bytes: pi.zod
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "fetch only: decline a payload larger than this, reporting its size and transferring nothing",
+      ),
   });
 
   pi.registerTool({
@@ -1053,6 +1355,18 @@ export default function ompRelay(pi: ExtensionAPI): void {
         join: (request) => performJoin(ctx, request),
         recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details),
         recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details),
+        readAttachment: async (path) => new Uint8Array(await readFile(path)),
+        saveAttachment: async (digest, bytes) => {
+          // Under the process's temporary directory rather than the working
+          // tree: a fetched payload is material to inspect, not a file to
+          // commit, and writing into the repository would put another peer's
+          // bytes where a careless `git add` picks them up.
+          const directory = join(tmpdir(), ATTACHMENT_DIR);
+          await mkdir(directory, { recursive: true, mode: 0o700 });
+          const path = join(directory, digest);
+          await writeFile(path, bytes, { mode: 0o600 });
+          return path;
+        },
       };
       return executeMesh(host, args);
     },

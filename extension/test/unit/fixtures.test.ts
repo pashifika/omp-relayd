@@ -25,6 +25,7 @@ import { join } from "node:path";
 import {
   asRecord,
   decodePayload,
+  digestProblem,
   encodePayload,
   PROTOCOL_VERSION,
   validateServerFrame,
@@ -35,7 +36,14 @@ import { FIXTURE_DIR } from "../support/paths.ts";
 
 const updating = process.env["UPDATE_FIXTURES"] !== undefined;
 
-/** The six frames, and the interoperability risk each one exists to catch. */
+/**
+ * The address every attachment fixture uses: the SHA-256 of the empty payload,
+ * in unpadded base64url. A real digest rather than 43 arbitrary characters, so
+ * the value is one either side could have produced.
+ */
+const FIXTURE_DIGEST = "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU";
+
+/** Each frame, and the interoperability risk it exists to catch. */
 const TS_FIXTURES: readonly {
   readonly name: string;
   readonly frame: ClientFrame | ServerFrame;
@@ -100,6 +108,37 @@ const TS_FIXTURES: readonly {
       shed: 1,
     },
     risk: "an aggregate outcome as two integer counts rather than as a receipt status",
+  },
+  {
+    name: "ts-reserve.msgpack",
+    frame: {
+      type: "reserve",
+      request_id: "res-1",
+      digest: FIXTURE_DIGEST,
+      bytes: 301_824,
+    },
+    risk: "a byte count as a MessagePack integer rather than a string, beside a 43-character base64url address",
+  },
+  {
+    name: "ts-reserved.msgpack",
+    frame: {
+      type: "reserved",
+      request_id: "res-1",
+      status: "granted",
+      expires_in: 7200,
+    },
+    risk: "a reservation status as a snake_case string with the payload's stated lifetime beside it",
+  },
+  {
+    name: "ts-send-attachment.msgpack",
+    frame: {
+      type: "send",
+      id: "msg-2",
+      to: "windows-main",
+      body: "the failing test's output is attached",
+      attachment: FIXTURE_DIGEST,
+    },
+    risk: "a reference as a bare string rather than a map, so no location, size, or filename travels with it",
   },
 ];
 
@@ -312,7 +351,14 @@ describe("this implementation decodes the Rust relay's fixtures", () => {
     // Named maps, not positional tuples: the whole set depends on it, and the
     // cheapest proof is to re-encode the decoded value with its keys reversed
     // and require the same reading back.
-    for (const name of ["rust-announce.msgpack", "rust-notice.msgpack", "rust-accepted.msgpack"]) {
+    for (const name of [
+      "rust-announce.msgpack",
+      "rust-notice.msgpack",
+      "rust-accepted.msgpack",
+      "rust-reserve.msgpack",
+      "rust-reserved.msgpack",
+      "rust-send-attachment.msgpack",
+    ]) {
       const committed = await requireRustFixture(name);
       const decoded = decodePayload(committed);
       expect(decoded.ok).toBe(true);
@@ -348,6 +394,120 @@ describe("this implementation decodes the Rust relay's fixtures", () => {
     expect(widenedMap?.["id"]).toBe("ann-1");
     expect(widenedMap?.["body"]).toBe("the schema landed");
     expect(widenedMap !== null && "to" in widenedMap).toBe(false);
+  });
+
+  test("an unknown extra field on a reserve is ignored, not refused", async () => {
+    // The same additive rule on the frame this change introduces, which is where
+    // a field is most likely to be added next: a bound, a hint, a priority.
+    const committed = await requireRustFixture("rust-reserve.msgpack");
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    const map = asRecord(decoded.value);
+    expect(map).not.toBeNull();
+    if (map === null) return;
+
+    const widened = decodePayload(
+      rawEncode({ ...map, host: "198.51.100.7", filename: "../../evil" }),
+    );
+    expect(widened.ok).toBe(true);
+    if (!widened.ok) return;
+    const widenedMap = asRecord(widened.value);
+    expect(widenedMap?.["digest"]).toBe(FIXTURE_DIGEST);
+    expect(widenedMap?.["bytes"]).toBe(301_824);
+  });
+
+  test("rust-reserve.msgpack carries its byte count as a number", async () => {
+    const committed = await requireRustFixture("rust-reserve.msgpack");
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    expect(decoded.value).toEqual({
+      type: "reserve",
+      request_id: "res-1",
+      digest: FIXTURE_DIGEST,
+      bytes: 301_824,
+    });
+
+    // A count encoded as text would make the field's type differ between
+    // implementations while both still worked against their own encoder.
+    const map = asRecord(decoded.value);
+    expect(typeof map?.["bytes"]).toBe("number");
+    expect(digestProblem(String(map?.["digest"]))).toBeNull();
+    console.log(
+      `rust-reserve.msgpack: ${committed.length} bytes, bytes typeof ${typeof map?.["bytes"]}`,
+    );
+  });
+
+  test("rust-reserved.msgpack states its lifetime beside a grant", async () => {
+    const committed = await requireRustFixture("rust-reserved.msgpack");
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    const outcome = validateServerFrame(decoded.value);
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame).toEqual({
+      type: "reserved",
+      request_id: "res-1",
+      status: "granted",
+      expires_in: 7200,
+    });
+
+    // The other half of the rule, which the granted fixture cannot show: a
+    // lifetime beside a refusal is rejected rather than accepted with the number
+    // ignored.
+    const map = asRecord(decoded.value);
+    expect(map).not.toBeNull();
+    if (map === null) return;
+    const refusedWithLifetime = validateServerFrame({ ...map, status: "room_full" });
+    expect(refusedWithLifetime.kind).toBe("invalid");
+    console.log(
+      `rust-reserved.msgpack: ${committed.length} bytes; a refusal carrying expires_in is ${refusedWithLifetime.kind}`,
+    );
+  });
+
+  test("rust-send-attachment.msgpack carries a bare digest and no reply_to", async () => {
+    const committed = await requireRustFixture("rust-send-attachment.msgpack");
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    expect(decoded.value).toEqual({
+      type: "send",
+      id: "msg-2",
+      to: "windows-main",
+      body: "the failing test's output is attached",
+      attachment: FIXTURE_DIGEST,
+    });
+
+    // The shape, asserted against what a map-valued reference would have
+    // carried: a location would let a sender aim a recipient's fetch at an
+    // arbitrary host, and a filename would make a path component out of another
+    // peer's text.
+    const map = asRecord(decoded.value);
+    expect(typeof map?.["attachment"]).toBe("string");
+    for (const rejected of ["host", "port", "path", "filename", "name", "bytes"]) {
+      expect(containsKey(committed, rejected)).toBe(false);
+    }
+    expect(containsKey(committed, "reply_to")).toBe(false);
+  });
+
+  test("a delivered attachment is validated as a digest, not as free text", async () => {
+    // A relay that sent something else would otherwise have its value carried
+    // into a URL path component and into the name of a local file.
+    const base = {
+      type: "message",
+      id: "msg-2",
+      from: "macbook-reviewer",
+      body: "attached",
+    };
+    expect(validateServerFrame({ ...base, attachment: FIXTURE_DIGEST }).kind).toBe("frame");
+    for (const bad of ["", "short", `${FIXTURE_DIGEST}x`, "../../etc/passwd", 7, {}]) {
+      expect(validateServerFrame({ ...base, attachment: bad }).kind).toBe("invalid");
+    }
   });
 });
 

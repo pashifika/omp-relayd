@@ -611,3 +611,59 @@ fn typescript_accepted_fixture_decodes_its_counts_as_integers() {
         "the TypeScript accepted fixture must carry no status field: {committed:02x?}"
     );
 }
+
+#[test]
+fn typescript_reserve_fixture_decodes_its_byte_count_as_an_integer() {
+    check_foreign_fixture(
+        "ts-reserve.msgpack",
+        &ClientFrame::Reserve {
+            request_id: "res-1".to_owned(),
+            digest: FIXTURE_DIGEST.to_owned(),
+            bytes: 301_824,
+        },
+        "a byte count the TypeScript side wrote as a number, decoding into `u64` here \
+         rather than failing as a string",
+    );
+}
+
+#[test]
+fn typescript_reserved_fixture_decodes_its_status_and_lifetime() {
+    check_foreign_fixture(
+        "ts-reserved.msgpack",
+        &ServerFrame::Reserved {
+            request_id: "res-1".to_owned(),
+            status: ReserveStatus::Granted,
+            expires_in: Some(7200),
+        },
+        "a reservation status the TypeScript side wrote as a snake_case string, with \
+         the lifetime beside it as a number",
+    );
+}
+
+#[test]
+fn typescript_send_attachment_fixture_decodes_as_a_bare_digest() {
+    check_foreign_fixture(
+        "ts-send-attachment.msgpack",
+        &ClientFrame::Send {
+            id: "msg-2".to_owned(),
+            to: "windows-main".to_owned(),
+            body: "the failing test's output is attached".to_owned(),
+            reply_to: None,
+            attachment: Some(FIXTURE_DIGEST.to_owned()),
+        },
+        "a reference the TypeScript side wrote as a bare string, decoding into \
+         `Option<String>` here rather than failing as a map",
+    );
+
+    // The absent-field rule still holds on a frame that carries one optional
+    // field and omits another.
+    let committed =
+        fs::read(fixture_dir().join("ts-send-attachment.msgpack")).expect("read the fixture");
+    assert!(
+        !committed
+            .windows(b"reply_to".len())
+            .any(|window| window == b"reply_to"),
+        "an absent reply_to must be omitted even beside a present attachment: \
+         {committed:02x?}"
+    );
+}
