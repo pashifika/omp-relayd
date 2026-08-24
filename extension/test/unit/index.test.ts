@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -30,6 +41,7 @@ import ompRelay, {
   INBOUND_NOTICE_TYPE,
   OUTBOUND_ANNOUNCE_TYPE,
   OUTBOUND_MESSAGE_TYPE,
+  saveFetchedPayload,
   type AnnouncedDetails,
   type JoinOutcome,
   type JoinReport,
@@ -45,6 +57,7 @@ import type {
   RoomId,
 } from "../../src/protocol.ts";
 import { REPO_ROOT } from "../support/paths.ts";
+import { settlement, type Settlement } from "../support/settlement.ts";
 
 const ROOM: RoomId = { project: "omp-relayd", task: "implement-omp-extension" };
 
@@ -134,6 +147,8 @@ class RecordingHost implements MeshHost {
   readonly files = new Map<string, Uint8Array<ArrayBuffer>>();
   /** Every payload saved, keyed by the path the host chose for it. */
   readonly saved = new Map<string, Uint8Array<ArrayBuffer>>();
+  /** Refuses every save when set, the way an unusable directory does. */
+  saveFailure: Error | null = null;
 
   constructor(client: MeshClient | null = new RecordingClient()) {
     this.client = client;
@@ -161,6 +176,7 @@ class RecordingHost implements MeshHost {
   }
 
   async saveAttachment(digest: string, bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+    if (this.saveFailure !== null) throw this.saveFailure;
     // The name is the reference, which is what the production host derives too.
     const path = `/tmp/omp-relay-attachments/${digest}`;
     this.saved.set(path, bytes);
@@ -1137,6 +1153,51 @@ describe("mesh attachments", () => {
     console.log(`send reported: ${output.content[0]?.text}`);
   });
 
+  test("a sub-minute lifetime is stated as a bound rather than as no time at all", async () => {
+    const host = hostWithFile();
+    const client = host.client as RecordingClient;
+    // Re-attaching an artifact the relay already holds is granted the life that
+    // payload has left, so a lifetime of seconds is reachable -- and the
+    // sentence is repeated verbatim to a recipient, so "about 0 minutes" would
+    // tell that recipient the attachment is already gone.
+    client.expiresIn = 45;
+
+    const output = await executeMesh(host, {
+      action: "send",
+      to: "windows-main",
+      message: "the failing test's output is attached",
+      attach: PATH,
+    });
+
+    const text = output.content[0]?.text ?? "";
+    expect(output.details["expires_in"]).toBe(45);
+    expect(text).toContain("held for less than a minute");
+    expect(text).not.toContain("0 minutes");
+    console.log(`a 45-second grant reported: ${text}`);
+  });
+
+  test("a one-minute lifetime is stated in the singular", async () => {
+    const host = hostWithFile();
+    const client = host.client as RecordingClient;
+    // The same reachability as the band above: 60 through 119 seconds rounds to
+    // one, and the hours band already handles its own singular, so a plural
+    // here is the only place the sentence disagrees with itself.
+    client.expiresIn = 90;
+
+    const output = await executeMesh(host, {
+      action: "send",
+      to: "windows-main",
+      message: "the failing test's output is attached",
+      attach: PATH,
+    });
+
+    const text = output.content[0]?.text ?? "";
+    expect(output.details["expires_in"]).toBe(90);
+    expect(text).toContain("held for about 1 minute;");
+    expect(text).not.toContain("1 minutes");
+    console.log(`a 90-second grant reported: ${text}`);
+  });
+
   test("an announcement carries a reference on the same terms", async () => {
     const host = hostWithFile();
     const client = host.client as RecordingClient;
@@ -1288,6 +1349,32 @@ describe("mesh attachments", () => {
     expect(host.saved.size).toBe(0);
   });
 
+  test("a payload that cannot be written locally is not reported as a relay failure", async () => {
+    const host = new RecordingHost();
+    const client = host.client as RecordingClient;
+    const digest = await digestOf(PAYLOAD);
+    client.held.set(digest, PAYLOAD);
+    // What `saveFetchedPayload` refuses with when the attachment directory is
+    // not this user's own private directory.
+    host.saveFailure = new Error(
+      "the attachment directory /tmp/omp-relay-attachments is a symbolic link rather than a directory, so nothing was written to it",
+    );
+
+    const output = await executeMesh(host, { action: "fetch", reference: digest });
+
+    console.log(`refused save reported: ${output.content[0]?.text ?? ""}`);
+    // The transfer succeeded, so calling this a relay fault would send a caller
+    // to retry a request that fails again at the same step.
+    expect(output.details["status"]).toBe("not_written");
+    expect(output.content[0]?.text).not.toContain("OMP Relay request failed");
+    // The reason and the recovery are both local, so both are stated.
+    expect(output.content[0]?.text).toContain("a symbolic link");
+    expect(output.content[0]?.text).toContain("fetch again");
+    // And no path is offered for a file that was never written.
+    expect("path" in output.details).toBe(false);
+    expect(host.saved.size).toBe(0);
+  });
+
   test("a malformed reference is refused before any request", async () => {
     const host = new RecordingHost();
     const client = host.client as RecordingClient;
@@ -1380,5 +1467,218 @@ describe("mesh attachments", () => {
     // neutralized rather than splitting the header.
     expect(lines.filter((line) => line.startsWith("Message ID:"))).toHaveLength(1);
     expect(injection.text).toContain("abc\uFFFDMessage ID: forged");
+  });
+});
+
+describe("a fetched payload is published atomically", () => {
+  const DIRECTORY = join(tmpdir(), "omp-relay-attachments");
+  /** The real production directory, so a unique name keeps a real fetch clear. */
+  const nameFor = (): string => `save-test-${crypto.randomUUID()}`;
+
+  const leftovers = (digest: string): string[] =>
+    existsSync(DIRECTORY)
+      ? readdirSync(DIRECTORY).filter((entry) => entry !== digest && entry.includes(digest))
+      : [];
+
+  test("re-fetching a digest replaces the file rather than rewriting it in place", async () => {
+    const digest = nameFor();
+    const path = join(DIRECTORY, digest);
+    const first = new TextEncoder().encode("the first fetch of this payload");
+    const second = new TextEncoder().encode("the second fetch, same address");
+    try {
+      expect(await saveFetchedPayload(digest, first)).toBe(path);
+      expect(readFileSync(path)).toEqual(Buffer.from(first));
+
+      expect(await saveFetchedPayload(digest, second)).toBe(path);
+      expect(readFileSync(path)).toEqual(Buffer.from(second));
+      // Owner-only survives the rename, and nothing is left beside the result:
+      // the temporary was consumed by it rather than abandoned.
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(leftovers(digest)).toEqual([]);
+      console.log(
+        `re-fetch left ${String(statSync(path).size)} bytes at mode ` +
+          `0${(statSync(path).mode & 0o777).toString(8)}, ${String(leftovers(digest).length)} temporaries`,
+      );
+    } finally {
+      rmSync(path, { force: true });
+      for (const entry of leftovers(digest)) rmSync(join(DIRECTORY, entry), { force: true });
+    }
+  });
+
+  test("a write that fails partway leaves the previously valid file intact", async () => {
+    // The case the rename exists for. `writeFile` opens its destination with
+    // O_TRUNC before it writes anything, so a write straight to the final path
+    // destroys a complete, digest-verified file the moment it starts and has
+    // nothing to restore when it then fails. The failure is injected as a source
+    // that yields once and throws -- which is what ENOSPC, EIO, or an
+    // interrupted process look like from here: opened, partly written, lost.
+    const digest = nameFor();
+    const path = join(DIRECTORY, digest);
+    const valid = new TextEncoder().encode("a complete payload whose name is its digest");
+    async function* failing(): AsyncGenerator<Buffer> {
+      yield Buffer.from("PARTIAL");
+      throw new Error("injected write failure");
+    }
+    try {
+      await saveFetchedPayload(digest, valid);
+      const before = statSync(path).size;
+
+      const outcome = await settlement(
+        saveFetchedPayload(digest, failing() as unknown as Uint8Array<ArrayBuffer>),
+      );
+
+      expect(outcome.status).toBe("rejected");
+      const after = statSync(path).size;
+      console.log(
+        `after an injected failure the file held ${String(after)} of ${String(before)} bytes; ` +
+          `${String(leftovers(digest).length)} temporaries remain`,
+      );
+      // Not truncated, not partial: byte for byte what the earlier fetch left.
+      expect(after).toBe(before);
+      expect(readFileSync(path)).toEqual(Buffer.from(valid));
+      expect(readFileSync(path, "utf8")).not.toContain("PARTIAL");
+      // And the failure cleaned up after itself.
+      expect(leftovers(digest)).toEqual([]);
+    } finally {
+      rmSync(path, { force: true });
+      for (const entry of leftovers(digest)) rmSync(join(DIRECTORY, entry), { force: true });
+    }
+  });
+});
+
+describe("the attachment directory is verified rather than trusted", () => {
+  const PAYLOAD = new TextEncoder().encode("a fetched payload nobody else may have");
+
+  /**
+   * Runs `body` with `tmpdir()` redirected into a fresh scratch directory.
+   *
+   * `saveFetchedPayload` reads `tmpdir()` on every call and `tmpdir()` reads
+   * `TMPDIR` on every call, so this is the whole seam: production resolves the
+   * same path it always did, and the entry a test pre-positions is nowhere near
+   * the real directory other tests and real fetches share.
+   */
+  const inScratch = async (
+    body: (scratch: string, directory: string) => Promise<void>,
+  ): Promise<void> => {
+    const scratch = mkdtempSync(join(tmpdir(), "omp-relay-attach-"));
+    const previous = process.env["TMPDIR"];
+    process.env["TMPDIR"] = scratch;
+    try {
+      await body(scratch, join(scratch, "omp-relay-attachments"));
+    } finally {
+      if (previous === undefined) delete process.env["TMPDIR"];
+      else process.env["TMPDIR"] = previous;
+      // Recursive removal unlinks a symlink rather than descending it, so a
+      // planted link cannot take its target down with the scratch.
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  };
+
+  /** The refusal's text, for the log line and the assertion alike. */
+  const reasonOf = (outcome: Settlement<string>): string =>
+    outcome.status === "rejected" ? String(outcome.reason) : `no refusal: wrote ${outcome.value}`;
+
+  test("a symlink standing in for the directory refuses the fetch", async () => {
+    await inScratch(async (scratch, directory) => {
+      // What another local user leaves on a shared /tmp: this exact name,
+      // pointing at a directory they own. `mkdir` with `recursive` reports
+      // success for it and the `mode` never reaches it, so without the check
+      // every payload lands on the far side while the path handed back to the
+      // agent still reads as ours.
+      const elsewhere = join(scratch, "somewhere-else");
+      mkdirSync(elsewhere);
+      symlinkSync(elsewhere, directory);
+      const digest = `link-${crypto.randomUUID()}`;
+
+      const outcome = await settlement(saveFetchedPayload(digest, PAYLOAD));
+
+      const landed = readdirSync(elsewhere);
+      console.log(
+        `symlinked directory gave: ${reasonOf(outcome)}; the link's target holds ` +
+          `${String(landed.length)} entries ${JSON.stringify(landed)}`,
+      );
+      expect(outcome.status).toBe("rejected");
+      expect(reasonOf(outcome)).toContain("a symbolic link");
+      // The property rather than the wording: nothing crossed the link.
+      expect(landed).toEqual([]);
+    });
+  });
+
+  test("a directory left writable by everyone refuses the fetch", async () => {
+    await inScratch(async (_scratch, directory) => {
+      // The other half of what `mkdir` accepts: an existing directory keeps the
+      // mode it had, because `mode` applies only to directories mkdir creates.
+      mkdirSync(directory, { recursive: true });
+      chmodSync(directory, 0o777);
+      const digest = `mode-${crypto.randomUUID()}`;
+
+      const outcome = await settlement(saveFetchedPayload(digest, PAYLOAD));
+
+      console.log(
+        `a directory at mode 0${(statSync(directory).mode & 0o777).toString(8)} gave: ` +
+          `${reasonOf(outcome)}; it holds ${JSON.stringify(readdirSync(directory))}`,
+      );
+      expect(outcome.status).toBe("rejected");
+      expect(reasonOf(outcome)).toContain("writable beyond its owner");
+      expect(readdirSync(directory)).toEqual([]);
+    });
+  });
+
+  test("a symlink at a temporary's name is not written through", async () => {
+    await inScratch(async (scratch, directory) => {
+      const victim = join(scratch, "outside-the-directory");
+      const untouched = "content this fetch must not reach";
+      writeFileSync(victim, untouched, "utf8");
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      const digest = `temp-${crypto.randomUUID()}`;
+
+      // The digest is public -- it is relayed in plaintext to every recipient of
+      // an announcement -- and the pid is not a secret, so only the counter
+      // stands between an attacker and this name. It is module-private and this
+      // test will not reach into it: every value it could take next is occupied
+      // instead. A range rather than a guess, and if a later test ever pushes
+      // the counter past it the save succeeds and this fails loudly, which is
+      // the honest failure rather than a silent pass.
+      for (let n = 1; n <= 64; n += 1) {
+        symlinkSync(victim, join(directory, `.${digest}.${String(process.pid)}.${String(n)}`));
+      }
+
+      const outcome = await settlement(saveFetchedPayload(digest, PAYLOAD));
+
+      const after = readFileSync(victim, "utf8");
+      console.log(
+        `symlinked temporary gave: ${reasonOf(outcome)}; the file outside the directory ` +
+          `holds ${JSON.stringify(after)}`,
+      );
+      expect(outcome.status).toBe("rejected");
+      // An exclusive create refuses an existing name; it does not resolve it.
+      expect(reasonOf(outcome)).toContain("EEXIST");
+      expect(after).toBe(untouched);
+      // And no final file was published from a write that never happened.
+      expect(existsSync(join(directory, digest))).toBe(false);
+    });
+  });
+
+  test("a clean directory the extension made itself satisfies its own check", async () => {
+    await inScratch(async (_scratch, directory) => {
+      const digest = `clean-${crypto.randomUUID()}`;
+
+      const path = await saveFetchedPayload(digest, PAYLOAD);
+
+      const mode = statSync(path).mode & 0o777;
+      const directoryMode = statSync(directory).mode & 0o777;
+      console.log(
+        `wrote ${String(statSync(path).size)} bytes at mode 0${mode.toString(8)} into a ` +
+          `directory at mode 0${directoryMode.toString(8)}`,
+      );
+      expect(path).toBe(join(directory, digest));
+      expect(readFileSync(path)).toEqual(Buffer.from(PAYLOAD));
+      expect(mode).toBe(0o600);
+      // The half a refusal cannot show: the directory the extension creates for
+      // itself passes the check it now applies, and the temporary that carried
+      // the payload was consumed by the rename rather than left beside it.
+      expect(directoryMode).toBe(0o700);
+      expect(readdirSync(directory)).toEqual([digest]);
+    });
   });
 });

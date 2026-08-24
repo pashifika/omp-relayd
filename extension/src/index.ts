@@ -4,7 +4,7 @@ import type {
   ExtensionMode,
 } from "@oh-my-pi/pi-coding-agent";
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -86,6 +86,97 @@ export const OUTBOUND_ANNOUNCE_TYPE = "io.github.pashifika.omp-relay.announced";
  * construction.
  */
 const ATTACHMENT_DIR = "omp-relay-attachments";
+
+/** Distinguishes one process's temporaries from another's in that directory. */
+let nextAttachmentTemp = 0;
+
+/**
+ * Writes a fetched payload to a file named for its address, and returns it.
+ *
+ * Under the process's temporary directory rather than the working tree: a
+ * fetched payload is material to inspect, not a file to commit, and writing
+ * into the repository would put another peer's bytes where a careless
+ * `git add` picks them up.
+ *
+ * Published by rename rather than written in place. The path is derived from
+ * the digest, so an earlier fetch of the same payload has already handed it to
+ * a caller: writing straight to it would truncate a complete, digest-verified
+ * file for the duration of the rewrite, and would leave a partial one behind if
+ * the write failed -- at a name whose entire meaning is that its content hashes
+ * to it. Verifying the bytes in memory buys nothing if the file the caller
+ * opens is a different, shorter thing. The relay's store publishes by rename
+ * for the same reason (`server/src/blob.rs`), and undoing that at the last step
+ * would spend its care for nothing.
+ *
+ * The temporary sits in the same directory, which is what makes the rename
+ * atomic, and takes the leading dot and counter the store uses for its own. The
+ * pid joins them because every session on this machine shares this directory,
+ * where the store owns each room's.
+ *
+ * The directory is verified rather than trusted, and that is separate from the
+ * rename. `tmpdir()` is the shared `/tmp` on Linux, so this name is predictable
+ * and its parent is writable by every local user, while a recursive `mkdir`
+ * reports success for whatever already occupies it -- a symlink included, and
+ * with the owner and mode it already had, because its `mode` applies only to
+ * directories it creates. Unchecked, another local user pre-positions the name
+ * and every payload lands where they chose while the path handed back still
+ * reads as ours. The store's `create_private_dir` records why that matters
+ * (`server/src/blob.rs`): on a trusted host a traversable temporary directory
+ * exposes to every local user exactly the payload content the logging rules
+ * forbid recording.
+ *
+ * The temporary is created exclusively, which is what keeps it honest once the
+ * directory is. Its name is guessable -- the digest is relayed in plaintext to
+ * every recipient of an announcement, and a pid and a small counter are not
+ * secrets -- and a plain `writeFile` follows a symlink standing at it, where
+ * the rename only protects the final name. An exclusive create fails when the
+ * name exists at all, symlink included, so it needs no separate no-follow flag.
+ * It also refuses a temporary this pid abandoned in an earlier crash, which is
+ * right on the same terms: that file is not this fetch's to truncate, and the
+ * counter has already moved on for the next attempt.
+ */
+export async function saveFetchedPayload(
+  digest: string,
+  bytes: Uint8Array<ArrayBuffer>,
+): Promise<string> {
+  const directory = join(tmpdir(), ATTACHMENT_DIR);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+
+  // `lstat` rather than `stat`: the question is what this name *is*, not what
+  // it points at, and resolving the link is exactly what must not happen.
+  const stats = await lstat(directory);
+  // Absent on Windows, which has neither of the two properties below. The
+  // symlink and directory checks still hold there.
+  const uid = process.getuid?.();
+  const wrong = stats.isSymbolicLink()
+    ? "a symbolic link rather than a directory"
+    : !stats.isDirectory()
+      ? "not a directory"
+      : uid !== undefined && stats.uid !== uid
+        ? `owned by uid ${String(stats.uid)} rather than by this process's uid ${String(uid)}`
+        : uid !== undefined && (stats.mode & 0o022) !== 0
+          ? `writable beyond its owner, at mode 0${(stats.mode & 0o777).toString(8)}`
+          : null;
+  if (wrong !== null) {
+    throw new Error(
+      `the attachment directory ${directory} is ${wrong}, so nothing was written to it`,
+    );
+  }
+
+  const path = join(directory, digest);
+  const temp = join(directory, `.${digest}.${process.pid}.${++nextAttachmentTemp}`);
+  try {
+    await writeFile(temp, bytes, { mode: 0o600, flag: "wx" });
+    await rename(temp, path);
+  } catch (error) {
+    // Removed on the way out so a failed fetch leaves nothing behind, and
+    // `force` because the failure may well be that the temporary was never
+    // created.
+    await rm(temp, { force: true });
+    throw error;
+  }
+  return path;
+}
 
 export interface MeshArguments {
   readonly action?: unknown;
@@ -390,12 +481,26 @@ function expiredResult(reference: string): MeshToolResult {
   );
 }
 
-/** How a sender is told what it must pass on: the lifetime, in whole units. */
+/**
+ * How a sender is told what it must pass on: how long the payload has left.
+ *
+ * "about" belongs to each band rather than to the sentence, because a payload
+ * with seconds left is stated as a bound rather than a rounded count -- and
+ * "held for about less than a minute" is worse than the bug it replaces. That
+ * band became reachable when `reserve` began granting an already-held payload
+ * the life it has left; before that, every grant was the full lifetime.
+ */
 function expiryNote(seconds: number | undefined): string {
   if (seconds === undefined || seconds <= 0) return "";
   const hours = Math.floor(seconds / 3600);
-  const stated = hours >= 1 ? `${hours} hour${hours === 1 ? "" : "s"}` : `${Math.floor(seconds / 60)} minutes`;
-  return ` The attachment is held for about ${stated}; say so in the body, because a recipient reading later will find it gone.`;
+  const minutes = Math.floor(seconds / 60);
+  const stated =
+    hours >= 1
+      ? `about ${hours} hour${hours === 1 ? "" : "s"}`
+      : seconds < 60
+        ? "less than a minute"
+        : `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  return ` The attachment is held for ${stated}; say so in the body, because a recipient reading later will find it gone.`;
 }
 
 function receiptResult(
@@ -779,7 +884,22 @@ export async function executeMesh(host: MeshHost, args: MeshArguments): Promise<
       // carries the path and no payload byte: a payload is by definition larger
       // than a frame can carry, and spending the model's context on material it
       // usually wants to search, apply, or run is what a path avoids.
-      const path = await host.saveAttachment(reference, bytes);
+      let path: string;
+      try {
+        path = await host.saveAttachment(reference, bytes);
+      } catch (error) {
+        // The transfer already succeeded, so this is not a relay fault and must
+        // not be reported as one: the outer handler renders every escape as
+        // "OMP Relay request failed", which would send a caller to retry a
+        // request that succeeds again and fails again at the same step. The
+        // reason is local and the recovery is local, so both are stated.
+        return result(
+          `The payload at ${reference} transferred, but writing it locally was refused: ` +
+            `${singleLine(describe(error))}. No file was written for this fetch. Clear or ` +
+            "repair that path, then fetch again.",
+          { action: "fetch", status: "not_written", reference, bytes: bytes.byteLength },
+        );
+      }
       return result(
         `Fetched ${bytes.byteLength} bytes to ${path}. Read, apply, or run it with ordinary ` +
           "tools; its contents are not in this result.",
@@ -1356,17 +1476,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
         recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details),
         recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details),
         readAttachment: async (path) => new Uint8Array(await readFile(path)),
-        saveAttachment: async (digest, bytes) => {
-          // Under the process's temporary directory rather than the working
-          // tree: a fetched payload is material to inspect, not a file to
-          // commit, and writing into the repository would put another peer's
-          // bytes where a careless `git add` picks them up.
-          const directory = join(tmpdir(), ATTACHMENT_DIR);
-          await mkdir(directory, { recursive: true, mode: 0o700 });
-          const path = join(directory, digest);
-          await writeFile(path, bytes, { mode: 0o600 });
-          return path;
-        },
+        saveAttachment: saveFetchedPayload,
       };
       return executeMesh(host, args);
     },
