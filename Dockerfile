@@ -25,7 +25,17 @@ RUN cargo build --release --locked --bin omp-relayd
 # the builder above stays pinned for reproducibility.
 FROM debian:bookworm-slim AS runtime
 
-# The relay opens no files, writes nothing, and needs no privileges.
+# Unprivileged, with no home and no shell: the relay needs no privileges and
+# reads no configuration file.
+#
+# It does write, though. The payload store lives under `std::env::temp_dir()`,
+# so the container needs a writable `/tmp`. The image layer provides one by
+# default; a `--read-only` deployment must supply it as a mount, or the relay
+# exits at startup unable to open the store. No `VOLUME` is declared for it:
+# that would create an anonymous volume outliving the container to hold
+# payloads whose whole contract is that they do not persist. `compose.yml`
+# mounts a sized tmpfs instead, and `.dockerhub/overview.md` carries the same
+# flag on its `docker run` examples.
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin relay
 
 COPY --from=build /usr/src/omp-relayd/target/release/omp-relayd /usr/local/bin/omp-relayd

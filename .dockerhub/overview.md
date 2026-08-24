@@ -10,7 +10,21 @@ The transport is **plain TCP with no authentication and no encryption**. Anyone 
 
 Run it on a trusted host, or on a trusted private network. Do not publish the port to the public Internet. There is no public mode, and adding one is not a configuration option — mutual TLS is a later release.
 
-The image reflects that stance: it publishes port `7788` inside the container only, runs as an unprivileged `relay` user, reads no configuration file, writes nothing, and keeps no history. Restricting who can reach it is the published port's job.
+The image reflects that stance: it publishes port `7788` inside the container only, runs as an unprivileged `relay` user, reads no configuration file, and keeps no message history — no queue for an absent peer, no replay after a reconnect. Restricting who can reach it is the published port's job. That one port carries both the frame protocol and attachment transfer, so exposure is a single decision, with no second port to reason about.
+
+## What it holds on disk
+
+Routing is in memory and stays there. Attachments are the exception, and they are why every command that runs the relay mounts a writable `/tmp`.
+
+A message body is capped at 65024 bytes. Anything larger — a diff, a captured test run, a build log — is uploaded to the relay and referenced by the message that carries it. That is a bounded temporary store rather than persistence: every payload is removed when its room's last peer leaves, when its two-hour lifetime elapses, or at startup, and nothing survives a restart.
+
+Without somewhere to write it, a read-only container starts and immediately exits:
+
+```text
+ERROR omp_relayd: could not open the payload store base=/tmp/omp-relayd error=Read-only file system (os error 30)
+```
+
+tmpfs is RAM-backed, so `size=320m` bounds memory as well as bytes held. It sits above the relay's own 256 MiB ceiling deliberately, so a sender meets the relay's clean refusal rather than an I/O error from a full filesystem. To spend disk instead, mount a sized filesystem at `/tmp` — the relay reads `TMPDIR` and needs no other configuration. A named volume is the wrong shape here: it would outlive the container to hold data that must not persist.
 
 ## Run it
 
@@ -21,6 +35,7 @@ docker run -d --name omp-relay \
   -p 127.0.0.1:7788:7788 \
   --read-only --cap-drop ALL \
   --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,noexec,nosuid,size=320m,mode=1777 \
   {{IMAGE}}:{{VERSION}}
 ```
 
@@ -29,6 +44,7 @@ To reach it from a trusted private network, publish it on one specific private a
 ```sh
 docker run -d --name omp-relay -p 192.168.1.10:7788:7788 \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,noexec,nosuid,size=320m,mode=1777 \
   {{IMAGE}}:{{VERSION}}
 ```
 
