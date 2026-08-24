@@ -44,10 +44,19 @@ pub const MAX_CORRELATION_BYTES: usize = 128;
 /// Those maxima are a *premise*, and every one of them has to be enforced for
 /// the budget to mean anything. `id` and `reply_to` are checked against
 /// [`MAX_CORRELATION_BYTES`] and `from` is the connection's registered peer
-/// name, already checked against [`MAX_IDENTIFIER_BYTES`]. An unchecked field
-/// here is not a slack calculation — it is a way for one sender to build a
-/// `message` the recipient's connection cannot encode, which closes that
-/// connection. `reply_to` was missed on the first pass and found in review.
+/// name, already checked against [`MAX_IDENTIFIER_BYTES`]. `reply_to` was
+/// missed on the first pass and found in review.
+///
+/// What an unchecked field costs here has changed, and the reservation is kept
+/// for the smaller of the two reasons. It used to be a third-party hazard: a
+/// delivery was serialized on the *recipient's* writer task, so a `message` the
+/// relay could not encode closed the recipient's connection and any sender
+/// could pick the victim. Deliveries are now encoded on the routing call, on
+/// the sending connection's own task, and an unwritable one is refused there
+/// (`relay::Routed::Unwritable`), so that class of failure no longer exists to
+/// be reserved against. What remains is that a sender learns at once, and by
+/// name, that its body is too large -- rather than having the relay accept the
+/// frame and drop it later for a reason no error code states.
 const MESSAGE_ENVELOPE_HEADROOM: usize = 512;
 
 /// Largest accepted `send.body`, in UTF-8 bytes.
@@ -58,10 +67,14 @@ const MESSAGE_ENVELOPE_HEADROOM: usize = 512;
 /// longer key names than `send` and `to`. A body that fits an inbound `send`
 /// can therefore produce an outbound `message` that does not fit the frame cap.
 ///
-/// Enforcing the budget on the way in is what keeps that from becoming a way to
-/// attack a third party: the encode failure would otherwise land on the
-/// *recipient's* connection, letting any sender close any peer's connection at
-/// will. `worst_case_message_at_the_body_budget_fits_the_frame_cap` proves the
+/// Enforcing the budget on the way in is what makes that a rejection the sender
+/// can act on: `error` code `frame_too_large` naming the body and the limit,
+/// before anything is routed. It is no longer what keeps the failure off a
+/// third party -- encoding a delivery happens on the sending connection's task
+/// now, so the recipient is never the one that fails -- but it is still the
+/// only point at which the sender can be told *why*.
+///
+/// `worst_case_message_at_the_body_budget_fits_the_frame_cap` proves the
 /// arithmetic instead of trusting this comment.
 pub const MAX_BODY_BYTES: usize = MAX_FRAME_BYTES - MESSAGE_ENVELOPE_HEADROOM;
 
