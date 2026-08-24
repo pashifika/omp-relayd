@@ -330,6 +330,32 @@ describe("server frame validation", () => {
     expect(outcome.reason).toContain("an array of strings");
   });
 
+  test("a granted reservation stating no lifetime is rejected and names the field", () => {
+    // The mirror of the refusal-with-a-lifetime rule, and the half a caller
+    // feels: accepting this would leave the client inventing the number and a
+    // sender stating that invention to a recipient as the relay's own answer.
+    const outcome = validateServerFrame({
+      type: "reserved",
+      request_id: "res-1",
+      status: "granted",
+    });
+    expect(outcome.kind).toBe("invalid");
+    if (outcome.kind !== "invalid") return;
+    expect(outcome.reason).toBe(
+      "reserved.expires_in is absent on a granted reservation, which must state a lifetime",
+    );
+    console.log(`granted without a lifetime: ${outcome.kind} -- ${outcome.reason}`);
+
+    // The refusal it must not have broken: no lifetime is exactly right there.
+    const refused = validateServerFrame({
+      type: "reserved",
+      request_id: "res-1",
+      status: "room_full",
+    });
+    expect(refused.kind).toBe("frame");
+    console.log(`room_full without a lifetime: ${refused.kind}`);
+  });
+
   test("an unknown frame type is ignorable, not invalid", () => {
     // The two outcomes drive different behavior: ignorable keeps the
     // connection, invalid fails it. Collapsing them would turn a relay's
