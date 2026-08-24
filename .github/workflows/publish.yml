@@ -442,9 +442,32 @@ jobs:
           diff -u expected.txt observed.txt
 
           echo "tags now resolve to:"
+          : > digests.txt
           for tag in "$VERSION" "$COMMIT_TAG" latest; do
             digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:${tag}")
             echo "  ${IMAGE}:${tag} -> ${digest}"
+            echo "$digest" >> digests.txt
           done
+
+          # One release, one digest. The three tags were attached by a single
+          # imagetools call, so this is near-tautological today -- and it is what
+          # would catch a later refactor that split that call in two.
+          if [ "$(sort -u digests.txt | wc -l)" -ne 1 ]; then
+            echo "publish: the release's tags do not all resolve to one digest"
+            exit 1
+          fi
+
+          # This runner is amd64, so pulling here exercises the architecture
+          # selection an operator on amd64 depends on, rather than inferring it
+          # from the manifest list above. The arm64 half is exercised on the
+          # maintainer's own workstation.
+          docker pull --quiet "${IMAGE}:${VERSION}"
+          pulled=$(docker image inspect "${IMAGE}:${VERSION}" --format '{{.Os}}/{{.Architecture}}')
+          echo "pulling ${IMAGE}:${VERSION} on this runner produced ${pulled}"
+
+          if [ "$pulled" != "linux/amd64" ]; then
+            echo "publish: an amd64 host pulled ${pulled}"
+            exit 1
+          fi
 
           echo "publish: ${IMAGE}:${VERSION} published for linux/amd64 and linux/arm64"
