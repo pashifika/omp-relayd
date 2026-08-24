@@ -1,0 +1,450 @@
+name: Publish
+
+# Manual only. Publication is a deliberate act: merging must never move a tag in
+# a registry, and a version tag, once published, is not moved again without being
+# asked. The `dry_run` default is `true` because a `workflow_dispatch` workflow
+# cannot be dispatched until it exists on the default branch, so the first run is
+# necessarily an experiment -- and a stray click should rehearse, not publish.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify everything, leaving the registry untouched
+        type: boolean
+        default: true
+      overwrite:
+        description: Move an existing version tag, which is otherwise refused
+        type: boolean
+        default: false
+
+# Pushing to Docker Hub needs no GitHub token scope whatsoever; the registry
+# credential comes from the `docker-hub` environment instead.
+permissions:
+  contents: read
+
+# Queued, never cancelled -- the opposite of `ci.yml`, where superseding a
+# verification run is exactly right. Cancelling a publication part-way through
+# leaves tags unmoved and blobs orphaned, with no failing job to explain it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Literals, not secrets. The image name is public by definition and the account
+  # name appears inside it, so keeping both in the file makes the target of a
+  # publication reviewable as a diff. Only the token is a secret.
+  IMAGE: pashifika/omp-relayd
+  DOCKERHUB_USERNAME: pashifika
+
+jobs:
+  # Resolves the release's identity and refuses an already-published version,
+  # before anything is built and before any credential is in scope. Deliberately
+  # declares no environment: this job holds no secret, so a version mistake fails
+  # here in seconds rather than after two release builds.
+  identity:
+    name: identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      commit_tag: ${{ steps.resolve.outputs.commit_tag }}
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Resolve the version and verify the deployment file agrees
+        id: resolve
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # Read the version from the `[package]` table alone, so a dependency's
+          # version can never be mistaken for the crate's own.
+          version=$(awk '
+            /^\[/ { in_package = ($0 == "[package]"); next }
+            in_package && /^[[:space:]]*version[[:space:]]*=/ {
+              if (match($0, /"[^"]*"/)) { print substr($0, RSTART + 1, RLENGTH - 2); exit }
+            }
+          ' server/Cargo.toml)
+
+          # An operator deploys what `compose.yml` names, not what this workflow
+          # publishes. Nothing else in this repository checks that the two agree.
+          compose_ref=$(awk '
+            /^[[:space:]]*image:[[:space:]]*/ {
+              line = $0
+              sub(/^[[:space:]]*image:[[:space:]]*/, "", line)
+              gsub(/^["'"'"']|["'"'"']$/, "", line)
+              print line
+              exit
+            }
+          ' compose.yml)
+
+          compose_image=${compose_ref%:*}
+          compose_tag=${compose_ref##*:}
+          commit_tag="sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+
+          # Printed, not assumed: a reader can re-derive the verdict below from
+          # these four values, and a mis-specified check is visible either way.
+          echo "server/Cargo.toml [package] version : ${version}"
+          echo "compose.yml image reference         : ${compose_ref}"
+          echo "workflow publishes                  : ${IMAGE}"
+          echo "commit tag                          : ${commit_tag}"
+
+          if [ -z "$version" ]; then
+            echo "identity: no version found in the [package] table of server/Cargo.toml"
+            exit 1
+          fi
+
+          if [ "$compose_image" != "$IMAGE" ]; then
+            echo "identity: compose.yml deploys '${compose_image}' but this workflow publishes '${IMAGE}'"
+            exit 1
+          fi
+
+          if [ "$compose_tag" != "$version" ]; then
+            echo "identity: compose.yml pins tag '${compose_tag}' but the crate version is '${version}'"
+            exit 1
+          fi
+
+          echo "identity: both files agree on version ${version}"
+
+          {
+            echo "version=${version}"
+            echo "commit_tag=${commit_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to move an already-published version tag
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          set -euo pipefail
+
+          # Docker Hub answers manifest reads for a public repository with an
+          # anonymous token, so this check needs no credential and runs before
+          # the environment's gate. The publish job repeats it authenticated,
+          # which closes the window between this check and the tag move.
+          token=$(curl -fsS \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
+            | jq -r '.token')
+
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://registry-1.docker.io/v2/${IMAGE}/manifests/${VERSION}")
+
+          echo "manifest read for ${IMAGE}:${VERSION} returned HTTP ${code}"
+
+          case "$code" in
+            404)
+              echo "identity: ${IMAGE}:${VERSION} has not been published"
+              ;;
+            200)
+              if [ "$OVERWRITE" = "true" ]; then
+                echo "identity: ${IMAGE}:${VERSION} exists and an overwrite was requested"
+              else
+                echo "identity: refusing to move the published tag ${IMAGE}:${VERSION}."
+                echo "identity: bump the version in server/Cargo.toml and compose.yml, or dispatch again with overwrite enabled."
+                exit 1
+              fi
+              ;;
+            *)
+              # An unanswered question must never be read as "the tag is free".
+              echo "identity: the registry answered HTTP ${code}; whether the tag exists is unknown"
+              exit 1
+              ;;
+          esac
+
+  # One job per architecture, each on its own native runner. A matrix cannot
+  # expose per-leg outputs to a downstream job, so the digests would have to
+  # travel through upload-artifact and download-artifact -- two more actions to
+  # pin and review -- to save the handful of lines these two jobs duplicate. A
+  # local reusable workflow is not an option either: the hygiene check requires
+  # every `uses:` to be `owner/repo@<40-hex-sha>`, and `./.github/workflows/...`
+  # cannot satisfy that. So the two jobs are kept adjacent and identical apart
+  # from `runs-on` and `PLATFORM`, where a diff between them is easy to read.
+  amd64:
+    name: amd64
+    needs: identity
+    runs-on: ubuntu-24.04
+    environment: docker-hub
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Docker Hub
+        timeout-minutes: 5
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        # On standard input: a token in a command argument is readable by every
+        # process on the runner. Performed in a rehearsal too, so a dry run also
+        # proves the credential works before a real publication depends on it.
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Build and push by digest
+        id: build
+        timeout-minutes: 25
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          PLATFORM: linux/amd64
+        run: |
+          set -euo pipefail
+
+          docker version --format 'engine {{.Server.Version}}'
+          docker buildx version
+
+          # buildx refuses push-by-digest on the default `docker` driver, with
+          # "push-by-digest is currently not implemented for docker driver,
+          # please create a new builder instance". So the builder is created
+          # explicitly, making the capability a property of this workflow rather
+          # than of whatever the runner image happens to ship.
+          docker buildx create --name relay --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+          # No provenance attestation. It would add `unknown/unknown` entries to
+          # the manifest list, which both complicates composing the list and
+          # defeats the assertion that it names exactly two platforms. Publishing
+          # attestations is a deliberate future change, with its own verification.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "mode: rehearsal -- building ${PLATFORM} and exporting nothing"
+            docker buildx build \
+              --platform "$PLATFORM" \
+              --provenance=false \
+              --output type=cacheonly \
+              .
+            echo "digest=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "mode: publish -- building ${PLATFORM} and pushing by digest"
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --provenance=false \
+            --metadata-file metadata.json \
+            --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+            .
+
+          digest=$(jq -r '."containerimage.digest" // empty' metadata.json)
+          if [ -z "$digest" ]; then
+            echo "build: the build reported no image digest"
+            cat metadata.json
+            exit 1
+          fi
+
+          echo "pushed ${IMAGE}@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+  arm64:
+    name: arm64
+    needs: identity
+    runs-on: ubuntu-24.04-arm
+    environment: docker-hub
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Docker Hub
+        timeout-minutes: 5
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Build and push by digest
+        id: build
+        timeout-minutes: 25
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          PLATFORM: linux/arm64
+        run: |
+          set -euo pipefail
+
+          docker version --format 'engine {{.Server.Version}}'
+          docker buildx version
+
+          docker buildx create --name relay --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "mode: rehearsal -- building ${PLATFORM} and exporting nothing"
+            docker buildx build \
+              --platform "$PLATFORM" \
+              --provenance=false \
+              --output type=cacheonly \
+              .
+            echo "digest=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "mode: publish -- building ${PLATFORM} and pushing by digest"
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --provenance=false \
+            --metadata-file metadata.json \
+            --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+            .
+
+          digest=$(jq -r '."containerimage.digest" // empty' metadata.json)
+          if [ -z "$digest" ]; then
+            echo "build: the build reported no image digest"
+            cat metadata.json
+            exit 1
+          fi
+
+          echo "pushed ${IMAGE}@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+  # The only step that makes a tag point anywhere new. Everything above pushed
+  # untagged blobs, so a run that failed before this point left every existing
+  # tag resolving to the previous release.
+  #
+  # No checkout: this job only talks to the registry.
+  publish:
+    name: publish
+    needs: [identity, amd64, arm64]
+    runs-on: ubuntu-24.04
+    environment: docker-hub
+    timeout-minutes: 15
+    steps:
+      - name: Authenticate to Docker Hub
+        timeout-minutes: 5
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Re-check the version tag immediately before moving it
+        id: recheck
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          OVERWRITE: ${{ inputs.overwrite }}
+        run: |
+          set -euo pipefail
+
+          token=$(curl -fsS \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${IMAGE}:pull" \
+            | jq -r '.token')
+
+          code=$(curl -sS -o /dev/null -D headers.txt -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://registry-1.docker.io/v2/${IMAGE}/manifests/${VERSION}")
+
+          previous=$(awk 'tolower($1) == "docker-content-digest:" { gsub(/\r/, "", $2); print $2 }' headers.txt)
+
+          echo "manifest read for ${IMAGE}:${VERSION} returned HTTP ${code}"
+
+          case "$code" in
+            404)
+              echo "publish: ${IMAGE}:${VERSION} is still unpublished"
+              ;;
+            200)
+              if [ "$OVERWRITE" = "true" ]; then
+                echo "publish: moving ${IMAGE}:${VERSION} away from ${previous}"
+                echo "previous=${previous}" >> "$GITHUB_OUTPUT"
+              else
+                echo "publish: ${IMAGE}:${VERSION} was published between the identity check and now; refusing to move it"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "publish: the registry answered HTTP ${code}; whether the tag exists is unknown"
+              exit 1
+              ;;
+          esac
+
+      - name: Compose the manifest list and attach every tag
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          COMMIT_TAG: ${{ needs.identity.outputs.commit_tag }}
+          AMD64_DIGEST: ${{ needs.amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.arm64.outputs.digest }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "mode: rehearsal -- no digest was pushed, so there is nothing to compose"
+            echo "these tags would have been attached:"
+            for tag in "$VERSION" "$COMMIT_TAG" latest; do
+              echo "  ${IMAGE}:${tag}"
+            done
+            exit 0
+          fi
+
+          echo "amd64 digest: ${AMD64_DIGEST}"
+          echo "arm64 digest: ${ARM64_DIGEST}"
+
+          if [ -z "$AMD64_DIGEST" ] || [ -z "$ARM64_DIGEST" ]; then
+            echo "publish: an architecture reported no digest; refusing to compose a partial release"
+            exit 1
+          fi
+
+          # Two architectures that produced one digest means one of them built
+          # the wrong platform, which would otherwise publish as a manifest list
+          # naming two entries that are the same image.
+          if [ "$AMD64_DIGEST" = "$ARM64_DIGEST" ]; then
+            echo "publish: both architectures reported the same digest; one of them built the wrong platform"
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:${COMMIT_TAG}" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}@${AMD64_DIGEST}" \
+            "${IMAGE}@${ARM64_DIGEST}"
+
+      - name: Verify the published list and report what every tag resolves to
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          COMMIT_TAG: ${{ needs.identity.outputs.commit_tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "mode: rehearsal -- nothing was published, so there is nothing to verify"
+            exit 0
+          fi
+
+          docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" > list.json
+
+          echo "manifest list for ${IMAGE}:${VERSION}:"
+          jq '.' list.json
+
+          # An exact set, not a subset: an extra entry -- an attestation manifest,
+          # or a third architecture -- is as much a surprise as a missing one.
+          jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture)"' list.json | sort -u > observed.txt
+          printf 'linux/amd64\nlinux/arm64\n' > expected.txt
+
+          echo "platforms observed:"
+          sed 's/^/  /' observed.txt
+
+          diff -u expected.txt observed.txt
+
+          echo "tags now resolve to:"
+          for tag in "$VERSION" "$COMMIT_TAG" latest; do
+            digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${IMAGE}:${tag}")
+            echo "  ${IMAGE}:${tag} -> ${digest}"
+          done
+
+          echo "publish: ${IMAGE}:${VERSION} published for linux/amd64 and linux/arm64"

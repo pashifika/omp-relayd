@@ -336,12 +336,53 @@ jobs:
         working-directory: extension
         run: bun run test:integration
 
+  # Runtime job. Owns the container image, which is the one artifact in this
+  # repository no other job builds -- so before this job existed, a `Dockerfile`
+  # broken on `main` was discovered only when a publication was attempted.
+  #
+  # Deliberately amd64 only. Building arm64 here would roughly double the job to
+  # catch architecture-specific compilation failures, which this dependency set
+  # makes unlikely; publication is manual, so such a failure surfaces as a red
+  # publish run rather than as a broken release.
+  #
+  # It pushes nothing and holds no credential, so a fork's pull request runs it.
+  docker:
+    name: docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Report the engine version
+        timeout-minutes: 5
+        # Printed, not assumed: the build below belongs to this engine.
+        run: docker version --format 'engine {{.Server.Version}}'
+
+      - name: Build the relay image
+        timeout-minutes: 20
+        # Plain `docker build`, not buildx with an exporter: this job only needs
+        # to know the image builds, and the daemon's builder does that with no
+        # driver setup. `publish.yml` needs a container builder; this does not.
+        run: docker build --tag omp-relayd:ci .
+
+      - name: Report what was built
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          docker image inspect omp-relayd:ci \
+            --format 'built {{.RepoTags}} os={{.Os}} arch={{.Architecture}} user={{.Config.User}} entrypoint={{.Config.Entrypoint}}'
+
   # The single status check branch protection requires. `.github/rulesets/main.json`
   # names the literal string `ci`; nothing mechanically verifies the two agree, so
   # renaming this job silently blocks every merge with no failing job to point at.
   ci:
     name: ci
-    needs: [hygiene, rust, bun, interop]
+    needs: [hygiene, rust, bun, interop, docker]
     # `always()` is load-bearing. Without it this job is skipped when a dependency
     # fails, and a skipped required check blocks a pull request rather than failing
     # it -- a stuck merge button instead of a red one.
