@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use omp_relayd::protocol::{
-    self, ClientFrame, PROTOCOL_VERSION, ReceiptStatus, RoomId, ServerFrame,
+    self, ClientFrame, PROTOCOL_VERSION, ReceiptStatus, ReserveStatus, RoomId, ServerFrame,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,14 @@ use serde::{Deserialize, Serialize};
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../test-fixtures/protocol-v1")
 }
+
+/// The address every attachment fixture uses.
+///
+/// A real SHA-256, so the value is one both implementations could have produced:
+/// the digest of the empty payload, in unpadded base64url. A made-up
+/// 43-character string would test the field's shape while leaving the encoding
+/// unpinned.
+const FIXTURE_DIGEST: &str = "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU";
 
 fn updating() -> bool {
     env::var_os("UPDATE_FIXTURES").is_some()
@@ -154,6 +162,7 @@ fn send_fixture_omits_its_absent_optional_field() {
         to: "windows-main".to_owned(),
         body: "review the diff".to_owned(),
         reply_to: None,
+        attachment: None,
     };
 
     check_fixture(
@@ -201,6 +210,7 @@ fn announce_fixture_carries_no_target_field() {
         id: "ann-1".to_owned(),
         body: "the schema landed".to_owned(),
         reply_to: None,
+        attachment: None,
     };
 
     check_fixture(
@@ -232,6 +242,7 @@ fn notice_fixture_is_distinguished_from_a_message_by_its_type_alone() {
         from: "macbook-reviewer".to_owned(),
         body: "and the migration with it".to_owned(),
         reply_to: Some("ann-1".to_owned()),
+        attachment: None,
     };
 
     check_fixture(
@@ -250,6 +261,7 @@ fn notice_fixture_is_distinguished_from_a_message_by_its_type_alone() {
         from: "macbook-reviewer".to_owned(),
         body: "and the migration with it".to_owned(),
         reply_to: Some("ann-1".to_owned()),
+        attachment: None,
     })
     .expect("encodes");
     assert_eq!(
@@ -291,6 +303,115 @@ fn accepted_fixture_carries_two_integers_and_no_status() {
              {committed:02x?}"
         );
     }
+}
+
+#[test]
+fn reserve_fixture_carries_its_byte_count_as_an_integer() {
+    check_fixture(
+        "rust-reserve.msgpack",
+        &ClientFrame::Reserve {
+            request_id: "res-1".to_owned(),
+            digest: FIXTURE_DIGEST.to_owned(),
+            bytes: 301_824,
+        },
+        "a byte count as a MessagePack integer rather than a string, and a digest \
+         as the 43-character base64url address it is",
+    );
+
+    let committed = fs::read(fixture_dir().join("rust-reserve.msgpack")).expect("read the fixture");
+    assert!(
+        committed
+            .windows(FIXTURE_DIGEST.len())
+            .any(|window| window == FIXTURE_DIGEST.as_bytes()),
+        "the reserve fixture must carry its digest verbatim: {committed:02x?}"
+    );
+    // A count encoded as text would make the field's type differ between
+    // implementations while both still "worked" on a round trip through their
+    // own encoder.
+    assert!(
+        !committed
+            .windows(b"301824".len())
+            .any(|window| window == b"301824"),
+        "the byte count must not be encoded as text: {committed:02x?}"
+    );
+}
+
+#[test]
+fn reserved_fixture_states_a_lifetime_only_when_granted() {
+    check_fixture(
+        "rust-reserved.msgpack",
+        &ServerFrame::Reserved {
+            request_id: "res-1".to_owned(),
+            status: ReserveStatus::Granted,
+            expires_in: Some(7200),
+        },
+        "a reservation status as the snake_case string `granted`, with the payload's \
+         stated lifetime beside it",
+    );
+
+    let committed =
+        fs::read(fixture_dir().join("rust-reserved.msgpack")).expect("read the fixture");
+    for key in ["granted", "expires_in"] {
+        assert!(
+            committed
+                .windows(key.len())
+                .any(|window| window == key.as_bytes()),
+            "the reserved fixture must carry {key}: {committed:02x?}"
+        );
+    }
+
+    // The other half of the rule, which the granted fixture cannot show.
+    let refused = omp_relayd::protocol::encode(&ServerFrame::Reserved {
+        request_id: "res-2".to_owned(),
+        status: ReserveStatus::RoomFull,
+        expires_in: None,
+    })
+    .expect("encodes");
+    assert!(
+        !refused
+            .windows(b"expires_in".len())
+            .any(|window| window == b"expires_in"),
+        "a refusal must state no lifetime: {refused:02x?}"
+    );
+}
+
+#[test]
+fn send_with_attachment_fixture_carries_a_bare_digest() {
+    check_fixture(
+        "rust-send-attachment.msgpack",
+        &ClientFrame::Send {
+            id: "msg-2".to_owned(),
+            to: "windows-main".to_owned(),
+            body: "the failing test's output is attached".to_owned(),
+            reply_to: None,
+            attachment: Some(FIXTURE_DIGEST.to_owned()),
+        },
+        "a reference as a bare string address rather than a map, so no location, \
+         size, or filename travels with it",
+    );
+
+    let committed =
+        fs::read(fixture_dir().join("rust-send-attachment.msgpack")).expect("read the fixture");
+    // The shape, asserted against what a map-valued reference would have
+    // carried. Any of these keys means the reference grew fields the design
+    // rejected for reasons that are about security, not size.
+    for rejected in [
+        "digest", "bytes", "host", "port", "path", "filename", "name",
+    ] {
+        assert!(
+            !committed
+                .windows(rejected.len())
+                .any(|window| window == rejected.as_bytes()),
+            "the attachment must be a bare digest, but the fixture carries a \
+             {rejected} key: {committed:02x?}"
+        );
+    }
+    assert!(
+        committed
+            .windows(b"attachment".len())
+            .any(|window| window == b"attachment"),
+        "the fixture must name the field: {committed:02x?}"
+    );
 }
 
 /// Checks a fixture produced by the *other* implementation.
@@ -373,6 +494,7 @@ fn typescript_send_fixture_yields_reply_to_as_none() {
             to: "windows-main".to_owned(),
             body: "review the diff".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "an absent optional field omitted by the TypeScript encoder, not sent as nil",
     );
@@ -410,6 +532,7 @@ fn typescript_announce_fixture_decodes_without_a_target() {
             id: "ann-1".to_owned(),
             body: "the schema landed".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "a room-wide address the TypeScript encoder expressed as the absence of a target \
          field, with no reserved value for a peer to capture",
@@ -432,6 +555,7 @@ fn typescript_notice_fixture_decodes_as_a_notice_rather_than_a_message() {
         from: "macbook-reviewer".to_owned(),
         body: "and the migration with it".to_owned(),
         reply_to: Some("ann-1".to_owned()),
+        attachment: None,
     };
 
     check_foreign_fixture(
@@ -452,6 +576,7 @@ fn typescript_notice_fixture_decodes_as_a_notice_rather_than_a_message() {
         from: "macbook-reviewer".to_owned(),
         body: "and the migration with it".to_owned(),
         reply_to: Some("ann-1".to_owned()),
+        attachment: None,
     })
     .expect("encodes");
     assert_eq!(
