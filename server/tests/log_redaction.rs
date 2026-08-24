@@ -214,6 +214,7 @@ async fn exercise_a_routed_body(
             to: "recipient".to_owned(),
             body: body.clone(),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
@@ -231,6 +232,7 @@ async fn exercise_a_routed_body(
             from: "sender".to_owned(),
             body,
             reply_to: None,
+            attachment: None,
         },
         "the body must be delivered intact even though it is never logged"
     );
@@ -244,6 +246,7 @@ async fn exercise_an_undeliverable_body(sender: &mut Client<tokio::net::TcpStrea
             to: "ghost".to_owned(),
             body: format!("nobody will read {CANARY}"),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
@@ -264,6 +267,7 @@ async fn exercise_an_announced_body(announcer: &mut Client<tokio::net::TcpStream
             id: "a1".to_owned(),
             body: format!("the room should know about {CANARY}"),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
@@ -289,6 +293,7 @@ async fn exercise_a_shed_announcement(announcer: &mut Client<tokio::net::TcpStre
             id: "a2".to_owned(),
             body: format!("one of you is stalled, and {CANARY} is why"),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
@@ -327,6 +332,7 @@ async fn exercise_a_backpressured_body(
                 to: "stalled".to_owned(),
                 body: body.clone(),
                 reply_to: None,
+                attachment: None,
             })
             .await;
 

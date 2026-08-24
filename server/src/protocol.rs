@@ -203,6 +203,21 @@ pub enum ClientFrame {
         /// Identifier of the message being answered, when this is a reply.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        /// Address of a stored payload this message refers to.
+        ///
+        /// A bare digest: no location, no size, no filename. A location
+        /// supplied over the wire would let whatever is at the other end of the
+        /// socket aim a recipient's fetch at an arbitrary host; a size is
+        /// strictly less informative than the length request, which also reports
+        /// whether the payload still exists; and a filename would make a path
+        /// component out of another peer's text.
+        ///
+        /// Never sent speculatively. A client attaches one only after a
+        /// `reserve` was granted, because an older relay ignores a field it does
+        /// not recognize and would route a message referring to an attachment
+        /// nothing carried -- silent at both ends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<String>,
     },
     /// Requests delivery of `body` to every other peer in the sender's room.
     ///
@@ -221,6 +236,36 @@ pub enum ClientFrame {
         /// Identifier of the message being answered, when this is a reply.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        /// Address of a stored payload this announcement refers to. Same rules
+        /// as [`ClientFrame::Send`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<String>,
+    },
+    /// Asks the relay to hold `bytes` for a payload addressed `digest`.
+    ///
+    /// Earns its place three times over, which is why it is a frame rather than
+    /// a header on the upload route.
+    ///
+    /// *Write authorization.* The upload route carries no credential, and a
+    /// digest cannot serve as one because an uploader computes its own. A
+    /// reservation makes write authority exactly the `hello` handshake that
+    /// already decides who may address a room, so no new mechanism exists.
+    ///
+    /// *Capability detection.* This is what makes an optional `attachment`
+    /// field safe. An older relay ignores an unknown field and routes the
+    /// message anyway; it answers an unknown *frame* with `unsupported_frame` on
+    /// an open connection. So a client learns loudly that attachments are
+    /// unavailable instead of sending a reference nothing can resolve.
+    ///
+    /// *Ceiling check before transfer.* A refusal costs one small frame rather
+    /// than an abandoned upload, and it names which bound was reached.
+    Reserve {
+        /// Opaque correlation token echoed in the `reserved` reply.
+        request_id: String,
+        /// Address the payload will be uploaded under.
+        digest: String,
+        /// Byte count to hold.
+        bytes: u64,
     },
     /// Liveness probe; answered with `pong`.
     Ping,
@@ -242,6 +287,7 @@ impl ClientFrame {
             Self::List { .. } => "list",
             Self::Send { .. } => "send",
             Self::Announce { .. } => "announce",
+            Self::Reserve { .. } => "reserve",
             Self::Ping => "ping",
             Self::Unsupported => "unsupported",
         }
@@ -275,6 +321,16 @@ pub enum ServerFrame {
         /// Identifier of the message being answered, when the sender set one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        /// Address of a stored payload, copied from the `send` unchanged.
+        ///
+        /// The relay does not resolve it, does not check that it names anything,
+        /// and performs no store lookup on the routing path. A reference to a
+        /// payload that was never uploaded is routed like any other, and the
+        /// receipt says what it would have said regardless: whether a reference
+        /// resolves is the recipient's question at the moment it asks, not a
+        /// property of the delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<String>,
     },
     /// An announcement relayed from another peer of the room.
     ///
@@ -300,6 +356,10 @@ pub enum ServerFrame {
         /// one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        /// Address of a stored payload, copied from the `announce` unchanged.
+        /// Same rules as [`ServerFrame::Message`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<String>,
     },
     /// Relay-level outcome of one `send`.
     Receipt {
@@ -328,6 +388,27 @@ pub enum ServerFrame {
         /// been reaped. The two are one count because nothing acts on the
         /// difference; the second is a race window rather than a state.
         shed: u32,
+    },
+    /// Answer to one `reserve`.
+    Reserved {
+        /// Correlation token copied from the `reserve`.
+        request_id: String,
+        /// Whether the reservation was made, and if not, which bound refused.
+        status: ReserveStatus,
+        /// How long the payload will remain fetchable once uploaded, in
+        /// seconds.
+        ///
+        /// Present only when `status` is [`ReserveStatus::Granted`]: a refusal
+        /// has no payload and therefore no lifetime, and a number beside one
+        /// would read as a promise about something that will not exist.
+        ///
+        /// Stated at all because §13.1 of the protocol record named the trap it
+        /// closes: a reference adds a second way to be disappointed, since it
+        /// may no longer resolve by the time the recipient reads it. Stating the
+        /// lifetime makes that the sender's responsibility with a number behind
+        /// it rather than a vague one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_in: Option<u64>,
     },
     /// Answer to `ping`.
     Pong,
@@ -358,8 +439,68 @@ impl ServerFrame {
             Self::Notice { .. } => "notice",
             Self::Receipt { .. } => "receipt",
             Self::Accepted { .. } => "accepted",
+            Self::Reserved { .. } => "reserved",
             Self::Pong => "pong",
             Self::Error { .. } => "error",
+        }
+    }
+}
+
+/// Whether a reservation was made, and which bound refused it if not.
+///
+/// A status rather than an [`ErrorCode`], and that is a deliberate boundary. A
+/// refusal is the application-level answer to a request the relay understood and
+/// acted on -- exactly what [`ReceiptStatus`] is for a `send`. A new error code
+/// would widen a set the protocol keeps closed at ten, make a capacity answer
+/// look like a protocol rejection, and enlarge every client's branching surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReserveStatus {
+    /// The allowance is held; the payload may be uploaded.
+    Granted,
+    /// Above the per-payload maximum. No later moment makes this succeed.
+    PayloadTooLarge,
+    /// The room's own total is reached. Waiting or an expiry may clear it.
+    RoomFull,
+    /// The process-wide total is reached, so other rooms hold the bytes.
+    StoreFull,
+}
+
+impl ReserveStatus {
+    /// Stable wire and log spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::RoomFull => "room_full",
+            Self::StoreFull => "store_full",
+        }
+    }
+
+    /// Whether this status means the reservation exists.
+    pub fn is_granted(self) -> bool {
+        matches!(self, Self::Granted)
+    }
+}
+
+impl fmt::Display for ReserveStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<crate::blob::Refusal> for ReserveStatus {
+    /// Maps the store's refusal onto its wire status.
+    ///
+    /// The two enums are kept separate rather than shared: the store's is about
+    /// which ceiling it enforces, and this one is a wire value whose variants
+    /// cannot change without a protocol change. One type would couple a wire
+    /// contract to an implementation detail of the accounting.
+    fn from(refusal: crate::blob::Refusal) -> Self {
+        match refusal {
+            crate::blob::Refusal::PayloadTooLarge => Self::PayloadTooLarge,
+            crate::blob::Refusal::RoomFull => Self::RoomFull,
+            crate::blob::Refusal::StoreFull => Self::StoreFull,
         }
     }
 }
@@ -808,22 +949,26 @@ mod tests {
                 to: "windows-main".to_owned(),
                 body: "review the diff".to_owned(),
                 reply_to: None,
+                attachment: None,
             },
             ClientFrame::Send {
                 id: "msg-2".to_owned(),
                 to: "windows-main".to_owned(),
                 body: "on it".to_owned(),
                 reply_to: Some("msg-1".to_owned()),
+                attachment: None,
             },
             ClientFrame::Announce {
                 id: "ann-1".to_owned(),
                 body: "the schema landed".to_owned(),
                 reply_to: None,
+                attachment: None,
             },
             ClientFrame::Announce {
                 id: "ann-2".to_owned(),
                 body: "and the migration with it".to_owned(),
                 reply_to: Some("ann-1".to_owned()),
+                attachment: None,
             },
             ClientFrame::Ping,
         ]
@@ -843,24 +988,28 @@ mod tests {
                 from: "macbook-reviewer".to_owned(),
                 body: "review the diff".to_owned(),
                 reply_to: None,
+                attachment: None,
             },
             ServerFrame::Message {
                 id: "msg-2".to_owned(),
                 from: "macbook-reviewer".to_owned(),
                 body: "on it".to_owned(),
                 reply_to: Some("msg-1".to_owned()),
+                attachment: None,
             },
             ServerFrame::Notice {
                 id: "ann-1".to_owned(),
                 from: "macbook-reviewer".to_owned(),
                 body: "the schema landed".to_owned(),
                 reply_to: None,
+                attachment: None,
             },
             ServerFrame::Notice {
                 id: "ann-2".to_owned(),
                 from: "macbook-reviewer".to_owned(),
                 body: "and the migration with it".to_owned(),
                 reply_to: Some("ann-1".to_owned()),
+                attachment: None,
             },
             ServerFrame::Receipt {
                 id: "msg-1".to_owned(),
@@ -964,6 +1113,7 @@ mod tests {
             from: "macbook-reviewer".to_owned(),
             body: "review the diff".to_owned(),
             reply_to: None,
+            attachment: None,
         })
         .expect("encodes");
         assert!(
@@ -976,6 +1126,7 @@ mod tests {
             from: "macbook-reviewer".to_owned(),
             body: "on it".to_owned(),
             reply_to: Some("msg-1".to_owned()),
+            attachment: None,
         })
         .expect("encodes");
         assert!(
@@ -1048,6 +1199,7 @@ mod tests {
                 to: "windows-main".to_owned(),
                 body: "review the diff".to_owned(),
                 reply_to: None,
+                attachment: None,
             },
             "unknown fields changed the decoded frame"
         );
@@ -1205,6 +1357,7 @@ mod tests {
             to: "windows-main".to_owned(),
             body: "review the diff".to_owned(),
             reply_to: None,
+            attachment: None,
         };
         assert_eq!(decoded, expected);
 
@@ -1340,6 +1493,7 @@ mod tests {
             from: "f".repeat(MAX_IDENTIFIER_BYTES),
             body: "b".repeat(MAX_BODY_BYTES),
             reply_to: Some("r".repeat(MAX_CORRELATION_BYTES)),
+            attachment: None,
         };
 
         let encoded = encode(&frame).expect("encodes").len();
@@ -1377,6 +1531,7 @@ mod tests {
                     from,
                     body,
                     reply_to,
+                    attachment: None,
                 }
             } else {
                 ServerFrame::Message {
@@ -1384,6 +1539,7 @@ mod tests {
                     from,
                     body,
                     reply_to,
+                    attachment: None,
                 }
             }
         };
@@ -1412,6 +1568,231 @@ mod tests {
             MAX_FRAME_BYTES - notice
         );
     }
+
+    /// 4.3: the envelope reservation with an attachment at the body budget.
+    ///
+    /// The reference's shape was chosen by measurement against the 512-byte
+    /// reservation `MAX_BODY_BYTES` was computed from, and the measurement is
+    /// recorded in `evidence/reference-field-shapes.md`. This asserts the two
+    /// numbers that measurement produced, so the shape cannot be widened
+    /// without a test failing: a flat 43-character string costs 56 bytes and
+    /// leaves 91 of slack.
+    #[test]
+    fn worst_case_delivery_with_an_attachment_fits_the_frame_cap() {
+        let maximal = |attached: bool, as_notice: bool| {
+            let id = "i".repeat(MAX_CORRELATION_BYTES);
+            let from = "f".repeat(MAX_IDENTIFIER_BYTES);
+            let body = "b".repeat(MAX_BODY_BYTES);
+            let reply_to = Some("r".repeat(MAX_CORRELATION_BYTES));
+            // Any 43-character base64url value: the cost is its length, not its
+            // content.
+            let attachment = attached.then(|| "A".repeat(DIGEST_CHARS));
+            if as_notice {
+                ServerFrame::Notice {
+                    id,
+                    from,
+                    body,
+                    reply_to,
+                    attachment,
+                }
+            } else {
+                ServerFrame::Message {
+                    id,
+                    from,
+                    body,
+                    reply_to,
+                    attachment,
+                }
+            }
+        };
+        let size = |attached: bool, as_notice: bool| {
+            encode(&maximal(attached, as_notice))
+                .expect("encodes")
+                .len()
+        };
+
+        let message = size(true, false);
+        let notice = size(true, true);
+
+        assert!(
+            message <= MAX_FRAME_BYTES,
+            "worst-case message with an attachment is {message} bytes, over the \
+             {MAX_FRAME_BYTES}-byte cap"
+        );
+        assert!(
+            notice <= MAX_FRAME_BYTES,
+            "worst-case notice with an attachment is {notice} bytes, over the \
+             {MAX_FRAME_BYTES}-byte cap"
+        );
+
+        // The measured cost, pinned. A shape carrying a size or a filename
+        // measured 75 and would leave 72; the flat string was chosen for the
+        // 19 bytes of reservation that buys.
+        assert_eq!(
+            message - size(false, false),
+            56,
+            "an attachment cost {} bytes rather than the measured 56; the reference's \
+             shape or its length rule has changed",
+            message - size(false, false)
+        );
+        assert_eq!(
+            MAX_FRAME_BYTES - message,
+            91,
+            "the reservation left {} bytes of slack rather than the measured 91",
+            MAX_FRAME_BYTES - message
+        );
+        assert_eq!(
+            message - notice,
+            1,
+            "an attachment must not disturb the one-byte relation the shared budget \
+             rests on: message {message}, notice {notice}"
+        );
+
+        println!(
+            "worst-case message with an attachment: {message} bytes = {} envelope + \
+             {MAX_BODY_BYTES} body, {} below the {MAX_FRAME_BYTES}-byte cap; notice {notice}",
+            message - MAX_BODY_BYTES,
+            MAX_FRAME_BYTES - message
+        );
+    }
+
+    /// 3.2: a digest is its own rule, not an identifier and not a correlation
+    /// token.
+    #[test]
+    fn a_digest_is_exactly_43_characters_of_unpadded_base64url() {
+        let valid = "A".repeat(DIGEST_CHARS);
+        assert_eq!(validate_digest(&valid), Ok(()), "{valid} was rejected");
+
+        for (value, expected) in [
+            ("A".repeat(42), DigestError::WrongLength { found: 42 }),
+            ("A".repeat(44), DigestError::WrongLength { found: 44 }),
+            (String::new(), DigestError::WrongLength { found: 0 }),
+        ] {
+            assert_eq!(
+                validate_digest(&value),
+                Err(expected),
+                "a {}-character value was not rejected on length",
+                value.chars().count()
+            );
+        }
+
+        // Standard base64's two extra characters and its padding, each at the
+        // right length so the rejection is about the alphabet.
+        for (value, character) in [
+            (format!("{}/{}", "A".repeat(21), "A".repeat(21)), '/'),
+            (format!("{}+{}", "A".repeat(21), "A".repeat(21)), '+'),
+            (format!("{}=", "A".repeat(42)), '='),
+            (format!("{} ", "A".repeat(42)), ' '),
+        ] {
+            assert_eq!(value.chars().count(), DIGEST_CHARS, "fixture length");
+            assert_eq!(
+                validate_digest(&value),
+                Err(DigestError::NotBase64Url { character }),
+                "{value:?} was not rejected on its alphabet"
+            );
+        }
+
+        // The whole alphabet is accepted, so the rule admits every value the
+        // encoder can produce.
+        let alphabet: String = ('A'..='Z')
+            .chain('a'..='z')
+            .chain('0'..='9')
+            .chain(['-', '_'])
+            .collect();
+        assert_eq!(alphabet.len(), 64, "the alphabet has 64 characters");
+        for chunk in alphabet.as_bytes().chunks(DIGEST_CHARS) {
+            let mut value = String::from_utf8(chunk.to_vec()).expect("ASCII");
+            while value.chars().count() < DIGEST_CHARS {
+                value.push('A');
+            }
+            assert_eq!(
+                validate_digest(&value),
+                Ok(()),
+                "{value:?} left the accepted alphabet"
+            );
+        }
+
+        // A digest is not validated by either neighbouring rule: both would
+        // accept the 42-character value this rule rejects.
+        assert_eq!(validate_identifier(&"A".repeat(42)), Ok(()));
+        assert_eq!(validate_correlation_id(&"A".repeat(42)), Ok(()));
+    }
+
+    /// A `reserved` frame states a lifetime only when there is a payload to
+    /// have one.
+    #[test]
+    fn reserved_carries_its_lifetime_only_when_granted() {
+        let granted = encode(&ServerFrame::Reserved {
+            request_id: "r-1".to_owned(),
+            status: ReserveStatus::Granted,
+            expires_in: Some(7200),
+        })
+        .expect("encodes");
+        assert!(
+            contains_key(&granted, b"expires_in"),
+            "a granted reservation did not state its lifetime: {granted:02x?}"
+        );
+        assert!(
+            contains_key(&granted, b"granted"),
+            "the status was not carried as a string: {granted:02x?}"
+        );
+
+        for status in [
+            ReserveStatus::PayloadTooLarge,
+            ReserveStatus::RoomFull,
+            ReserveStatus::StoreFull,
+        ] {
+            let refused = encode(&ServerFrame::Reserved {
+                request_id: "r-2".to_owned(),
+                status,
+                expires_in: None,
+            })
+            .expect("encodes");
+            assert!(
+                !contains_key(&refused, b"expires_in"),
+                "{status} carried a lifetime for a payload that will not exist: {refused:02x?}"
+            );
+            assert!(
+                contains_key(&refused, status.as_str().as_bytes()),
+                "{status} was not carried as a string: {refused:02x?}"
+            );
+        }
+    }
+
+    /// A refusal is a status on a frame the relay answered, never an error code.
+    #[test]
+    fn a_reserve_refusal_is_not_an_error_code() {
+        // The closed set stays closed: every code predates this change.
+        for status in [
+            ReserveStatus::PayloadTooLarge,
+            ReserveStatus::RoomFull,
+            ReserveStatus::StoreFull,
+        ] {
+            assert!(
+                !EVERY_ERROR_CODE
+                    .iter()
+                    .any(|code| code.as_str() == status.as_str()),
+                "{status} was also added to the error codes, widening a set the protocol \
+                 keeps closed"
+            );
+        }
+    }
+
+    /// The closed set of error codes, enumerated so a test can assert about all
+    /// of them. Kept in the test module because nothing in the relay branches
+    /// over every code.
+    const EVERY_ERROR_CODE: [ErrorCode; 10] = [
+        ErrorCode::UnsupportedFrame,
+        ErrorCode::UnsupportedProtocol,
+        ErrorCode::InvalidHello,
+        ErrorCode::DuplicateHello,
+        ErrorCode::InvalidIdentifier,
+        ErrorCode::MalformedFrame,
+        ErrorCode::FrameTooLarge,
+        ErrorCode::HelloTimeout,
+        ErrorCode::IdleTimeout,
+        ErrorCode::PeerReplaced,
+    ];
 
     /// A `send` missing its target is malformed, never an announcement.
     ///
@@ -1452,6 +1833,7 @@ mod tests {
             id: "msg-1".to_owned(),
             body: "who is this for".to_owned(),
             reply_to: None,
+            attachment: None,
         })
         .expect("encodes");
         assert!(
@@ -1464,6 +1846,7 @@ mod tests {
                 id: "msg-1".to_owned(),
                 body: "who is this for".to_owned(),
                 reply_to: None,
+                attachment: None,
             }
         );
     }

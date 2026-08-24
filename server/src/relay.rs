@@ -28,7 +28,8 @@ use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::blob;
 use crate::protocol::{
-    self, ClientFrame, ErrorCode, PROTOCOL_VERSION, ReceiptStatus, RoomId, ServerFrame,
+    self, ClientFrame, ErrorCode, PROTOCOL_VERSION, ReceiptStatus, ReserveStatus, RoomId,
+    ServerFrame,
 };
 
 /// Outbound queue depth per registered peer.
@@ -1275,11 +1276,42 @@ fn handle_frame(
             to,
             body,
             reply_to,
-        } => handle_send(replies, state, registered, id, to, body, reply_to),
+            attachment,
+        } => handle_send(
+            replies,
+            state,
+            registered,
+            to,
+            Submission {
+                id,
+                body,
+                reply_to,
+                attachment,
+            },
+        ),
 
-        ClientFrame::Announce { id, body, reply_to } => {
-            handle_announce(replies, state, registered, id, body, reply_to)
-        }
+        ClientFrame::Announce {
+            id,
+            body,
+            reply_to,
+            attachment,
+        } => handle_announce(
+            replies,
+            state,
+            registered,
+            Submission {
+                id,
+                body,
+                reply_to,
+                attachment,
+            },
+        ),
+
+        ClientFrame::Reserve {
+            request_id,
+            digest,
+            bytes,
+        } => handle_reserve(replies, state, registered, request_id, &digest, bytes),
 
         ClientFrame::Unsupported => {
             tracing::info!(
@@ -1299,6 +1331,26 @@ fn handle_frame(
     }
 }
 
+/// The sender-supplied parts of a `send` or an `announce`.
+///
+/// One type for both classes because the relay validates these four fields
+/// identically in both, and because passing them positionally is how a later
+/// field lands in the wrong parameter: `reply_to` and `attachment` are both
+/// `Option<String>`, so transposing them would compile.
+///
+/// `to` stays out of it. It is the one field only a `send` has, and the one the
+/// relay validates against a different rule.
+struct Submission {
+    /// Correlation token chosen by the sender.
+    id: String,
+    /// Payload, relayed uninterpreted and never logged.
+    body: String,
+    /// Identifier of the message being answered, when there is one.
+    reply_to: Option<String>,
+    /// Address of a stored payload, relayed uninterpreted.
+    attachment: Option<String>,
+}
+
 /// Validates and routes one `send`, then reports its receipt.
 ///
 /// The three checks are ordered by consequence. An invalid correlation id and
@@ -1309,11 +1361,16 @@ fn handle_send(
     replies: &mpsc::Sender<ServerFrame>,
     state: &ServerState,
     registered: &RegisteredPeer,
-    id: String,
     to: String,
-    body: String,
-    reply_to: Option<String>,
+    submitted: Submission,
 ) -> ControlFlow<()> {
+    let Submission {
+        id,
+        body,
+        reply_to,
+        attachment,
+    } = submitted;
+
     if let Err(error) = protocol::validate_correlation_id(&id) {
         return enqueue_reply(
             replies,
@@ -1378,51 +1435,23 @@ fn handle_send(
     // it broke, where the `refuse_unwritable` fallback can only report that the
     // `message` the frame would have produced did not fit the cap.
     if let Some(body_bytes) = protocol::body_over_budget(&body) {
-        tracing::info!(
-            room = %registered.room,
-            peer = %registered.peer,
-            connection_id = registered.connection_id,
-            body_bytes,
-            budget = protocol::MAX_BODY_BYTES,
-            "body exceeds the relayable budget"
-        );
-        queue_diagnostic(
-            replies,
-            ErrorCode::FrameTooLarge,
-            format!(
-                "body is {body_bytes} bytes; at most {} can be relayed within the {}-byte \
-                 frame cap",
-                protocol::MAX_BODY_BYTES,
-                protocol::MAX_FRAME_BYTES
-            ),
-        );
-        return ControlFlow::Break(());
+        return refuse_over_budget(replies, registered, "body", body_bytes);
     }
 
     // The acknowledgement is claimed before the frame is routed. `peer-relay`
     // requires exactly one receipt per valid `send`, so routing first and
     // finding no room afterwards delivered the message and lost its receipt --
     // leaving the sender unable to tell whether to retry.
-    let Some(receipt_slot) = reserve_acknowledgement(replies) else {
-        tracing::info!(
-            room = %registered.room,
-            peer = %registered.peer,
-            connection_id = registered.connection_id,
-            capacity = REPLY_QUEUE_CAPACITY,
-            "cannot acknowledge a send; closing without routing it"
-        );
-        queue_diagnostic(
-            replies,
-            ErrorCode::IdleTimeout,
-            "replies are not being drained, so this send cannot be acknowledged; \
-             it was not routed"
-                .to_owned(),
-        );
+    let Some(receipt_slot) = claim_acknowledgement(replies, registered, "send") else {
         return ControlFlow::Break(());
     };
 
     // `body` is moved into the delivered frame and is never a log field; only
-    // its size is observable in logs.
+    // its size is observable in logs. `attachment` moves with it, unchanged and
+    // uninterpreted: the routing path performs no store lookup, so a reference
+    // to a payload that was never uploaded costs nothing here and is routed like
+    // any other. Whether it resolves is the recipient's question at the moment
+    // it asks.
     let body_bytes = body.len();
     let outcome = state.route(
         &registered.room,
@@ -1432,6 +1461,7 @@ fn handle_send(
             from: registered.peer.clone(),
             body,
             reply_to,
+            attachment,
         },
     );
 
@@ -1461,10 +1491,15 @@ fn handle_announce(
     replies: &mpsc::Sender<ServerFrame>,
     state: &ServerState,
     registered: &RegisteredPeer,
-    id: String,
-    body: String,
-    reply_to: Option<String>,
+    submitted: Submission,
 ) -> ControlFlow<()> {
+    let Submission {
+        id,
+        body,
+        reply_to,
+        attachment,
+    } = submitted;
+
     if let Err(error) = protocol::validate_correlation_id(&id) {
         return enqueue_reply(
             replies,
@@ -1493,25 +1528,7 @@ fn handle_announce(
     }
 
     if let Some(body_bytes) = protocol::body_over_budget(&body) {
-        tracing::info!(
-            room = %registered.room,
-            peer = %registered.peer,
-            connection_id = registered.connection_id,
-            body_bytes,
-            budget = protocol::MAX_BODY_BYTES,
-            "announced body exceeds the relayable budget"
-        );
-        queue_diagnostic(
-            replies,
-            ErrorCode::FrameTooLarge,
-            format!(
-                "body is {body_bytes} bytes; at most {} can be relayed within the {}-byte \
-                 frame cap",
-                protocol::MAX_BODY_BYTES,
-                protocol::MAX_FRAME_BYTES
-            ),
-        );
-        return ControlFlow::Break(());
+        return refuse_over_budget(replies, registered, "announced body", body_bytes);
     }
 
     // Secured before any recipient is enqueued, exactly as a `receipt` is. The
@@ -1519,32 +1536,21 @@ fn handle_announce(
     // constrains the order of securing against enqueueing and not the number of
     // recipients: zero acknowledgements means zero deliveries, so a resend after
     // reconnecting is never a duplicate.
-    let Some(accepted_slot) = reserve_acknowledgement(replies) else {
-        tracing::info!(
-            room = %registered.room,
-            peer = %registered.peer,
-            connection_id = registered.connection_id,
-            capacity = REPLY_QUEUE_CAPACITY,
-            "cannot acknowledge an announcement; closing without routing it"
-        );
-        queue_diagnostic(
-            replies,
-            ErrorCode::IdleTimeout,
-            "replies are not being drained, so this announcement cannot be acknowledged; \
-             it was not routed"
-                .to_owned(),
-        );
+    let Some(accepted_slot) = claim_acknowledgement(replies, registered, "announcement") else {
         return ControlFlow::Break(());
     };
 
     // `body` is moved into the notice and is never a log field; only its size is
-    // observable in logs.
+    // observable in logs. `attachment` moves with it, unchanged and
+    // uninterpreted, and reaches every recipient because it is part of the one
+    // encoded payload the fanout hands out.
     let body_bytes = body.len();
     let notice = ServerFrame::Notice {
         id: id.clone(),
         from: registered.peer.clone(),
         body,
         reply_to,
+        attachment,
     };
 
     // Encoded once for the whole room. Every field of a `notice` is
@@ -1564,6 +1570,131 @@ fn handle_announce(
         shed: counts.shed,
     });
     ControlFlow::Continue(())
+}
+
+/// Validates and answers one `reserve`.
+///
+/// The room comes from this connection's registration and a room supplied by the
+/// reserving peer is not read, because there is no field for one: a reservation
+/// is a registered peer's act inside the room it was admitted to, and the whole
+/// of the write authorization is that the `hello` handshake already decided
+/// which room that is.
+///
+/// The reply slot is claimed **before** the reservation is made, for the same
+/// reason a `receipt` is: making the reservation and then discovering there is no
+/// room for its answer would hold a room's allowance for a peer that was never
+/// told it had one, and the peer would reserve again on reconnecting. Nothing
+/// held means the retry is correct rather than a duplicate.
+///
+/// `request_id` is validated before `digest`, so a rejection can name the frame
+/// it answers. A digest rejected without a usable correlation token would arrive
+/// at a pipelining client with no positional relationship to anything.
+fn handle_reserve(
+    replies: &mpsc::Sender<ServerFrame>,
+    state: &ServerState,
+    registered: &RegisteredPeer,
+    request_id: String,
+    digest: &str,
+    bytes: u64,
+) -> ControlFlow<()> {
+    if let Err(error) = protocol::validate_correlation_id(&request_id) {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("reserve.request_id {error}")),
+                request_id: None,
+            },
+        );
+    }
+
+    if let Err(error) = protocol::validate_digest(digest) {
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::InvalidIdentifier,
+                message: Some(format!("reserve.digest {error}")),
+                request_id: Some(request_id),
+            },
+        );
+    }
+
+    // A relay running without a payload store cannot hold anything, and saying
+    // so as `unsupported_frame` is exactly right: to a client, a relay that
+    // does not implement attachments is indistinguishable from one that does not
+    // know the frame, and both answers lead it to report attachments
+    // unavailable rather than send a reference nothing can resolve.
+    let Some(blobs) = state.blobs() else {
+        tracing::info!(
+            room = %registered.room,
+            peer = %registered.peer,
+            "reserve refused: this relay runs without a payload store"
+        );
+        return enqueue_reply(
+            replies,
+            ServerFrame::Error {
+                code: ErrorCode::UnsupportedFrame,
+                message: Some(
+                    "this relay holds no payloads, so nothing can be reserved".to_owned(),
+                ),
+                request_id: Some(request_id),
+            },
+        );
+    };
+
+    let Some(reply_slot) = claim_acknowledgement(replies, registered, "reservation") else {
+        return ControlFlow::Break(());
+    };
+
+    let (status, expires_in) = match blobs.reserve(&registered.room, digest, bytes) {
+        Ok(grant) => (ReserveStatus::Granted, Some(grant.time_to_live.as_secs())),
+        Err(refusal) => (ReserveStatus::from(refusal), None),
+    };
+
+    log_reservation(registered, digest, bytes, status);
+
+    reply_slot.send(ServerFrame::Reserved {
+        request_id,
+        status,
+        expires_in,
+    });
+    ControlFlow::Continue(())
+}
+
+/// Emits the reservation outcome.
+///
+/// Carries the digest and the byte count, which are metadata rather than
+/// content: a digest is a 256-bit address that reveals nothing about the payload
+/// to a reader who does not already have it, and a size is exactly what an
+/// operator investigating a full store needs. No payload byte is loggable and
+/// none appears here.
+///
+/// A refusal names the bound it reached rather than reporting a generic refusal,
+/// because the three mean different things to an operator: `payload_too_large`
+/// is a client asking for something no configuration permits, `room_full` is one
+/// room's traffic, and `store_full` is the relay's aggregate load.
+fn log_reservation(registered: &RegisteredPeer, digest: &str, bytes: u64, status: ReserveStatus) {
+    if status.is_granted() {
+        tracing::info!(
+            room = %registered.room,
+            peer = %registered.peer,
+            connection_id = registered.connection_id,
+            digest,
+            bytes,
+            status = status.as_str(),
+            "reservation granted"
+        );
+    } else {
+        tracing::info!(
+            room = %registered.room,
+            peer = %registered.peer,
+            connection_id = registered.connection_id,
+            digest,
+            bytes,
+            bound = status.as_str(),
+            "reservation refused"
+        );
+    }
 }
 
 /// Closes the connection whose frame produced a delivery this relay cannot
@@ -1786,6 +1917,82 @@ fn reserve_acknowledgement(
     replies.try_reserve().ok()
 }
 
+/// Claims the acknowledgement slot, or states why the connection is closing.
+///
+/// The three request classes that owe an acknowledgement -- a `send`, an
+/// `announce`, and a `reserve` -- all secure it before doing the thing they will
+/// acknowledge, and all close the connection when they cannot. Sharing the
+/// refusal keeps them from drifting: `what` is the only difference, and it is
+/// diagnostic text.
+///
+/// Returning `None` means "do not perform the effect", so nothing was delivered
+/// or held and the peer's retry after reconnecting is correct rather than a
+/// duplicate.
+fn claim_acknowledgement<'a>(
+    replies: &'a mpsc::Sender<ServerFrame>,
+    registered: &RegisteredPeer,
+    what: &str,
+) -> Option<mpsc::Permit<'a, ServerFrame>> {
+    if let Some(slot) = reserve_acknowledgement(replies) {
+        return Some(slot);
+    }
+    tracing::info!(
+        room = %registered.room,
+        peer = %registered.peer,
+        connection_id = registered.connection_id,
+        capacity = REPLY_QUEUE_CAPACITY,
+        what,
+        "cannot acknowledge; closing without performing it"
+    );
+    queue_diagnostic(
+        replies,
+        ErrorCode::IdleTimeout,
+        format!(
+            "replies are not being drained, so this {what} cannot be acknowledged; \
+             it was not performed"
+        ),
+    );
+    None
+}
+
+/// Refuses a body the relay cannot fit in the delivery it would build, closing
+/// the connection with the size and the budget named.
+///
+/// Shared by `send` and `announce`, whose arithmetic is identical: both build a
+/// delivery whose envelope is larger than the frame that produced it, and both
+/// close rather than continue, because a sender that keeps writing over-budget
+/// bodies has a defect the connection cannot absorb.
+///
+/// `field` names which of the two was over budget, because that is the one thing
+/// the two cases differ in and the one thing the sender needs to locate.
+fn refuse_over_budget(
+    replies: &mpsc::Sender<ServerFrame>,
+    registered: &RegisteredPeer,
+    field: &str,
+    body_bytes: usize,
+) -> ControlFlow<()> {
+    tracing::info!(
+        room = %registered.room,
+        peer = %registered.peer,
+        connection_id = registered.connection_id,
+        field,
+        body_bytes,
+        budget = protocol::MAX_BODY_BYTES,
+        "body exceeds the relayable budget"
+    );
+    queue_diagnostic(
+        replies,
+        ErrorCode::FrameTooLarge,
+        format!(
+            "{field} is {body_bytes} bytes; at most {} can be relayed within the {}-byte \
+             frame cap",
+            protocol::MAX_BODY_BYTES,
+            protocol::MAX_FRAME_BYTES
+        ),
+    );
+    ControlFlow::Break(())
+}
+
 /// Queues the frame that names why the relay is closing this connection.
 ///
 /// A bare EOF is indistinguishable from a crashed relay, a wrong port, or a
@@ -1930,6 +2137,7 @@ mod tests {
             from: "macbook-reviewer".to_owned(),
             body: "review the diff".to_owned(),
             reply_to: None,
+            attachment: None,
         }
     }
 
@@ -2158,6 +2366,7 @@ mod tests {
             from: "macbook-reviewer".to_owned(),
             body: "x".repeat(protocol::MAX_FRAME_BYTES),
             reply_to: None,
+            attachment: None,
         };
         assert!(
             protocol::encode(&oversized).expect("encodes").len() > protocol::MAX_FRAME_BYTES,
@@ -2202,6 +2411,7 @@ mod tests {
             from: "macbook-reviewer".to_owned(),
             body: "the schema landed".to_owned(),
             reply_to: None,
+            attachment: None,
         })
         .expect("encodes");
 
@@ -2481,6 +2691,7 @@ mod tests {
             from: "sender".to_owned(),
             body: "x".repeat(8 * 1024),
             reply_to: None,
+            attachment: None,
         };
         let diagnostic = ServerFrame::Error {
             code: ErrorCode::IdleTimeout,

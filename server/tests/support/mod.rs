@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use omp_relayd::blob;
-use omp_relayd::protocol::{self, ClientFrame, PROTOCOL_VERSION, RoomId, ServerFrame};
+use omp_relayd::protocol::{
+    self, ClientFrame, PROTOCOL_VERSION, ReceiptStatus, RoomId, ServerFrame,
+};
 use omp_relayd::relay::{self, Deadlines, ServerState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -519,4 +521,35 @@ pub async fn wait_until_deregistered(relay: &Relay, room: &RoomId, peer: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("{peer} was still registered in {room} after 2 seconds");
+}
+
+/// Fills `to`'s socket buffer and then its outbound queue, returning how many
+/// sends were accepted before backpressure. Large bodies get there in tens of
+/// frames rather than thousands.
+pub async fn fill_pipeline(sender: &mut Client<TcpStream>, to: &str) -> usize {
+    let body = "x".repeat(32 * 1024);
+    let mut routed = 0usize;
+    for attempt in 1..=2000 {
+        sender
+            .send(&ClientFrame::Send {
+                id: format!("m{attempt}"),
+                to: to.to_owned(),
+                body: body.clone(),
+                reply_to: None,
+                attachment: None,
+            })
+            .await;
+        match sender.recv().await {
+            ServerFrame::Receipt {
+                status: ReceiptStatus::Routed,
+                ..
+            } => routed += 1,
+            ServerFrame::Receipt {
+                status: ReceiptStatus::RecipientBackpressure,
+                ..
+            } => return routed,
+            other => panic!("attempt {attempt}: unexpected {other:?}"),
+        }
+    }
+    panic!("backpressure never appeared after 2000 sends of 32 KiB");
 }

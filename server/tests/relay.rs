@@ -19,7 +19,7 @@ use omp_relayd::relay::{self, Deadlines, OUTBOUND_QUEUE_CAPACITY, ServerState};
 use serde::Serialize;
 use tokio::sync::watch;
 
-use support::{Client, QUIET, Relay, length_prefix, room, wait_until_deregistered};
+use support::{Client, QUIET, Relay, fill_pipeline, length_prefix, room, wait_until_deregistered};
 
 fn send(id: &str, to: &str, body: &str) -> ClientFrame {
     ClientFrame::Send {
@@ -27,6 +27,7 @@ fn send(id: &str, to: &str, body: &str) -> ClientFrame {
         to: to.to_owned(),
         body: body.to_owned(),
         reply_to: None,
+        attachment: None,
     }
 }
 
@@ -40,6 +41,7 @@ fn announce(id: &str, body: &str) -> ClientFrame {
         id: id.to_owned(),
         body: body.to_owned(),
         reply_to: None,
+        attachment: None,
     }
 }
 
@@ -49,6 +51,7 @@ fn notice(id: &str, from: &str, body: &str) -> ServerFrame {
         from: from.to_owned(),
         body: body.to_owned(),
         reply_to: None,
+        attachment: None,
     }
 }
 
@@ -257,6 +260,7 @@ async fn case_distinct_peer_names_are_distinct_peers() {
             from: "Reviewer".to_owned(),
             body: "for the lowercase one".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "the message must reach the lowercase peer, not the sender"
     );
@@ -318,6 +322,7 @@ async fn three_messages_from_one_sender_arrive_in_order() {
                 from: "macbook-reviewer".to_owned(),
                 body: format!("body of {id}"),
                 reply_to: None,
+                attachment: None,
             },
             "frames from one sender must arrive in read order"
         );
@@ -399,6 +404,7 @@ async fn an_oversized_target_is_answered_with_a_receipt_rather_than_a_bare_close
             to: "x".repeat(target_len),
             body: String::new(),
             reply_to: None,
+            attachment: None,
         })
         .expect("encodes")
         .len()
@@ -455,6 +461,7 @@ async fn an_oversized_target_is_answered_with_a_receipt_rather_than_a_bare_close
             to: to.clone(),
             body: String::new(),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
@@ -492,6 +499,7 @@ async fn a_rejected_reply_to_names_the_send_it_rejected() {
             to: "recipient".to_owned(),
             body: "hi".to_owned(),
             reply_to: Some("r".repeat(129)),
+            attachment: None,
         })
         .await;
 
@@ -543,6 +551,7 @@ async fn a_self_addressed_send_is_delivered_to_the_sender() {
             from: "solo".to_owned(),
             body: "note to self".to_owned(),
             reply_to: None,
+            attachment: None,
         }),
         "expected the delivered message among {frames:?}"
     );
@@ -562,6 +571,7 @@ async fn a_reply_reference_is_carried_through_and_omitted_when_absent() {
             to: "windows-main".to_owned(),
             body: "answering".to_owned(),
             reply_to: Some("m1".to_owned()),
+            attachment: None,
         })
         .await;
     assert_eq!(sender.recv().await, routed("m2", "windows-main"));
@@ -572,6 +582,7 @@ async fn a_reply_reference_is_carried_through_and_omitted_when_absent() {
             from: "macbook-reviewer".to_owned(),
             body: "answering".to_owned(),
             reply_to: Some("m1".to_owned()),
+            attachment: None,
         },
         "reply_to must be carried through unchanged"
     );
@@ -585,6 +596,7 @@ async fn a_reply_reference_is_carried_through_and_omitted_when_absent() {
             from: "macbook-reviewer".to_owned(),
             body: "unprompted".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "an absent reply_to must stay absent"
     );
@@ -611,6 +623,7 @@ async fn a_repeated_message_id_is_not_deduplicated() {
                 from: "macbook-reviewer".to_owned(),
                 body: "twice".to_owned(),
                 reply_to: None,
+                attachment: None,
             },
             "delivery {round} of a repeated id must still arrive"
         );
@@ -657,6 +670,7 @@ async fn unknown_fields_are_ignored_and_a_supplied_sender_identity_is_not_truste
             from: "macbook-reviewer".to_owned(),
             body: "with extras".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "an unknown field must be ignored and `from` must come from the registration"
     );
@@ -683,6 +697,7 @@ async fn a_full_recipient_queue_reports_backpressure_and_keeps_the_sender_open()
                 to: "stalled".to_owned(),
                 body: body.clone(),
                 reply_to: None,
+                attachment: None,
             })
             .await;
 
@@ -881,6 +896,7 @@ async fn an_announced_reply_reference_is_carried_through_and_omitted_when_absent
             id: "a2".to_owned(),
             body: "answering the room".to_owned(),
             reply_to: Some("m1".to_owned()),
+            attachment: None,
         })
         .await;
     assert_eq!(announcer.recv().await, accepted("a2", 1, 0));
@@ -891,6 +907,7 @@ async fn an_announced_reply_reference_is_carried_through_and_omitted_when_absent
             from: "announcer".to_owned(),
             body: "answering the room".to_owned(),
             reply_to: Some("m1".to_owned()),
+            attachment: None,
         },
         "reply_to must be carried through unchanged"
     );
@@ -935,6 +952,7 @@ async fn an_announcement_and_a_directed_message_keep_their_order() {
             from: "sender".to_owned(),
             body: "so apply the migration".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "and the directed message must follow it"
     );
@@ -979,6 +997,7 @@ async fn an_over_budget_announcement_harms_nobody_else() {
             id: "a1".to_owned(),
             body: "b".repeat(MAX_BODY_BYTES + 1),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
@@ -1033,6 +1052,7 @@ async fn an_over_long_announcement_id_is_rejected_without_closing_the_connection
             id: "a1".to_owned(),
             body: "over-long reply_to".to_owned(),
             reply_to: Some("r".repeat(129)),
+            attachment: None,
         })
         .await;
     match announcer.recv().await {
@@ -1167,6 +1187,7 @@ async fn an_announced_body_at_the_relayable_budget_is_delivered_intact() {
             id: "i".repeat(MAX_IDENTIFIER_BYTES),
             body: body.clone(),
             reply_to: Some("r".repeat(128)),
+            attachment: None,
         })
         .await;
 
@@ -1264,39 +1285,10 @@ async fn a_replacement_connection_takes_over_the_peer_name() {
             from: "macbook-reviewer".to_owned(),
             body: "after the takeover".to_owned(),
             reply_to: None,
+            attachment: None,
         },
         "traffic must follow the replacement"
     );
-}
-
-/// Fills `to`'s socket buffer and then its outbound queue, returning how many
-/// sends were accepted before backpressure. Large bodies get there in tens of
-/// frames rather than thousands.
-async fn fill_pipeline(sender: &mut Client<tokio::net::TcpStream>, to: &str) -> usize {
-    let body = "x".repeat(32 * 1024);
-    let mut routed = 0usize;
-    for attempt in 1..=2000 {
-        sender
-            .send(&ClientFrame::Send {
-                id: format!("m{attempt}"),
-                to: to.to_owned(),
-                body: body.clone(),
-                reply_to: None,
-            })
-            .await;
-        match sender.recv().await {
-            ServerFrame::Receipt {
-                status: ReceiptStatus::Routed,
-                ..
-            } => routed += 1,
-            ServerFrame::Receipt {
-                status: ReceiptStatus::RecipientBackpressure,
-                ..
-            } => return routed,
-            other => panic!("attempt {attempt}: unexpected {other:?}"),
-        }
-    }
-    panic!("backpressure never appeared after 2000 sends of 32 KiB");
 }
 
 /// Regression: the eviction signal used to be the closure of the outbound
@@ -1728,6 +1720,7 @@ async fn late_cleanup_of_a_superseded_connection_keeps_the_replacement() {
             from: "macbook-reviewer".to_owned(),
             body: "still reachable".to_owned(),
             reply_to: None,
+            attachment: None,
         }
     );
 }
@@ -1799,6 +1792,7 @@ async fn a_peer_that_stops_reading_is_closed_by_the_idle_deadline() {
                 to: "stalled".to_owned(),
                 body: body.clone(),
                 reply_to: None,
+                attachment: None,
             })
             .await;
 
@@ -2082,6 +2076,7 @@ fn send_payload_with_long_reply_to(target: usize, to: &str) -> Vec<u8> {
             to: to.to_owned(),
             body: String::new(),
             reply_to: Some("r".repeat(reply_len)),
+            attachment: None,
         })
         .expect("encode");
 
@@ -2202,6 +2197,7 @@ fn send_payload_of_exact_size(target: usize, to: &str) -> Vec<u8> {
             to: to.to_owned(),
             body: "x".repeat(body_len),
             reply_to: None,
+            attachment: None,
         })
         .expect("encode");
 
@@ -2244,6 +2240,7 @@ async fn a_body_at_the_relayable_budget_is_delivered_intact() {
             to: "recipient".to_owned(),
             body: body.clone(),
             reply_to: Some("r".repeat(protocol::MAX_CORRELATION_BYTES)),
+            attachment: None,
         })
         .await;
 
@@ -2282,6 +2279,7 @@ async fn a_body_one_byte_over_the_budget_is_refused_and_the_recipient_survives()
             to: "recipient".to_owned(),
             body: "b".repeat(MAX_BODY_BYTES + 1),
             reply_to: None,
+            attachment: None,
         })
         .await;
 
