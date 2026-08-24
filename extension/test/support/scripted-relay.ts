@@ -140,6 +140,19 @@ export class ScriptedRelay {
   readonly transfers: TransferRequest[] = [];
 
   /**
+   * Every frame and every transfer, interleaved in true arrival order.
+   *
+   * Separate from {@link received} and {@link transfers} because those are two
+   * lists, and a test that concatenated them by category would construct the
+   * ordering it meant to observe: `["reserve", "transfer:PUT", "send"]` comes
+   * out of a category sort whether or not the `send` actually followed the
+   * upload. Ordering across the two protocols is exactly the property that
+   * matters — a reference must never be relayed before the payload it names is
+   * in place — so it needs one clock.
+   */
+  readonly timeline: string[] = [];
+
+  /**
    * Payloads this relay holds, keyed by request path.
    *
    * Keyed by the whole path rather than by digest, because the path carries the
@@ -297,6 +310,8 @@ export class ScriptedRelay {
       }
       for (const value of outcome.values) {
         this.received.push(value);
+        const kind = asRecord(value)?.["type"];
+        this.timeline.push(typeof kind === "string" ? kind : "frame");
         this.#script(value, session);
       }
       this.#notify();
@@ -343,6 +358,7 @@ export class ScriptedRelay {
 
       const request: TransferRequest = { method, path, body };
       this.transfers.push(request);
+      this.timeline.push(`transfer:${method}`);
       this.#notifyTransfers();
       const answer = this.#transferScript(request, this);
       if (answer === null) {

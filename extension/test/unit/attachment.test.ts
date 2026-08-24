@@ -90,6 +90,14 @@ const GRANT: Script = (frame, session) => {
       status: "routed",
     });
   }
+  if (isFrame(frame, "announce")) {
+    session.send({
+      type: "accepted",
+      id: String(frameField(frame, "id")),
+      delivered: 2,
+      shed: 0,
+    });
+  }
 };
 
 /** Admits, then refuses every reservation with `status`. */
@@ -284,33 +292,41 @@ describe("reserving", () => {
 });
 
 describe("attaching to a message", () => {
-  test("the reference is carried only after a grant and an upload", async () => {
-    const { relay, harness, close } = await joined(GRANT);
-    try {
-      const payload = new TextEncoder().encode("a diff");
-      const attached = await harness.client.attach(payload);
-      await harness.client.send({
-        to: "windows-main",
-        body: "attached",
-        attachment: attached.digest,
-      });
+  test.each([
+    ["send", "send"] as const,
+    ["announce", "announce"] as const,
+  ])(
+    "a %s carries its reference only after the payload is in place",
+    async (kind, frameType) => {
+      const { relay, harness, close } = await joined(GRANT);
+      try {
+        const payload = new TextEncoder().encode("a diff");
+        const attached = await harness.client.attach(payload);
+        if (kind === "send") {
+          await harness.client.send({
+            to: "windows-main",
+            body: "attached",
+            attachment: attached.digest,
+          });
+        } else {
+          await harness.client.announce({ body: "attached", attachment: attached.digest });
+        }
 
-      // Order is the contract: reserve, upload, then the frame that refers to it.
-      // A frame that overtook its own upload would reference a payload the
-      // recipient could not fetch.
-      const order = [
-        ...relay.received.filter((frame) => isFrame(frame, "reserve")).map(() => "reserve"),
-        ...relay.transfers.map((request) => `transfer:${request.method}`),
-        ...relay.received.filter((frame) => isFrame(frame, "send")).map(() => "send"),
-      ];
-      expect(order).toEqual(["reserve", "transfer:PUT", "send"]);
+        // Read off one clock, so this observes the interleaving rather than
+        // constructing it. Concatenating the frame list and the transfer list by
+        // category would produce this same array even if the frame had overtaken
+        // its own upload — and a frame that overtook its upload would reference a
+        // payload no recipient could fetch. The `announce` case matters more than
+        // the `send`: a premature reference there reaches every peer in the room.
+        expect(relay.timeline).toEqual(["hello", "reserve", "transfer:PUT", frameType]);
 
-      const sent = relay.received.find((frame) => isFrame(frame, "send"));
-      expect(frameField(sent, "attachment")).toBe(attached.digest);
-    } finally {
-      await close();
-    }
-  });
+        const written = relay.received.find((frame) => isFrame(frame, frameType));
+        expect(frameField(written, "attachment")).toBe(attached.digest);
+      } finally {
+        await close();
+      }
+    },
+  );
 
   test("a refused reservation writes no frame carrying a reference", async () => {
     const { relay, harness, close } = await joined(refuseWith("room_full"));
