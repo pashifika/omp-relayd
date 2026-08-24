@@ -1,0 +1,1 @@
+In-memory MessagePack relay for named Oh My Pi sessions. Unauthenticated TCP, trusted LAN only.
