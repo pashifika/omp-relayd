@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until, timeout};
 
+use crate::blob;
 use crate::protocol::{
     self, ClientFrame, ErrorCode, PROTOCOL_VERSION, ReceiptStatus, RoomId, ServerFrame,
 };
@@ -167,6 +168,10 @@ pub struct ServerState {
     rooms: RwLock<Rooms>,
     next_connection_id: AtomicU64,
     deadlines: Deadlines,
+    /// Absent when the relay runs without a payload store, which is every unit
+    /// test that does not exercise one. Routing never consults it: a reference
+    /// is relayed uninterpreted.
+    blobs: Option<Arc<blob::Store>>,
 }
 
 impl Default for ServerState {
@@ -176,7 +181,7 @@ impl Default for ServerState {
 }
 
 impl ServerState {
-    /// Empty registry with the protocol's deadlines.
+    /// Empty registry with the protocol's deadlines and no payload store.
     pub fn new() -> Self {
         Self::with_deadlines(Deadlines::default())
     }
@@ -188,7 +193,20 @@ impl ServerState {
             // Ids start at 1 so that 0 is never a live connection.
             next_connection_id: AtomicU64::new(1),
             deadlines,
+            blobs: None,
         }
+    }
+
+    /// Attaches the payload store whose rooms this registry's rooms govern.
+    #[must_use]
+    pub fn with_blobs(mut self, blobs: Arc<blob::Store>) -> Self {
+        self.blobs = Some(blobs);
+        self
+    }
+
+    /// The payload store, when one is attached.
+    pub fn blobs(&self) -> Option<&Arc<blob::Store>> {
+        self.blobs.as_ref()
     }
 
     /// The deadlines this relay enforces.
@@ -255,20 +273,45 @@ impl ServerState {
     /// evicting the replacement that already took its name. Returns whether an
     /// entry was removed.
     fn deregister(&self, room: &RoomId, peer: &str, connection_id: u64) -> bool {
-        let mut rooms = self.write_rooms();
+        let emptied = {
+            let mut rooms = self.write_rooms();
 
-        let Some(peers) = rooms.get_mut(room) else {
-            return false;
+            let Some(peers) = rooms.get_mut(room) else {
+                return false;
+            };
+            if peers.get(peer).map(|handle| handle.connection_id) != Some(connection_id) {
+                return false;
+            }
+            peers.remove(peer);
+
+            // An emptied room is dropped so that a long-lived relay's memory
+            // tracks live peers rather than every room name it has ever seen.
+            let emptied = peers.is_empty();
+            if emptied {
+                rooms.remove(room);
+            }
+            emptied
         };
-        if peers.get(peer).map(|handle| handle.connection_id) != Some(connection_id) {
-            return false;
-        }
-        peers.remove(peer);
 
-        // An emptied room is dropped so that a long-lived relay's memory
-        // tracks live peers rather than every room name it has ever seen.
-        if peers.is_empty() {
-            rooms.remove(room);
+        // Outside the registry guard: `forget_room` takes the store's own lock,
+        // and holding two is a lock order nothing else needs to know about.
+        //
+        // Immediate, and that is the specified rule rather than the preferred
+        // one. A grace period is genuinely wanted -- a room can empty for a few
+        // seconds without anyone intending it to end, one peer finishing while
+        // another is mid-reconnect, and a payload removed in that window reports
+        // itself to the recipient as expired, which is somebody else's cause.
+        // The reason it is not here, the two flows that lose a payload, the four
+        // constraints such a timer must respect -- the configuration stance, the
+        // payload time to live it must not extend past, the offline-queue rule it
+        // must not become, and the bound on retained room names -- and the two
+        // layers it could live at are recorded in
+        // `local_docs/omp-relay-room-idle-close/README.md`. Read that before
+        // adding a timer here: a naive one breaks the payload time to live.
+        if emptied {
+            if let Some(blobs) = &self.blobs {
+                blobs.forget_room(room);
+            }
         }
         true
     }
@@ -1755,6 +1798,8 @@ async fn wait_for_flag(flag: &mut watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::*;
@@ -2390,5 +2435,114 @@ mod tests {
             vec![large, diagnostic],
             "the cancelled frame must arrive whole and be followed by the diagnostic"
         );
+    }
+
+    /// A store rooted in its own temporary directory, attached to a registry.
+    async fn state_with_store(name: &str) -> (Arc<ServerState>, Arc<blob::Store>, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "omp-relayd-relay-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let (store, _maintenance) = blob::Store::open(&base, name)
+            .await
+            .expect("the payload store opens");
+        let state = Arc::new(ServerState::new().with_blobs(Arc::clone(&store)));
+        (state, store, base)
+    }
+
+    /// Stores `bytes` in `room` through the store's own reserve-and-upload path.
+    async fn store_payload(store: &Arc<blob::Store>, room: &RoomId, bytes: &[u8]) -> String {
+        let address = blob::digest(bytes);
+        store
+            .reserve(room, &address, bytes.len() as u64)
+            .expect("the reservation is granted");
+        let blob::Accepted::Upload(mut upload) = store
+            .begin_upload(room, &address, bytes.len() as u64)
+            .expect("the upload is accepted")
+        else {
+            panic!("nothing is held yet");
+        };
+        upload.write(bytes).await.expect("the chunk is written");
+        upload.finish().await.expect("the upload finishes");
+        address
+    }
+
+    /// 1.9: the removal rides the registry event the relay already observes.
+    #[tokio::test]
+    async fn the_last_peer_leaving_takes_the_rooms_payloads_with_it() {
+        let (state, store, base) = state_with_store("room-drop").await;
+        let room = room();
+        let address = store_payload(&store, &room, b"a diff worth reviewing").await;
+        assert_eq!(
+            store.payload_len(&room, &address),
+            Some(22),
+            "the payload was not stored"
+        );
+
+        let (outbound, _rx) = peer_queue();
+        let (registration, _evicted) = register_in(&state, &room, "macbook", outbound);
+        assert!(
+            state.deregister(&room, "macbook", registration.connection_id),
+            "the peer was not registered"
+        );
+
+        assert_eq!(
+            store.payload_len(&room, &address),
+            None,
+            "an emptied room kept its payloads fetchable"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other half of the same rule: a room that still holds a peer keeps
+    /// its payloads, so the removal is triggered by emptying rather than by any
+    /// departure.
+    #[tokio::test]
+    async fn a_room_that_still_holds_a_peer_keeps_its_payloads() {
+        let (state, store, base) = state_with_store("room-still-held").await;
+        let room = room();
+        let address = store_payload(&store, &room, b"a log bundle").await;
+
+        let (first, _first_rx) = peer_queue();
+        let (second, _second_rx) = peer_queue();
+        let (leaving, _evicted_a) = register_in(&state, &room, "macbook", first);
+        let (_staying, _evicted_b) = register_in(&state, &room, "linux-box", second);
+
+        assert!(state.deregister(&room, "macbook", leaving.connection_id));
+        assert_eq!(
+            store.payload_len(&room, &address),
+            Some(12),
+            "a departure that did not empty the room removed its payloads"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A superseded connection's late deregistration must not take the
+    /// replacement's payloads: it does not remove the registry entry, so it must
+    /// not remove the room's bytes either.
+    #[tokio::test]
+    async fn a_superseded_connection_leaves_the_rooms_payloads_alone() {
+        let (state, store, base) = state_with_store("room-superseded").await;
+        let room = room();
+        let address = store_payload(&store, &room, b"still wanted").await;
+
+        let (first, _first_rx) = peer_queue();
+        let (second, _second_rx) = peer_queue();
+        let (superseded, _evicted_a) = register_in(&state, &room, "macbook", first);
+        let (_replacement, _evicted_b) = register_in(&state, &room, "macbook", second);
+
+        assert!(
+            !state.deregister(&room, "macbook", superseded.connection_id),
+            "the superseded connection removed the replacement's entry"
+        );
+        assert_eq!(
+            store.payload_len(&room, &address),
+            Some(12),
+            "a superseded connection removed the replacement's payloads"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

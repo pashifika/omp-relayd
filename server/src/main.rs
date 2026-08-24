@@ -10,6 +10,7 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use omp_relayd::blob;
 use omp_relayd::relay::{self, ServerState};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -155,20 +156,49 @@ async fn run(listen: String) -> ExitCode {
         Err(error) => tracing::info!(requested = %listen, %error, "relay listening"),
     }
 
+    // Named by the address this instance listens on, so two relays on one host
+    // hold separate stores and a restart of either adopts nothing from the
+    // other. `local_addr` rather than the requested address, because an
+    // ephemeral port is only known after the bind -- and a run that could not
+    // report its own address gets a store nothing will adopt, which is the safe
+    // direction.
+    let instance = listener
+        .local_addr()
+        .map_or_else(|_| listen.clone(), |addr| addr.to_string());
+    let base = env::temp_dir().join(blob::STORE_BASE_DIR);
+    let (blobs, maintenance) = match blob::Store::open(&base, &instance).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            tracing::error!(base = %base.display(), %error, "could not open the payload store");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(root = %blobs.root().display(), "payload store ready");
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Awaited alongside the accept loop, not detached: its last act is to remove
+    // the store's directory, so a graceful shutdown that did not wait for it
+    // would leave behind exactly what the startup sweep exists to clean up.
+    let store_maintenance = tokio::spawn(maintenance.run(shutdown_rx.clone()));
     let accept_loop = tokio::spawn(relay::serve(
         listener,
-        Arc::new(ServerState::new()),
+        Arc::new(ServerState::new().with_blobs(blobs)),
         shutdown_rx,
     ));
 
     termination.recv().await;
     tracing::info!("termination signal received");
-    // Ignored: the receiver lives in the task awaited immediately below.
+    // Ignored: the receivers live in the two tasks awaited immediately below.
     let _ = shutdown_tx.send(true);
 
     if let Err(error) = accept_loop.await {
         tracing::error!(%error, "accept loop failed");
+        return ExitCode::FAILURE;
+    }
+    // After the accept loop, so no connection can reserve into a store whose
+    // directory is already gone.
+    if let Err(error) = store_maintenance.await {
+        tracing::error!(%error, "payload store maintenance failed");
         return ExitCode::FAILURE;
     }
 
