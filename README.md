@@ -36,16 +36,16 @@ For normal use:
 - Docker with Compose v2
 - Oh My Pi `18.0.1`
 
-To rebuild or test the extension, install Bun `1.3.14`. To build the relay outside Docker, install Rust `1.85.0` or later.
+Normal use pulls a published image and needs no Rust toolchain. To rebuild or test the extension, install Bun `1.3.14`. To build the relay outside Docker, install Rust `1.85.0` or later.
 
 ## Quick start
 
-Clone the repository and start the relay. Compose publishes port `7788` on loopback by default.
+Clone the repository and start the relay. The first start pulls the published image; Compose publishes port `7788` on loopback by default.
 
 ```bash
 git clone https://github.com/pashifika/omp-relayd.git
 cd omp-relayd
-docker compose up -d --build
+docker compose up -d
 ```
 
 Write both configuration files and install the collaboration skill in one command. `--task` names the topic the two ends will meet on, and is the one value the helper never guesses:
@@ -73,14 +73,14 @@ The initial transport is unauthenticated, unencrypted TCP. Run it only on a trus
 The default Compose deployment is reachable only from the same host:
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 docker compose logs relay
 ```
 
 To expose the relay to a trusted private LAN, opt in with one specific private address:
 
 ```bash
-OMP_RELAY_BIND=192.168.1.10 docker compose up -d --build
+OMP_RELAY_BIND=192.168.1.10 docker compose up -d
 ```
 
 `OMP_RELAY_BIND=0.0.0.0` publishes the unauthenticated port on every interface and is not a supported deployment. The container runs read-only, drops all Linux capabilities, and persists no relay state.
@@ -89,6 +89,29 @@ Stop the relay with:
 
 ```bash
 docker compose down
+```
+
+### The published image
+
+`compose.yml` deploys [`pashifika/omp-relayd`](https://hub.docker.com/r/pashifika/omp-relayd), pinned to the version this checkout declares. A release is one manifest list serving `linux/amd64` and `linux/arm64`, so a pull selects a native image without naming a platform, and it carries three tags:
+
+| Tag | Points at |
+| --- | --- |
+| `0.1.0` | The release `compose.yml` pins. A published version tag is not moved. |
+| `sha-<short>` | The commit the image was built from. Quote this tag when reporting a problem. |
+| `latest` | The most recent release. Nothing in this repository resolves it. |
+
+Images are built and pushed only by the `Publish` workflow, from a manual dispatch on `main`. A digest that no run produced did not come from here.
+
+Two consequences of how Compose chooses between pulling and building are worth knowing, because neither announces itself:
+
+- When the pinned tag cannot be obtained — a mistyped image name, no network, or a version that was never published — Compose builds it from source instead of failing. The symptom is a start that unexpectedly compiles for several minutes; check that the tag `compose.yml` names exists on Docker Hub.
+- A source build tags its result with that same name, so it shadows the published image for every later command. Discard it to go back:
+
+```bash
+docker compose down
+docker image rm pashifika/omp-relayd:0.1.0
+docker compose up -d
 ```
 
 ## Configuration
@@ -260,7 +283,7 @@ A single machine cannot demonstrate two peers meeting while peer names derive fr
 On the machine running the relay, publish it to the LAN address the other machine can reach:
 
 ```bash
-OMP_RELAY_BIND=192.168.1.10 docker compose up -d --build
+OMP_RELAY_BIND=192.168.1.10 docker compose up -d
 ```
 
 On each machine, from a checkout of the same repository:
@@ -304,6 +327,14 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 ```
+
+To build the relay image from the working tree instead of pulling the published one:
+
+```bash
+docker compose up -d --build
+```
+
+That tags the result with the image name `compose.yml` declares, so every later `docker compose up -d` uses it until the image is removed. See [The published image](#the-published-image).
 
 Cross-language fixtures live under `test-fixtures/protocol-v1/`. Both implementations decode fixtures produced by the other language.
 

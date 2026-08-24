@@ -1,8 +1,12 @@
 services:
   relay:
+    # With both `build` and `image` present and no `pull_policy`, Compose pulls
+    # the named image and builds from source only when it cannot be obtained. So
+    # `docker compose up -d` deploys the published image, `--build` forces the
+    # working tree, and a clone still starts before a version has been published.
     build:
       context: .
-    image: omp-relayd:0.1.0
+    image: pashifika/omp-relayd:0.1.0
     restart: unless-stopped
 
     # The relay has no authentication and no encryption, so the default binding
