@@ -10,11 +10,14 @@ use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use omp_relayd::protocol::{self, ClientFrame, ErrorCode, ReceiptStatus, ServerFrame};
+use omp_relayd::blob;
+use omp_relayd::protocol::{
+    self, ClientFrame, ErrorCode, ReceiptStatus, ReserveStatus, ServerFrame,
+};
 use serde::Serialize;
 use tracing_subscriber::fmt::MakeWriter;
 
-use support::{Client, Relay, room};
+use support::{Client, Relay, blob_path, http, http_put, room};
 
 /// A string that must not appear in any log record.
 const CANARY: &str = "SECRET-CANARY";
@@ -52,6 +55,42 @@ impl MakeWriter<'_> for CapturedLogs {
     }
 }
 
+/// Asserts every log path under test actually emitted a record.
+///
+/// Separate from the canary assertion, and run before it: a capture that missed
+/// a path would let the canary check pass by having nothing to find, which is
+/// the one way this test could be green and worthless.
+fn assert_every_log_path_was_exercised(captured: &str, lines: usize, transferred: &Transferred) {
+    for expected in [
+        "peer registered",
+        "message routed",
+        "message not delivered",
+        "recipient queue full",
+        "frame decode failed",
+        "announcement fanned out",
+        "announcement shed by a recipient queue",
+        "reservation granted",
+        "payload stored",
+    ] {
+        assert!(
+            captured.contains(expected),
+            "expected a {expected:?} record among the {lines} captured lines; \
+             without it this test would not have exercised that log path"
+        );
+    }
+
+    // The transfer's records carry the address and the byte count, which is what
+    // the requirement asks them to carry *instead* of the content.
+    let stored = captured
+        .lines()
+        .find(|line| line.contains("payload stored"))
+        .expect("the upload was exercised above");
+    assert!(
+        stored.contains(&transferred.digest) && stored.contains(&transferred.bytes.to_string()),
+        "the upload record must name the digest and the byte count; observed: {stored}"
+    );
+}
+
 /// A `send` whose `protocol` field is a string, so serde's type-mismatch error
 /// carries the offending value. A relay that logged that error text verbatim
 /// would leak the payload and emit an unbounded log record.
@@ -73,7 +112,10 @@ async fn no_log_record_carries_a_message_body() {
         .with_ansi(false)
         .init();
 
-    let relay = Relay::start().await;
+    // Store-backed, because the payload transfer routes are part of the surface
+    // under test: a relay started without a store would refuse every upload and
+    // the transfer exercise below would pass without touching `http.rs`.
+    let relay = Relay::with_store("redaction").await;
     let here = room("redaction");
 
     let mut sender = Client::join(&relay, &here, "sender").await;
@@ -82,6 +124,7 @@ async fn no_log_record_carries_a_message_body() {
     exercise_a_routed_body(&mut sender, &mut recipient).await;
     exercise_an_undeliverable_body(&mut sender).await;
     exercise_an_announced_body(&mut sender).await;
+    let transferred = exercise_a_transferred_payload(&relay, &here, &mut sender).await;
     // The stalled peer is kept alive by the caller: its queue stays full, which
     // is what lets the announcement below take the shed path.
     let (backpressured_at, _stalled) =
@@ -100,23 +143,8 @@ async fn no_log_record_carries_a_message_body() {
     let captured = logs.contents();
     let lines = captured.lines().count();
 
-    // The capture is working: if it were not, the canary assertion below would
-    // pass without proving anything.
-    for expected in [
-        "peer registered",
-        "message routed",
-        "message not delivered",
-        "recipient queue full",
-        "frame decode failed",
-        "announcement fanned out",
-        "announcement shed by a recipient queue",
-    ] {
-        assert!(
-            captured.contains(expected),
-            "expected a {expected:?} record among the {lines} captured lines; \
-             without it this test would not have exercised that log path"
-        );
-    }
+    assert_every_log_path_was_exercised(&captured, lines, &transferred);
+
     let decode_record = captured
         .lines()
         .find(|line| line.contains("frame decode failed"))
@@ -282,6 +310,62 @@ async fn exercise_an_announced_body(announcer: &mut Client<tokio::net::TcpStream
             );
         }
         other => panic!("expected an acceptance, received {other:?}"),
+    }
+}
+
+/// What one exercised transfer put on the wire, for the assertions to name.
+struct Transferred {
+    digest: String,
+    bytes: usize,
+}
+
+/// A payload uploaded and fetched over the transfer routes.
+///
+/// The reservation goes through a frame rather than the store's own API, so the
+/// `reserve` path's log record is exercised too: it names a digest and a byte
+/// count, and a relay that named the payload instead would fail the canary
+/// assertion from this record rather than from `http.rs`.
+async fn exercise_a_transferred_payload(
+    relay: &Relay,
+    here: &omp_relayd::protocol::RoomId,
+    sender: &mut Client<tokio::net::TcpStream>,
+) -> Transferred {
+    // Large enough to cross more than one read, so the mid-transfer log paths
+    // are reachable, and carrying the canary throughout rather than once.
+    let payload = format!("{CANARY} in a stored payload\n").repeat(4096);
+    let payload = payload.as_bytes();
+    let digest = blob::digest(payload);
+
+    sender
+        .send(&ClientFrame::Reserve {
+            request_id: "res-canary".to_owned(),
+            digest: digest.clone(),
+            bytes: payload.len() as u64,
+        })
+        .await;
+    match sender.recv().await {
+        ServerFrame::Reserved { status, .. } => assert_eq!(
+            status,
+            ReserveStatus::Granted,
+            "the reservation under test must be granted, or no upload follows"
+        ),
+        other => panic!("expected a reservation reply, received {other:?}"),
+    }
+
+    let path = blob_path(here, &digest);
+    let stored = http_put(relay.addr, &path, payload).await;
+    assert_eq!(stored.status, 201, "the upload must be accepted");
+
+    let fetched = http(relay.addr, "GET", &path, &[], &[]).await;
+    assert_eq!(fetched.status, 200, "the fetch must be answered");
+    assert_eq!(
+        fetched.body, payload,
+        "the fetched bytes must be the ones uploaded, or the canary never travelled"
+    );
+
+    Transferred {
+        digest,
+        bytes: payload.len(),
     }
 }
 

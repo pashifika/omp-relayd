@@ -55,6 +55,24 @@ export interface TransferResponse {
   readonly status: number;
   readonly headers?: Record<string, string>;
   readonly body?: Uint8Array;
+  /**
+   * Hands the socket to the test instead of writing `body`, so a response can
+   * be trickled a chunk at a time.
+   *
+   * The only way to exercise a *stall* bound as opposed to a whole-request
+   * deadline: the distinction is entirely about what happens between chunks, so
+   * a test that cannot place a gap between two chunks cannot tell the two
+   * designs apart.
+   */
+  readonly trickle?: (writer: BodyWriter) => void;
+}
+
+/** Writes a chunked response body under the test's control. */
+export interface BodyWriter {
+  /** Writes one chunk and returns once it has left for the socket. */
+  readonly push: (bytes: Uint8Array) => void;
+  /** Ends the body, completing the response. */
+  readonly end: () => void;
 }
 
 /**
@@ -327,9 +345,25 @@ export class ScriptedRelay {
       this.transfers.push(request);
       this.#notifyTransfers();
       const answer = this.#transferScript(request, this);
-      if (answer !== null) {
-        socket.write(renderResponse(answer, method === "HEAD"));
+      if (answer === null) {
+        continue;
       }
+      if (answer.trickle !== undefined && method !== "HEAD") {
+        // Chunked, because the length is not known when the head goes out.
+        socket.write(renderHead(answer, { chunked: true }));
+        answer.trickle({
+          push: (bytes) => {
+            socket.write(`${bytes.byteLength.toString(16)}\r\n`);
+            socket.write(bytes);
+            socket.write("\r\n");
+          },
+          end: () => {
+            socket.write("0\r\n\r\n");
+          },
+        });
+        continue;
+      }
+      socket.write(renderResponse(answer, method === "HEAD"));
     }
   }
 
@@ -391,14 +425,23 @@ function defaultTransferScript(
   }
 }
 
-/** Renders one response, omitting the body for a `HEAD`. */
-function renderResponse(answer: TransferResponse, headOnly: boolean): Uint8Array {
-  const body = answer.body ?? new Uint8Array(0);
+/**
+ * Renders one response head.
+ *
+ * `chunked` omits `content-length` and declares the transfer encoding instead,
+ * for a body whose length is not known when the head goes out.
+ */
+function renderHead(
+  answer: TransferResponse,
+  options: { readonly chunked: true } | { readonly length: number },
+): Uint8Array {
+  const framing =
+    "chunked" in options
+      ? { "transfer-encoding": "chunked" }
+      : { "content-length": String(options.length) };
   const headers: Record<string, string> = {
     ...answer.headers,
-    // Declared from the payload even on a `HEAD`, which is the whole point of
-    // the length-only request.
-    "content-length": String(body.byteLength),
+    ...framing,
     connection: "close",
   };
   const head = [
@@ -407,9 +450,17 @@ function renderResponse(answer: TransferResponse, headOnly: boolean): Uint8Array
     "",
     "",
   ].join("\r\n");
+  return new Uint8Array(Buffer.from(head, "utf8"));
+}
 
+/** Renders one response, omitting the body for a `HEAD`. */
+function renderResponse(answer: TransferResponse, headOnly: boolean): Uint8Array {
+  const body = answer.body ?? new Uint8Array(0);
+  // Declared from the payload even on a `HEAD`, which is the whole point of the
+  // length-only request.
+  const head = renderHead(answer, { length: body.byteLength });
   const rendered = Buffer.concat([
-    Buffer.from(head, "utf8"),
+    Buffer.from(head),
     headOnly ? Buffer.alloc(0) : Buffer.from(body),
   ]);
   return new Uint8Array(rendered);

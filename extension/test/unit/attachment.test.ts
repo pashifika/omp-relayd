@@ -15,6 +15,7 @@ import { encode as rawEncode } from "@msgpack/msgpack";
 import {
   RelayClient,
   RequestFailed,
+  TRANSFER_CHUNK_BYTES,
   TRANSFER_STALL_MS,
   type Report,
 } from "../../src/client.ts";
@@ -26,6 +27,7 @@ import {
   framePayload,
   isFrame,
   ScriptedRelay,
+  type BodyWriter,
   type Script,
 } from "../support/scripted-relay.ts";
 import { settlement } from "../support/settlement.ts";
@@ -561,6 +563,125 @@ describe("bounding a transfer", () => {
       expect(outcome.status).toBe("rejected");
       if (outcome.status !== "rejected") return;
       expect((outcome.reason as RequestFailed).reason).toBe("transfer_failed");
+    } finally {
+      await close();
+    }
+  });
+
+  test("a download that keeps arriving is not failed for taking longer than the bound", async () => {
+    // The requirement's central guarantee: "a transfer that is moving is allowed
+    // to take as long as its size requires". A single deadline over the whole
+    // request satisfies every other test in this file and violates exactly this
+    // one, which is why it exists.
+    const payload = new TextEncoder().encode("chunk".repeat(2000));
+    const digest = await digestOf(payload);
+    const slices = [payload.subarray(0, 3000), payload.subarray(3000, 7000), payload.subarray(7000)];
+
+    const handed = Promise.withResolvers<BodyWriter>();
+    const { relay, harness, close } = await joined(GRANT);
+    try {
+      relay.retransfer(() => ({
+        status: 200,
+        trickle: (control) => handed.resolve(control),
+      }));
+
+      const pending = settlement(harness.client.fetchAttachment(digest));
+      const writer = await handed.promise;
+
+      const armedFirst = harness.scheduler.liveOf("timeout", TRANSFER_STALL_MS)[0];
+      expect(armedFirst).toBeDefined();
+
+      // Each slice arrives, and between slices the bound is allowed to elapse in
+      // full. Under a whole-request deadline the transfer would already be dead
+      // by the second slice.
+      let armedBefore = armedFirst;
+      let bounds = harness.scheduler.delaysOf("timeout").filter((d) => d === TRANSFER_STALL_MS).length;
+      for (const slice of slices) {
+        writer.push(slice);
+        bounds += 1;
+        await harness.scheduler.until("timeout", bounds, TRANSFER_STALL_MS);
+        // The timer counting before this slice is cancelled and a fresh one
+        // replaces it: that is what "restarted on progress" means.
+        expect(armedBefore?.cancelled).toBe(true);
+        armedBefore = harness.scheduler.liveOf("timeout", TRANSFER_STALL_MS)[0];
+        expect(armedBefore).toBeDefined();
+      }
+      writer.end();
+
+      const outcome = await pending;
+      expect(outcome.status).toBe("fulfilled");
+      if (outcome.status !== "fulfilled") return;
+      expect([...outcome.value]).toEqual([...payload]);
+
+      // One bound per chunk plus the one armed before the request: a single
+      // whole-request deadline would have created exactly one.
+      expect(bounds).toBeGreaterThan(slices.length);
+      console.log(
+        `${slices.length} chunk(s) totalling ${payload.byteLength} bytes restarted the ${TRANSFER_STALL_MS} ms bound ${bounds} time(s)`,
+      );
+    } finally {
+      await close();
+    }
+  });
+
+  test("a download that stops partway fails once the gap exceeds the bound", async () => {
+    // The other half of the same rule. Progress resets the bound; absence of
+    // progress must still end the transfer, and a partial body is not a result.
+    const payload = new TextEncoder().encode("chunk".repeat(2000));
+    const digest = await digestOf(payload);
+
+    const handed = Promise.withResolvers<BodyWriter>();
+    const { relay, harness, close } = await joined(GRANT);
+    try {
+      relay.retransfer(() => ({
+        status: 200,
+        trickle: (control) => handed.resolve(control),
+      }));
+
+      const pending = settlement(harness.client.fetchAttachment(digest));
+      const writer = await handed.promise;
+
+      const before = harness.scheduler
+        .delaysOf("timeout")
+        .filter((d) => d === TRANSFER_STALL_MS).length;
+      writer.push(payload.subarray(0, 4000));
+      await harness.scheduler.until("timeout", before + 1, TRANSFER_STALL_MS);
+
+      // Nothing more arrives. The bound armed by the last chunk expires.
+      harness.scheduler.fireNewest("timeout", TRANSFER_STALL_MS);
+
+      const outcome = await pending;
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status !== "rejected") return;
+      expect((outcome.reason as RequestFailed).reason).toBe("transfer_failed");
+    } finally {
+      await close();
+    }
+  });
+
+  test("an upload restarts the bound as the socket takes each chunk", async () => {
+    // The request side of the same requirement. `fetch` reports no upload
+    // progress directly, but a `pull` on a stream body is the runtime asking for
+    // more, which it does once the previous chunk has left.
+    const { relay, harness, close } = await joined(GRANT);
+    try {
+      // Several chunks' worth, so more than one pull is required.
+      const payload = new Uint8Array(TRANSFER_CHUNK_BYTES * 3 + 17);
+      for (let index = 0; index < payload.length; index += 1) {
+        payload[index] = index % 251;
+      }
+
+      const attached = await harness.client.attach(payload);
+      expect(attached.bytes).toBe(payload.byteLength);
+      expect([...(relay.transfers[0]?.body ?? [])]).toEqual([...payload]);
+
+      const bounds = harness.scheduler
+        .delaysOf("timeout")
+        .filter((delay) => delay === TRANSFER_STALL_MS).length;
+      expect(bounds).toBeGreaterThan(1);
+      console.log(
+        `uploading ${payload.byteLength} bytes in ${TRANSFER_CHUNK_BYTES}-byte chunks restarted the bound ${bounds} time(s)`,
+      );
     } finally {
       await close();
     }

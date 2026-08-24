@@ -100,6 +100,36 @@ export class FakeScheduler implements Scheduler {
     return this.live.map((timer) => `${timer.kind}/${timer.delay}ms`).join(", ");
   }
 
+  /**
+   * Resolves once `count` timers matching `kind` and `delay` have been created.
+   *
+   * A signal rather than a poll. A test that needs to know the client reacted to
+   * something asynchronous — a chunk arriving, a socket draining — would
+   * otherwise sleep and guess, which binds the test to wall-clock time and hides
+   * the condition it is actually waiting for.
+   */
+  until(kind: "timeout" | "interval", count: number, delay?: number): Promise<void> {
+    const waiter = Promise.withResolvers<void>();
+    const made = (): number =>
+      this.history.filter(
+        (timer) => timer.kind === kind && (delay === undefined || timer.delay === delay),
+      ).length;
+    if (made() >= count) {
+      waiter.resolve();
+    } else {
+      this.#waiters.push({ kind, delay, count, resolve: waiter.resolve, made });
+    }
+    return waiter.promise;
+  }
+
+  readonly #waiters: {
+    readonly kind: "timeout" | "interval";
+    readonly delay: number | undefined;
+    readonly count: number;
+    readonly resolve: () => void;
+    readonly made: () => number;
+  }[] = [];
+
   #create(
     kind: "timeout" | "interval",
     callback: () => void,
@@ -108,6 +138,13 @@ export class FakeScheduler implements Scheduler {
     const handle = this.#nextHandle;
     this.#nextHandle += 1;
     this.history.push({ handle, kind, delay, callback, cancelled: false, fired: 0 });
+    for (let index = this.#waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = this.#waiters[index];
+      if (waiter !== undefined && waiter.made() >= waiter.count) {
+        this.#waiters.splice(index, 1);
+        waiter.resolve();
+      }
+    }
     return handle;
   }
 

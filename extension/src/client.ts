@@ -94,6 +94,15 @@ export const HANDSHAKE_TIMEOUT_MS = 10_000;
  */
 export const TRANSFER_STALL_MS = 10_000;
 
+/**
+ * How much of an upload is offered to the socket at a time.
+ *
+ * Only a granularity for progress: it decides how often {@link TRANSFER_STALL_MS}
+ * is restarted while uploading, not how fast the transfer runs. 64 KiB is the
+ * frame cap, so a stalled upload is noticed within one frame's worth of bytes.
+ */
+export const TRANSFER_CHUNK_BYTES = 64 * 1024;
+
 /** Delay before the first reconnect attempt of an outage. */
 export const RECONNECT_INITIAL_MS = 500;
 
@@ -315,6 +324,20 @@ export interface Attachment {
    * is somebody else's cause.
    */
   readonly expiresIn: number;
+}
+
+/**
+ * What one transfer request produced, read under the transfer's own bound.
+ *
+ * `bytes` carries the body only for a drained `GET`; a `HEAD` or a `PUT` leaves
+ * it empty. The body is read here rather than handed back as a `Response`
+ * because reading it is part of the transfer, and a bound that ended when the
+ * headers arrived would not cover the payload it was measuring.
+ */
+interface TransferOutcome {
+  readonly status: number;
+  readonly headers: Headers;
+  readonly bytes: Uint8Array<ArrayBuffer>;
 }
 
 /** Which request a pending entry belongs to, for its diagnostics. */
@@ -932,7 +955,12 @@ export class RelayClient {
       }
     }
 
-    const response = await this.#transfer("GET", digest, { expect: [200, 404] });
+    // Drained inside the transfer, so the stall bound covers the payload it
+    // exists to measure rather than ending when the headers arrived.
+    const response = await this.#transfer("GET", digest, {
+      expect: [200, 404],
+      drain: true,
+    });
     if (response.status === 404) {
       throw new RequestFailed(
         "unavailable",
@@ -940,7 +968,7 @@ export class RelayClient {
       );
     }
 
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    const bytes = response.bytes;
     const computed = await digestOf(bytes);
     if (computed !== digest) {
       // Nothing is handed back. A payload that does not match its address is not
@@ -964,12 +992,18 @@ export class RelayClient {
    * not hold. A location supplied over the wire would let it aim this fetch at a
    * host of its choosing.
    *
-   * Bounded by progress rather than by {@link REQUEST_TIMEOUT_MS}. That deadline
-   * is right for a frame exchange, where an answer either comes promptly or is
-   * not coming; a transfer's duration scales with the payload, so the same bound
-   * would fail a large payload on a slow link *because it was working*. The
-   * stall bound restarts on every chunk, and every timer comes from the host's
-   * scheduler so a test drives them.
+   * Bounded by *progress* rather than by {@link REQUEST_TIMEOUT_MS}. That
+   * deadline is right for a frame exchange, where an answer either comes
+   * promptly or is not coming; a transfer's duration scales with the payload, so
+   * one deadline over the whole request would fail a large payload on a slow
+   * link *because it was working*. At the 4 MiB payload ceiling a 10-second
+   * whole-request bound demands 3.36 Mbit/s sustained, which a congested LAN
+   * does not always provide.
+   *
+   * So the bound is on the gaps, not on the total: every chunk that arrives, and
+   * every chunk the socket accepts, restarts it. A transfer that is moving may
+   * take as long as its size requires; one that has stopped fails within the
+   * interval. Every timer comes from the host's scheduler so a test drives them.
    */
   async #transfer(
     method: "PUT" | "GET" | "HEAD",
@@ -978,8 +1012,10 @@ export class RelayClient {
       readonly body?: Uint8Array<ArrayBuffer>;
       readonly headers?: Record<string, string>;
       readonly expect: readonly number[];
+      /** Read the response body under the same bound, for `GET`. */
+      readonly drain?: boolean;
     },
-  ): Promise<Response> {
+  ): Promise<TransferOutcome> {
     if (this.#stopped) {
       throw new RequestFailed("stopped", "the client is not running");
     }
@@ -992,18 +1028,33 @@ export class RelayClient {
 
     const controller = new AbortController();
     this.#transfers.add(controller);
-    // Restarted by nothing: `fetch` gives no progress events, so the bound is on
-    // the whole request rather than on the gaps within it. Named for what it is.
-    const stall = this.#scheduler.setTimeout(() => {
-      controller.abort(new Error(`no progress within ${TRANSFER_STALL_MS} ms`));
-    }, TRANSFER_STALL_MS);
+
+    let stall: TimerHandle | null = null;
+    const stopWaiting = (): void => {
+      if (stall !== null) {
+        this.#scheduler.clearTimeout(stall);
+        stall = null;
+      }
+    };
+    // Named for what it measures: the gap since the last byte moved, not the
+    // age of the request.
+    const restart = (): void => {
+      stopWaiting();
+      stall = this.#scheduler.setTimeout(() => {
+        controller.abort(new Error(`no progress within ${TRANSFER_STALL_MS} ms`));
+      }, TRANSFER_STALL_MS);
+    };
+    restart();
 
     try {
       const response = await fetch(url, {
         method,
         signal: controller.signal,
-        ...(options.body === undefined ? {} : { body: options.body }),
+        ...(options.body === undefined ? {} : { body: this.#progressing(options.body, restart) }),
         ...(options.headers === undefined ? {} : { headers: options.headers }),
+        // Required by the Streams specification for a stream request body, and
+        // not in the DOM types Bun compiles against.
+        ...(options.body === undefined ? {} : ({ duplex: "half" } as Record<string, string>)),
       });
       if (!options.expect.includes(response.status)) {
         throw new RequestFailed(
@@ -1011,7 +1062,13 @@ export class RelayClient {
           `${method} ${digest} was answered ${response.status}`,
         );
       }
-      return response;
+
+      const bytes =
+        options.drain === true && response.status === 200
+          ? await this.#drain(response, restart)
+          : new Uint8Array(0);
+
+      return { status: response.status, headers: response.headers, bytes };
     } catch (error) {
       if (error instanceof RequestFailed) {
         throw error;
@@ -1021,9 +1078,60 @@ export class RelayClient {
         `${method} ${digest} failed: ${describe(error)}`,
       );
     } finally {
-      this.#scheduler.clearTimeout(stall);
+      stopWaiting();
       this.#transfers.delete(controller);
     }
+  }
+
+  /**
+   * `payload` as a stream that reports progress as the socket drains it.
+   *
+   * A `pull` is the runtime asking for more, which it does once the previous
+   * chunk has left for the socket — so a pull is evidence the transfer moved,
+   * and it is the only such evidence `fetch` offers on the request side.
+   */
+  #progressing(
+    payload: Uint8Array<ArrayBuffer>,
+    restart: () => void,
+  ): ReadableStream<Uint8Array> {
+    let offset = 0;
+    return new ReadableStream<Uint8Array>({
+      pull: (controller) => {
+        if (offset >= payload.byteLength) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(offset + TRANSFER_CHUNK_BYTES, payload.byteLength);
+        controller.enqueue(payload.subarray(offset, end));
+        offset = end;
+        restart();
+      },
+    });
+  }
+
+  /** Reads `response`'s body chunk by chunk, restarting the bound on each. */
+  async #drain(response: Response, restart: () => void): Promise<Uint8Array<ArrayBuffer>> {
+    const body = response.body;
+    if (body === null) {
+      return new Uint8Array(0);
+    }
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+      restart();
+    }
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    return joined;
   }
 
   // -------------------------------------------------------------------------
