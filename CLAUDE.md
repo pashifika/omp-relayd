@@ -80,6 +80,13 @@ each child as its parent lands. A squash would rewrite the commits the children
 still carry, re-inflating every downstream diff and forcing a rebase per merge,
 which is precisely why the method is pinned rather than recommended.
 
+`strict_required_status_checks_policy` makes every child `BEHIND` as its parent
+lands, so each one is updated and re-tested before it can merge. That cost is
+the point rather than a defect: this tree holds two languages whose wire
+contract is enforced only by the fixtures under `test-fixtures/protocol-v1/`,
+and two pull requests that are each green alone can still break that contract
+together. Do not relax the policy to make a stack cheaper.
+
 ## CI conventions
 
 Branch protection requires exactly **one** status check, named `ci`, produced by
@@ -90,6 +97,17 @@ the gate job in `.github/workflows/ci.yml` that aggregates `needs.*.result` unde
   `needs` and nothing else. Never add a job name to the ruleset.
 - The gate job's `name` is coupled by string to the ruleset and nothing verifies
   the two agree. Renaming it blocks every merge with no failing job to point at.
+- Bottom-up retargeting depends on `delete_branch_on_merge`, a repository
+  setting that lives outside this repository — the committed ruleset cannot
+  express it and nothing verifies it. With it off, the forge retargets nothing:
+  each child keeps pointing at a merged branch and needs a manual retarget, a
+  branch update, and a fresh `ci` run. It is on; if the workflow above ever
+  stops matching what the forge does, check it first.
+- **A merge queue is rejected, not merely unused.** It would remove the
+  strict-policy branch updates a stack pays for, but it changes how `ci`
+  reports — and that is the one coupling above which nothing verifies. Buying
+  back a few minutes per stack by disturbing the check whose silent failure
+  blocks every merge is the wrong trade.
 - **Every `uses:` is pinned to a full 40-character commit SHA with a trailing
   version comment.** The `hygiene` job enforces both halves and fails naming the
   offending reference. A tag is mutable by its publisher; a bare SHA is
