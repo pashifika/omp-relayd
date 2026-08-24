@@ -159,7 +159,7 @@ GLOBAL
 | `peer.name` | string | Optional. Non-empty, at most 64 UTF-8 bytes, no `/` or `@`, no leading or trailing whitespace. Defaults to the first label of the host name |
 | `peer.purpose` | string | Optional. At most 4096 UTF-8 bytes of your own instructions to the agent on this machine |
 
-`peer.purpose` never leaves the machine that owns it. Under `manual` it comes back in the join result; under `auto` it rides the session's first inbound message. It is accepted only from the global file, which is what keeps a committed file from instructing everyone who clones it.
+`peer.purpose` never leaves the machine that owns it. Under `manual` it comes back in the join result. Under `auto` there is no join result to carry it, so it rides the first inbound delivery that starts or steers a turn — any message addressed to this session, or a room announcement that arrives while the session is idle. An announcement that arrives mid-turn is held until that turn ends, so it carries nothing and the purpose stays owed to the next delivery. It is accepted only from the global file, which is what keeps a committed file from instructing everyone who clones it.
 
 ### The project file
 
@@ -254,15 +254,18 @@ The build produces the single ESM file `extension/dist/index.js`. It embeds `@ms
 
 ## Use the `mesh` tool
 
-`mesh` has three actions:
+`mesh` has four actions:
 
 | Action | Arguments | Result |
 |---|---|---|
 | `join` | optional `project`, `task`, `as` | Resolved room and peer name, the source of each, the current roster, and this machine's purpose under `manual` |
 | `list` | none | Connected peer names in the joined room |
 | `send` | `to`, `message`, optional `reply_to` | Relay receipt status and generated message identifier |
+| `announce` | `message`, optional `reply_to` | The two acceptance counts — peers it was queued for, and peers that shed it — and the generated announcement identifier |
 
 Nothing works before a join. `join` is also how a live session changes room or peer name: a room is fixed for a connection's lifetime, so joining elsewhere reconnects, and joining the room you already hold changes nothing.
+
+`announce` takes no target of any kind. Supplying `to`, `project`, `task`, or `as` is refused rather than ignored: a caller that named one meant to address it, and broadcasting into the room this session already holds instead would reach the wrong peers with nothing said about it.
 
 Prompt examples:
 
@@ -274,7 +277,11 @@ Use the omp-relay skill to join and tell me who is in the room.
 Use mesh with action send to win-desktop. Send: Review the parser error paths and reply with findings.
 ```
 
-A `routed` receipt means the relay queued the message for the recipient. It does not mean the recipient read, accepted, or answered it. Other results distinguish an offline peer, a full recipient queue, and an invalid target. The `omp-relay` skill carries the rest of the workflow: resolving an informal reference against the roster, stopping when nobody else is in the room, and writing a briefing the far end can act on without shared context.
+```text
+Use mesh with action announce. Say: I am rewriting the migrations in db/; leave that directory alone until I report back.
+```
+
+A `routed` receipt means the relay queued the message for the recipient. It does not mean the recipient read, accepted, or answered it. Other results distinguish an offline peer, a full recipient queue, and an invalid target. An announcement's counts read the same way: `delivered` peers took it into their queues, `shed` peers were not reading their connection and never received it, and both counts zero means the room held nobody else — a fact about the room rather than a failed request. The `omp-relay` skill carries the rest of the workflow: resolving an informal reference against the roster, stopping when nobody else is in the room, and writing a briefing the far end can act on without shared context.
 
 ## Verify two machines
 
