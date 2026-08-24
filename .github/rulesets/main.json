@@ -22,7 +22,7 @@
         "require_extra_approval_for_unattributed_changes": true,
         "required_review_thread_resolution": true,
         "required_reviewers": [],
-        "allowed_merge_methods": ["rebase", "squash", "merge"]
+        "allowed_merge_methods": ["merge"]
       }
     },
     {
