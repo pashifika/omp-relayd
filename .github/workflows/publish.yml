@@ -37,10 +37,10 @@ env:
   DOCKERHUB_USERNAME: pashifika
 
 jobs:
-  # Resolves the release's identity and refuses an already-published version,
-  # before anything is built and before any credential is in scope. Deliberately
-  # declares no environment: this job holds no secret, so a version mistake fails
-  # here in seconds rather than after two release builds.
+  # Resolves the release's identity and decides whether there is anything left
+  # to publish, before anything is built and before any credential is in scope.
+  # Deliberately declares no environment: this job holds no secret, so a version
+  # mistake fails here in seconds rather than after two release builds.
   identity:
     name: identity
     runs-on: ubuntu-24.04
@@ -48,6 +48,7 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       commit_tag: ${{ steps.resolve.outputs.commit_tag }}
+      publish: ${{ steps.decide.outputs.publish }}
     steps:
       - name: Check out the source tree
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,7 +116,8 @@ jobs:
             echo "commit_tag=${commit_tag}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Refuse to move an already-published version tag
+      - name: Decide whether this version still needs publishing
+        id: decide
         timeout-minutes: 5
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
@@ -139,17 +141,23 @@ jobs:
 
           echo "manifest read for ${IMAGE}:${VERSION} returned HTTP ${code}"
 
+          # A version already in the registry is not an error. It is a dispatch
+          # with nothing left to do, so it reports `publish=false` and every job
+          # below is skipped by its `if:`. A failure here would say something
+          # went wrong, when what happened is that the release already exists.
           case "$code" in
             404)
               echo "identity: ${IMAGE}:${VERSION} has not been published"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
               ;;
             200)
               if [ "$OVERWRITE" = "true" ]; then
                 echo "identity: ${IMAGE}:${VERSION} exists and an overwrite was requested"
+                echo "publish=true" >> "$GITHUB_OUTPUT"
               else
-                echo "identity: refusing to move the published tag ${IMAGE}:${VERSION}."
-                echo "identity: bump the version in server/Cargo.toml and compose.yml, or dispatch again with overwrite enabled."
-                exit 1
+                echo "identity: ${IMAGE}:${VERSION} is already published; nothing to do"
+                echo "identity: to release again, bump the version in server/Cargo.toml and compose.yml; to replace this exact tag, dispatch with overwrite enabled"
+                echo "publish=false" >> "$GITHUB_OUTPUT"
               fi
               ;;
             *)
@@ -170,6 +178,9 @@ jobs:
   amd64:
     name: amd64
     needs: identity
+    # Skipped, not failed, when the version is already published: the dispatch
+    # had nothing to do, and a red run would misreport that as a fault.
+    if: needs.identity.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     environment: docker-hub
     timeout-minutes: 30
@@ -247,6 +258,7 @@ jobs:
   arm64:
     name: arm64
     needs: identity
+    if: needs.identity.outputs.publish == 'true'
     runs-on: ubuntu-24.04-arm
     environment: docker-hub
     timeout-minutes: 30
@@ -317,6 +329,7 @@ jobs:
   publish:
     name: publish
     needs: [identity, amd64, arm64]
+    if: needs.identity.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     environment: docker-hub
     timeout-minutes: 15
@@ -359,7 +372,11 @@ jobs:
                 echo "publish: moving ${IMAGE}:${VERSION} away from ${previous}"
                 echo "previous=${previous}" >> "$GITHUB_OUTPUT"
               else
-                echo "publish: ${IMAGE}:${VERSION} was published between the identity check and now; refusing to move it"
+                # A failure here, unlike the skip in `identity`, because this is
+                # an anomaly rather than a dispatch with nothing to do: the
+                # concurrency group serializes runs, so the tag appearing since
+                # `identity` means something outside this workflow published it.
+                echo "publish: ${IMAGE}:${VERSION} appeared since the identity check; something outside this workflow published it"
                 exit 1
               fi
               ;;
