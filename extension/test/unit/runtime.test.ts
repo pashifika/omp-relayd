@@ -228,11 +228,19 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   let execute: ToolExecute | null = null;
   let idle = true;
 
+  // Mirrors only the builder methods this extension calls, so a schema the real
+  // facade cannot build fails registration here rather than at load time.
   const chain = {
     describe() {
       return chain;
     },
     optional() {
+      return chain;
+    },
+    int() {
+      return chain;
+    },
+    nonnegative() {
       return chain;
     },
   };
@@ -242,6 +250,9 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
         return chain;
       },
       string() {
+        return chain;
+      },
+      number() {
         return chain;
       },
       object() {
