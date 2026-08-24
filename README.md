@@ -12,13 +12,15 @@ OMP Relay lets two OMP terminals hand work to each other without sharing a proce
 - **Non-interrupting delivery:** Inbound work waits behind a streaming turn and starts a new turn when the receiving session is idle.
 - **Resilient sessions:** Relay outages, reconnects, invalid configuration, and extension callback failures do not end the host session.
 - **Standalone extension:** `extension/dist/index.js` includes its MessagePack dependency and loads without a neighboring `node_modules` directory.
-- **Bounded relay:** Per-peer queues and frame limits bound memory; the relay stores no messages and replays no history.
+- **Attachments by reference:** A payload too large for a message body is uploaded once and referenced, so a diff, a captured test run, or a build artifact reaches a peer on another machine. An inbound reference is never downloaded until a session asks for it.
+- **Bounded relay:** Per-peer queues and frame limits bound memory; the relay stores no messages and replays no history. Attachments are bounded and temporary, and nothing survives a restart.
 
 ## Contents
 
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Deployment and security](#deployment-and-security)
+  - [The attachment store](#the-attachment-store)
 - [Configuration](#configuration)
 - [Startup modes](#startup-modes)
 - [Manual setup](#manual-setup)
@@ -83,13 +85,39 @@ To expose the relay to a trusted private LAN, opt in with one specific private a
 OMP_RELAY_BIND=192.168.1.10 docker compose up -d
 ```
 
-`OMP_RELAY_BIND=0.0.0.0` publishes the unauthenticated port on every interface and is not a supported deployment. The container runs read-only, drops all Linux capabilities, and persists no relay state.
+`OMP_RELAY_BIND=0.0.0.0` publishes the unauthenticated port on every interface and is not a supported deployment. One published port carries both messaging and attachment transfer, so this single override is the whole exposure decision — there is no second port to reason about.
+
+The container runs read-only, drops all Linux capabilities, and persists no relay state: no message history, no queue for an absent peer, no replay after a reconnect. Attachments are the one thing it holds on disk, bounded and temporary — see [The attachment store](#the-attachment-store).
 
 Stop the relay with:
 
 ```bash
 docker compose down
 ```
+
+### The attachment store
+
+A message body is capped at 65024 bytes. Anything larger — a diff, a captured test run, a build log — is uploaded to the relay and referenced by a message, so the relay holds payload bytes for a bounded time. It is still not persistence: every payload is removed when its room's last peer leaves, when its two-hour lifetime elapses, or at startup, and nothing survives a restart.
+
+`compose.yml` mounts a sized tmpfs at `/tmp` for it:
+
+```yaml
+read_only: true
+tmpfs:
+  - /tmp:rw,noexec,nosuid,size=320m,mode=1777
+```
+
+That mount is required, not decorative. Without it the container starts and immediately exits, because a read-only root filesystem leaves nowhere to create the store:
+
+```text
+ERROR omp_relayd: could not open the payload store base=/tmp/omp-relayd error=Read-only file system (os error 30)
+```
+
+The relay's own ceilings are code constants — 4 MiB per payload, 32 MiB per room, 256 MiB across the process — so the mount is sized above the largest of them. That ordering matters: a sender that reaches the relay's bound is told `store_full` and can respond to it, while a sender that reaches the filesystem's bound gets an I/O error instead.
+
+tmpfs is RAM-backed, so 320 MiB is a ceiling on memory as well as on bytes held. To spend disk instead, mount a sized filesystem at `/tmp` — the relay reads `TMPDIR` and needs no other configuration. Bounding it at the mount is deliberate: a limit the kernel enforces holds even if the relay's accounting is wrong.
+
+A named volume is the wrong shape here. It would outlive the container to hold data that must not persist, and the store removes its directory at startup anyway.
 
 ### The published image
 
@@ -254,18 +282,23 @@ The build produces the single ESM file `extension/dist/index.js`. It embeds `@ms
 
 ## Use the `mesh` tool
 
-`mesh` has four actions:
+`mesh` has five actions:
 
 | Action | Arguments | Result |
 |---|---|---|
 | `join` | optional `project`, `task`, `as` | Resolved room and peer name, the source of each, the current roster, and this machine's purpose under `manual` |
 | `list` | none | Connected peer names in the joined room |
-| `send` | `to`, `message`, optional `reply_to` | Relay receipt status and generated message identifier |
-| `announce` | `message`, optional `reply_to` | The two acceptance counts — peers it was queued for, and peers that shed it — and the generated announcement identifier |
+| `send` | `to`, `message`, optional `reply_to`, `attach` | Relay receipt status and generated message identifier |
+| `announce` | `message`, optional `reply_to`, `attach` | The two acceptance counts — peers it was queued for, and peers that shed it — and the generated announcement identifier |
+| `fetch` | `reference`, optional `max_bytes` | The path of the downloaded file and its byte length |
 
 Nothing works before a join. `join` is also how a live session changes room or peer name: a room is fixed for a connection's lifetime, so joining elsewhere reconnects, and joining the room you already hold changes nothing.
 
 `announce` takes no target of any kind. Supplying `to`, `project`, `task`, or `as` is refused rather than ignored: a caller that named one meant to address it, and broadcasting into the room this session already holds instead would reach the wrong peers with nothing said about it.
+
+`attach` names a local file for material too large to put in a message body. The recipient is told a reference and nothing is downloaded on its behalf; it fetches deliberately, or not at all. A `fetch` returns a path rather than the bytes, so the payload is used with ordinary tools instead of occupying a model's context, and the file is named from the reference alone — never from anything a remote peer sent. `max_bytes` declines a payload larger than the caller wants: the size is reported and nothing is transferred.
+
+If the relay cannot hold the payload, the whole `send` or `announce` is refused and nothing reaches the room. That is deliberate: sending the body without its attachment would report success for a request that was not performed and leave the recipient reading about material that never arrived.
 
 Prompt examples:
 

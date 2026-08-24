@@ -29,7 +29,15 @@ Fixed decisions:
 - The initial release supports `local` transport only: plain TCP, no TLS, no
   authentication, trusted host or trusted private LAN. `private` transport with
   mTLS is a later release.
-- The server is an in-memory relay and persists nothing.
+- The server routes frames and holds nothing else in memory: no message history,
+  no queue for an absent peer, no replay after a reconnect.
+- **The one exception is the payload store, and it is not persistence.** A
+  payload too large for a message body is uploaded by reference and held as a
+  bounded, room-scoped set of content-addressed temporary files, reachable over
+  HTTP on the same listener as the frames. Every payload is removed when its room
+  empties, when its time to live elapses, or at startup, and nothing survives a
+  restart. The ceilings and the lifetime are code constants; the configuration
+  surface stays at two values.
 
 Out of scope: public Internet deployment, and any integration with OMP's
 built-in `hub` or internal IRC implementation.

@@ -23,10 +23,32 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-info}
 
-    # The relay is in-memory: it reads no configuration file and writes nothing.
-    # A writable filesystem or any retained capability would only be available
-    # to an attacker who reached the unauthenticated port.
+    # The relay reads no configuration file and persists nothing, so its root
+    # filesystem is read-only: a writable filesystem or any retained capability
+    # would only be available to an attacker who reached the unauthenticated
+    # port.
+    #
+    # The payload store is the one thing that writes, and this tmpfs is what it
+    # writes to. Three properties, none incidental:
+    #
+    #   * `read_only: true` survives. Without this mount the relay exits at
+    #     startup with "could not open the payload store ... Read-only file
+    #     system", because there is nowhere under `/tmp` to create it.
+    #   * The size bounds the store at the layer that can actually enforce it.
+    #     The relay's own ceiling is 256 MiB, so 320m leaves the relay's clean
+    #     `store_full` refusal as the bound a sender reaches, rather than an I/O
+    #     error from a full filesystem.
+    #   * Nothing survives the container, which is what the store's contract
+    #     already promises. A named volume would be a persistence-shaped thing
+    #     holding data that must not persist.
+    #
+    # tmpfs is RAM-backed, so this is a ceiling on memory as well as on bytes
+    # held. An operator who would rather spend disk than RAM can mount a sized
+    # filesystem at `/tmp` instead; the relay reads `TMPDIR` and needs nothing
+    # else. See `rasen/docs/omp-relay-messagepack-protocol-design.md` §13.1.
     read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=320m,mode=1777
     cap_drop:
       - ALL
     security_opt:

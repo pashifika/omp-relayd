@@ -213,6 +213,71 @@ const OBLIGATIONS: readonly Obligation[] = [
     states: "an inbound announcement starts idle and waits during a run",
     pattern: /When this\nsession is idle, it starts a turn[\s\S]{0,160}?waits for that run to finish rather than aborting or steering it\./,
   },
+  {
+    requirement: "The skill sends large work as an attachment rather than as prose",
+    states: "an oversized payload travels as an attachment rather than in the body",
+    pattern: /A message body is capped\.[\s\S]{0,220}?all wrong:/,
+  },
+  {
+    requirement: "The skill sends large work as an attachment rather than as prose",
+    states: "truncating, splitting, and naming a local path are each refused by name",
+    pattern:
+      /\*\*Do not truncate it\.\*\*[\s\S]*?\*\*Do not split it across messages\.\*\*[\s\S]*?\*\*Do not name a local path\.\*\*/,
+  },
+  {
+    requirement: "The skill sends large work as an attachment rather than as prose",
+    states: "the recipient may be on another machine, so a path is not a shared reference",
+    pattern:
+      /may be on a different machine, so\n\s*a path is not a shared reference even when both sessions are working on the\n\s*same repository/,
+  },
+  {
+    requirement: "The skill sends large work as an attachment rather than as prose",
+    states: "the body explains and the attachment carries",
+    pattern:
+      /\*\*The body explains; the attachment carries\.\*\*[\s\S]{0,320}?before\*? ?deciding whether to transfer\n?anything\./,
+  },
+  {
+    requirement: "The skill treats a reference as expiring and a fetch as deliberate",
+    states: "the sender is told the lifetime and states it in the body",
+    pattern:
+      /The result of a successful attachment\nstates how long the relay will hold it\. Say so in the body/,
+  },
+  {
+    requirement: "The skill treats a reference as expiring and a fetch as deliberate",
+    states: "an unavailable payload is expiry, and the response is a resend rather than a retry",
+    pattern:
+      /\*\*expiry, not\nfailure\*\*\.[\s\S]{0,200}?Ask the sender to send it again\./,
+  },
+  {
+    requirement: "The skill treats a reference as expiring and a fetch as deliberate",
+    states: "an inbound attachment has not been downloaded and fetching is explicit",
+    pattern:
+      /\*\*An inbound attachment has not been downloaded\.\*\*[\s\S]{0,220}?explicit act:/,
+  },
+  {
+    requirement: "The skill treats a reference as expiring and a fetch as deliberate",
+    states: "the session decides whether it needs the payload, and uses the ceiling when unsure",
+    pattern:
+      /Decide whether you need it before fetching\.[\s\S]{0,280}?pass a ceiling — the size is reported and nothing\nis transferred when it is exceeded/,
+  },
+  {
+    requirement: "The skill treats a reference as expiring and a fetch as deliberate",
+    states: "a fetch yields a path used with ordinary tools, not content in the result",
+    pattern:
+      /A fetch yields \*\*a file path, not content\*\*\.[\s\S]{0,260}?that is what a path exists to avoid\./,
+  },
+  {
+    requirement: "The skill states what a refused reservation means",
+    states: "the three bounds are named with the different response each calls for",
+    pattern:
+      /\| `payload_too_large` \|[\s\S]*?\| `room_full` \|[\s\S]*?\| `store_full` \|[^\n]*\n/,
+  },
+  {
+    requirement: "The skill states what a refused reservation means",
+    states: "a refusal sent nothing, so resending after addressing the bound is not a duplicate",
+    pattern:
+      /\*\*nothing was sent\*\*\.[\s\S]{0,260}?sending again is correct rather than a duplicate\./,
+  },
 ];
 
 /** One-line rendering of a matched excerpt, so a table row stays a row. */
@@ -268,7 +333,7 @@ describe("the shipped omp-relay skill", () => {
     // Guards the table itself. Losing a row here would quietly shrink the
     // inspection to whatever remained, and the test above would still pass.
     const requirements = [...new Set(OBLIGATIONS.map((entry) => entry.requirement))];
-    expect(requirements).toHaveLength(6);
+    expect(requirements).toHaveLength(9);
     console.log(`requirements represented in the table:\n${requirements.map((r) => `  ${r}`).join("\n")}`);
   });
 });
