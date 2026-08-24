@@ -336,14 +336,16 @@ docker compose up -d --build
 
 That tags the result with the image name `compose.yml` declares, so every later `docker compose up -d` uses it until the image is removed. See [The published image](#the-published-image).
 
-The Docker Hub repository's description is content in this repository, under `.dockerhub/`, rather than text typed into a web form. Publish it after editing:
+The Docker Hub repository's description is content in this repository, under `.dockerhub/`, rather than text typed into a web form:
 
 ```bash
-scripts/sync-dockerhub-description.sh --dry-run
-scripts/sync-dockerhub-description.sh
+scripts/sync-dockerhub-description.sh                          # validate and show
+scripts/sync-dockerhub-description.sh --raw overview | pbcopy  # then paste
 ```
 
-It substitutes the image name and version from `compose.yml` and `server/Cargo.toml`, so the page cannot advertise a version this repository does not deploy, and it refuses a short description over Docker Hub's 100-character limit rather than letting the registry truncate it. It needs a Docker Hub personal access token in `$DOCKERHUB_TOKEN` or `--token-file`. Publishing an image is a recorded workflow run; publishing prose is not, which is why this one stays local.
+It substitutes the image name and version from `compose.yml` and `server/Cargo.toml`, so the page cannot advertise a version this repository does not deploy, and it refuses a short description over Docker Hub's 100-character limit rather than letting the registry truncate it.
+
+The last step is a paste because Docker Hub requires it: its repository endpoint rejects a personal access token by design, answering `token issued from personal access token`, and accepts only the account password — which means two-factor authentication switched off ([hub-feedback#1927](https://github.com/docker/hub-feedback/issues/1927)). A `--publish` mode exists for an account that has made that trade. The default mode needs no credential at all.
 
 Cross-language fixtures live under `test-fixtures/protocol-v1/`. Both implementations decode fixtures produced by the other language.
 
