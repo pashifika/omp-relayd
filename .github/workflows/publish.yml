@@ -13,7 +13,7 @@ on:
         type: boolean
         default: true
       overwrite:
-        description: Move an existing version tag, which is otherwise refused
+        description: Replace an already-published version tag, which is otherwise left alone
         type: boolean
         default: false
 
