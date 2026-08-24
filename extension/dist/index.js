@@ -1,6 +1,6 @@
 // @bun
 // src/index.ts
-import { mkdir, readFile as readFile2, writeFile } from "fs/promises";
+import { lstat, mkdir, readFile as readFile2, rename, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join as join2 } from "path";
 
@@ -1628,6 +1628,12 @@ function validateServerFrame(value) {
           reason: `reserved.expires_in is present with status ${JSON.stringify(status)}, which is not a grant`
         };
       }
+      if (!stated && status === "granted") {
+        return {
+          kind: "invalid",
+          reason: "reserved.expires_in is absent on a granted reservation, which must state a lifetime"
+        };
+      }
       return {
         kind: "frame",
         frame: {
@@ -2042,7 +2048,7 @@ class RelayClient {
     if (reserved.status !== "granted") {
       throw new RequestFailed("refused", `the relay refused to hold ${bytes.byteLength} bytes: ${reserved.status}`, { status: reserved.status });
     }
-    const expiresIn = reserved.expires_in ?? 0;
+    const expiresIn = reserved.expires_in;
     await this.#transfer("PUT", digest, {
       body: bytes,
       headers: { "content-length": String(bytes.byteLength) },
@@ -2325,6 +2331,25 @@ class RelayClient {
           code: frame.code
         })
       });
+      if (settled) {
+        return;
+      }
+    }
+    if (frame.code === "unsupported_frame" && frame.request_id === undefined && this.#state === "ready") {
+      const prefix = `${replySpace("reserve")}:`;
+      let settled = false;
+      for (const key of [...this.#pending.keys()]) {
+        if (!key.startsWith(prefix)) {
+          continue;
+        }
+        const answered = this.#settleKey(key, {
+          ok: false,
+          error: new RequestFailed("relay_error", `the relay rejected the request: ${detail}`, {
+            code: frame.code
+          })
+        });
+        settled = settled || answered;
+      }
       if (settled) {
         return;
       }
@@ -2946,6 +2971,27 @@ var INBOUND_NOTICE_TYPE = "io.github.pashifika.omp-relay.notice";
 var OUTBOUND_MESSAGE_TYPE = "io.github.pashifika.omp-relay.sent";
 var OUTBOUND_ANNOUNCE_TYPE = "io.github.pashifika.omp-relay.announced";
 var ATTACHMENT_DIR = "omp-relay-attachments";
+var nextAttachmentTemp = 0;
+async function saveFetchedPayload(digest, bytes) {
+  const directory = join2(tmpdir(), ATTACHMENT_DIR);
+  await mkdir(directory, { recursive: true, mode: 448 });
+  const stats = await lstat(directory);
+  const uid = process.getuid?.();
+  const wrong = stats.isSymbolicLink() ? "a symbolic link rather than a directory" : !stats.isDirectory() ? "not a directory" : uid !== undefined && stats.uid !== uid ? `owned by uid ${String(stats.uid)} rather than by this process's uid ${String(uid)}` : uid !== undefined && (stats.mode & 18) !== 0 ? `writable beyond its owner, at mode 0${(stats.mode & 511).toString(8)}` : null;
+  if (wrong !== null) {
+    throw new Error(`the attachment directory ${directory} is ${wrong}, so nothing was written to it`);
+  }
+  const path = join2(directory, digest);
+  const temp = join2(directory, `.${digest}.${process.pid}.${++nextAttachmentTemp}`);
+  try {
+    await writeFile(temp, bytes, { mode: 384, flag: "wx" });
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+  return path;
+}
 var CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var CONTROL_CHARACTERS_OUTSIDE_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/gu;
 var NEUTRALIZED = "\uFFFD";
@@ -2999,8 +3045,9 @@ function expiryNote(seconds) {
   if (seconds === undefined || seconds <= 0)
     return "";
   const hours = Math.floor(seconds / 3600);
-  const stated = hours >= 1 ? `${hours} hour${hours === 1 ? "" : "s"}` : `${Math.floor(seconds / 60)} minutes`;
-  return ` The attachment is held for about ${stated}; say so in the body, because a recipient reading later will find it gone.`;
+  const minutes = Math.floor(seconds / 60);
+  const stated = hours >= 1 ? `about ${hours} hour${hours === 1 ? "" : "s"}` : seconds < 60 ? "less than a minute" : `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  return ` The attachment is held for ${stated}; say so in the body, because a recipient reading later will find it gone.`;
 }
 function receiptResult(receipt, attachment, expiry) {
   let text;
@@ -3237,7 +3284,12 @@ async function executeMesh(host, args) {
         }
         throw error;
       }
-      const path = await host.saveAttachment(reference, bytes);
+      let path;
+      try {
+        path = await host.saveAttachment(reference, bytes);
+      } catch (error) {
+        return result(`The payload at ${reference} transferred, but writing it locally was refused: ` + `${singleLine(describe(error))}. No file was written for this fetch. Clear or ` + "repair that path, then fetch again.", { action: "fetch", status: "not_written", reference, bytes: bytes.byteLength });
+      }
       return result(`Fetched ${bytes.byteLength} bytes to ${path}. Read, apply, or run it with ordinary ` + "tools; its contents are not in this result.", { action: "fetch", status: "fetched", reference, bytes: bytes.byteLength, path });
     }
     if (args.action === "announce") {
@@ -3527,13 +3579,7 @@ function ompRelay(pi) {
         recordSend: (details) => pi.appendEntry(OUTBOUND_MESSAGE_TYPE, details),
         recordAnnounce: (details) => pi.appendEntry(OUTBOUND_ANNOUNCE_TYPE, details),
         readAttachment: async (path) => new Uint8Array(await readFile2(path)),
-        saveAttachment: async (digest, bytes) => {
-          const directory = join2(tmpdir(), ATTACHMENT_DIR);
-          await mkdir(directory, { recursive: true, mode: 448 });
-          const path = join2(directory, digest);
-          await writeFile(path, bytes, { mode: 384 });
-          return path;
-        }
+        saveAttachment: saveFetchedPayload
       };
       return executeMesh(host, args);
     }
@@ -3591,6 +3637,7 @@ function ompRelay(pi) {
   });
 }
 export {
+  saveFetchedPayload,
   executeMesh,
   ompRelay as default,
   buildInboundInjection,
