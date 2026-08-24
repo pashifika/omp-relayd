@@ -81,7 +81,12 @@ async fn no_log_record_carries_a_message_body() {
 
     exercise_a_routed_body(&mut sender, &mut recipient).await;
     exercise_an_undeliverable_body(&mut sender).await;
-    let backpressured_at = exercise_a_backpressured_body(&relay, &here, &mut sender).await;
+    exercise_an_announced_body(&mut sender).await;
+    // The stalled peer is kept alive by the caller: its queue stays full, which
+    // is what lets the announcement below take the shed path.
+    let (backpressured_at, _stalled) =
+        exercise_a_backpressured_body(&relay, &here, &mut sender).await;
+    exercise_a_shed_announcement(&mut sender).await;
     exercise_a_malformed_frame(&relay).await;
 
     // Let the connection-close records be written.
@@ -98,6 +103,8 @@ async fn no_log_record_carries_a_message_body() {
         "message not delivered",
         "recipient queue full",
         "frame decode failed",
+        "announcement fanned out",
+        "announcement shed by a recipient queue",
     ] {
         assert!(
             captured.contains(expected),
@@ -187,15 +194,66 @@ async fn exercise_an_undeliverable_body(sender: &mut Client<tokio::net::TcpStrea
     ));
 }
 
+/// An announced body that reaches every other peer, which takes the
+/// debug-level fanout path.
+async fn exercise_an_announced_body(announcer: &mut Client<tokio::net::TcpStream>) {
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "a1".to_owned(),
+            body: format!("the room should know about {CANARY}"),
+            reply_to: None,
+        })
+        .await;
+
+    match announcer.recv().await {
+        ServerFrame::Accepted {
+            delivered, shed, ..
+        } => {
+            assert!(
+                delivered > 0 && shed == 0,
+                "the fanout log path under test is the one with nothing shed; observed \
+                 {delivered} delivered and {shed} shed"
+            );
+        }
+        other => panic!("expected an acceptance, received {other:?}"),
+    }
+}
+
+/// An announced body one of whose recipients is not reading, which takes the
+/// warn-level fanout path.
+async fn exercise_a_shed_announcement(announcer: &mut Client<tokio::net::TcpStream>) {
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "a2".to_owned(),
+            body: format!("one of you is stalled, and {CANARY} is why"),
+            reply_to: None,
+        })
+        .await;
+
+    match announcer.recv().await {
+        ServerFrame::Accepted { shed, .. } => {
+            assert!(
+                shed > 0,
+                "the premise is a recipient whose queue is full, so the warn-level record \
+                 is emitted; observed {shed} shed"
+            );
+        }
+        other => panic!("expected an acceptance, received {other:?}"),
+    }
+}
+
 /// Bodies that fill a stalled peer's queue, which takes the warn-level path.
-/// Returns the attempt at which backpressure appeared.
+///
+/// Returns the attempt at which backpressure appeared, and the stalled client
+/// itself: dropping it here would deregister the peer and empty the queue the
+/// announcement path exercised next depends on.
 async fn exercise_a_backpressured_body(
     relay: &Relay,
     here: &omp_relayd::protocol::RoomId,
     sender: &mut Client<tokio::net::TcpStream>,
-) -> u32 {
+) -> (u32, Client<tokio::net::TcpStream>) {
     let body = format!("{CANARY}{}", "x".repeat(32 * 1024));
-    let _stalled = Client::join(relay, here, "stalled").await;
+    let stalled = Client::join(relay, here, "stalled").await;
 
     for attempt in 1..=2000 {
         sender
@@ -212,7 +270,7 @@ async fn exercise_a_backpressured_body(
             ..
         } = sender.recv().await
         {
-            return attempt;
+            return (attempt, stalled);
         }
     }
 

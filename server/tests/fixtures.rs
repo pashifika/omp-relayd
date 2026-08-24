@@ -195,6 +195,104 @@ fn receipt_fixture_encodes_its_status_as_a_string() {
     );
 }
 
+#[test]
+fn announce_fixture_carries_no_target_field() {
+    let expected = ClientFrame::Announce {
+        id: "ann-1".to_owned(),
+        body: "the schema landed".to_owned(),
+        reply_to: None,
+    };
+
+    check_fixture(
+        "rust-announce.msgpack",
+        &expected,
+        "a room-wide address expressed as the *absence* of a target field, and an \
+         absent optional omitted rather than encoded as nil",
+    );
+
+    // The property the fixture exists for. An implementation that expected a
+    // target key here -- a reserved `all`, or an empty `to` -- would decode this
+    // payload only by inventing a value the wire never carried.
+    let committed =
+        fs::read(fixture_dir().join("rust-announce.msgpack")).expect("read the fixture");
+    for absent in ["to", "reply_to"] {
+        assert!(
+            !committed
+                .windows(absent.len())
+                .any(|window| window == absent.as_bytes()),
+            "the announce fixture must contain no {absent} key: {committed:02x?}"
+        );
+    }
+}
+
+#[test]
+fn notice_fixture_is_distinguished_from_a_message_by_its_type_alone() {
+    let expected = ServerFrame::Notice {
+        id: "ann-2".to_owned(),
+        from: "macbook-reviewer".to_owned(),
+        body: "and the migration with it".to_owned(),
+        reply_to: Some("ann-1".to_owned()),
+    };
+
+    check_fixture(
+        "rust-notice.msgpack",
+        &expected,
+        "a second delivery class carried by the discriminator rather than by a field \
+         inside the frame, over a field set identical to `message`",
+    );
+
+    // The claim the class rests on: same fields, different `type`. A recipient
+    // that told the two apart by anything else -- a marker field, a prefix in
+    // the body -- would pass its own tests and fail against this.
+    let committed = fs::read(fixture_dir().join("rust-notice.msgpack")).expect("read the fixture");
+    let as_message = protocol::encode(&ServerFrame::Message {
+        id: "ann-2".to_owned(),
+        from: "macbook-reviewer".to_owned(),
+        body: "and the migration with it".to_owned(),
+        reply_to: Some("ann-1".to_owned()),
+    })
+    .expect("encodes");
+    assert_eq!(
+        committed.len() + 1,
+        as_message.len(),
+        "the same fields under `notice` must be exactly one byte shorter than under \
+         `message`, which is the whole of the difference between the two classes and \
+         the arithmetic the shared body budget rests on"
+    );
+}
+
+#[test]
+fn accepted_fixture_carries_two_integers_and_no_status() {
+    check_fixture(
+        "rust-accepted.msgpack",
+        &ServerFrame::Accepted {
+            id: "ann-1".to_owned(),
+            delivered: 2,
+            shed: 1,
+        },
+        "an aggregate outcome as two counts rather than as a `receipt` status, so a \
+         mixed result needs no single value that would be a lie about it",
+    );
+
+    let committed =
+        fs::read(fixture_dir().join("rust-accepted.msgpack")).expect("read the fixture");
+    assert!(
+        !committed
+            .windows(b"status".len())
+            .any(|window| window == b"status"),
+        "the accepted fixture must carry no status field: {committed:02x?}"
+    );
+    for count in ["delivered", "shed"] {
+        assert!(
+            committed
+                .windows(count.len())
+                .any(|window| window == count.as_bytes()),
+            "the accepted fixture must name both counts, and {count} is missing: \
+             {committed:02x?}"
+        );
+    }
+}
+
 /// Checks a fixture produced by the *other* implementation.
 ///
 /// Deliberately not [`check_fixture`]. That function also asserts that a fresh

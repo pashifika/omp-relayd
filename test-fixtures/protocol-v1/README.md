@@ -22,6 +22,9 @@ disagree. Byte counts are from the committed files.
 | `rust-hello.msgpack` | `hello` | A **nested map**: `room` is a map of `project` and `task`. An implementation that flattened the room, or that sent the combined `<project>/<task>` spelling as one string, fails to decode this. |
 | `rust-send.msgpack` | `send` | An **absent optional field is omitted**, not encoded as nil. The payload contains no `reply_to` key at all. An implementation that requires the key to be present fails here. |
 | `rust-receipt.msgpack` | `receipt` | An **enum is a `snake_case` string**, not an integer. The payload spells out `recipient_backpressure`. An implementation that expected an ordinal fails here. |
+| `rust-announce.msgpack` | `announce` | **No target field at all.** The room-wide address is the absence of a peer component, so the payload carries no `to` key for an implementation to reserve a value in. One that expected a target — a magic `all`, or an empty string — cannot decode this without inventing a value the wire never carried. |
+| `rust-notice.msgpack` | `notice` | A **second delivery class carried by the discriminator**, over a field set identical to `message`. An implementation that told the classes apart by anything else — a marker field, a prefix in the body — passes its own tests and fails here. The fixture is asserted to be exactly one byte shorter than the same fields under `message`, which is the arithmetic the shared body budget rests on. |
+| `rust-accepted.msgpack` | `accepted` | **Two integer counts and no status.** A mixed outcome has no honest `receipt` status, so the frame carries `delivered` and `shed` instead. An implementation expecting a `status` key, or one count plus a total, fails here. |
 | `ts-hello.msgpack` | `hello` | The same nested-map risk, in the other direction. Decoded through a type whose `room` deserializer accepts a map only, so a positional or flattened room fails rather than decoding by accident. |
 | `ts-send.msgpack` | `send` | The same omitted-optional risk, in the other direction: the TypeScript encoder must omit `reply_to` rather than emit nil for it. |
 | `ts-receipt.msgpack` | `receipt` | The same string-enum risk, in the other direction: `rmp-serde` must recover `ReceiptStatus::RecipientBackpressure` from the string the TypeScript side wrote. |
@@ -29,6 +32,10 @@ disagree. Byte counts are from the committed files.
 The two `hello` fixtures name different rooms, because each was produced by the
 change that introduced it. Nothing depends on the values matching; the shape is
 what is under test.
+
+The `ts-*` counterparts of the three announcement frames arrive with the client
+library, in the step that teaches it those frames. Until then this direction is
+covered one way only, and the table above says which files exist.
 
 Every payload is also a MessagePack **map**, never a positional array. That is
 the property the whole set depends on, and it is asserted separately in

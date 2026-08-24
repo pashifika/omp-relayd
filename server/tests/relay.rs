@@ -35,6 +35,31 @@ fn send(id: &str, to: &str, body: &str) -> ClientFrame {
 /// sample inside the window where it still looks alive.
 const TERMINAL_GRACE_ALLOWANCE: Duration = Duration::from_secs(2);
 
+fn announce(id: &str, body: &str) -> ClientFrame {
+    ClientFrame::Announce {
+        id: id.to_owned(),
+        body: body.to_owned(),
+        reply_to: None,
+    }
+}
+
+fn notice(id: &str, from: &str, body: &str) -> ServerFrame {
+    ServerFrame::Notice {
+        id: id.to_owned(),
+        from: from.to_owned(),
+        body: body.to_owned(),
+        reply_to: None,
+    }
+}
+
+fn accepted(id: &str, delivered: u32, shed: u32) -> ServerFrame {
+    ServerFrame::Accepted {
+        id: id.to_owned(),
+        delivered,
+        shed,
+    }
+}
+
 fn routed(id: &str, to: &str) -> ServerFrame {
     ServerFrame::Receipt {
         id: id.to_owned(),
@@ -695,6 +720,476 @@ async fn a_full_recipient_queue_reports_backpressure_and_keeps_the_sender_open()
         ServerFrame::Pong,
         "a backpressured recipient must not close the sender's connection"
     );
+}
+
+// ------------------------------------------------------------- announcements
+
+#[tokio::test]
+async fn an_announcement_reaches_every_other_peer_of_the_room() {
+    let relay = Relay::start().await;
+    let here = room("announce");
+
+    let mut announcer = Client::join(&relay, &here, "macbook-reviewer").await;
+    let mut first = Client::join(&relay, &here, "windows-main").await;
+    let mut second = Client::join(&relay, &here, "linux-builder").await;
+
+    announcer.send(&announce("a1", "the schema landed")).await;
+
+    assert_eq!(
+        announcer.recv().await,
+        accepted("a1", 2, 0),
+        "both other peers had it queued and none was shed"
+    );
+    for (name, peer) in [("windows-main", &mut first), ("linux-builder", &mut second)] {
+        assert_eq!(
+            peer.recv().await,
+            notice("a1", "macbook-reviewer", "the schema landed"),
+            "{name} must receive the notice with `from` derived from the announcer's \
+             registration"
+        );
+    }
+
+    // The asymmetry with `send`, which delivers a self-addressed frame normally.
+    // An announcement that started a turn on its own author would be a loop with
+    // no reader, so this is a property and not an accident of ordering.
+    assert_eq!(
+        announcer.recv_within(QUIET).await,
+        None,
+        "the announcer must not receive its own announcement"
+    );
+}
+
+#[tokio::test]
+async fn a_lone_peer_gets_a_zero_count_acceptance_and_stays_open() {
+    let relay = Relay::start().await;
+    let here = room("announce-alone");
+
+    let mut solo = Client::join(&relay, &here, "solo").await;
+
+    solo.send(&announce("a1", "anyone there")).await;
+    assert_eq!(
+        solo.recv().await,
+        accepted("a1", 0, 0),
+        "an empty room is a fact about the room, not a failure of the request"
+    );
+
+    solo.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        solo.recv().await,
+        ServerFrame::Pong,
+        "and it is an application-level outcome, so the connection stays open"
+    );
+}
+
+#[tokio::test]
+async fn a_backpressured_recipient_is_shed_without_failing_the_others() {
+    let relay = Relay::start().await;
+    let here = room("announce-backpressure");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut filler = Client::join(&relay, &here, "filler").await;
+    let mut draining = Client::join(&relay, &here, "draining").await;
+    // Registered and never read from, so its outbound queue fills and stays
+    // full for the rest of the test.
+    let _stalled = Client::join(&relay, &here, "stalled").await;
+
+    let backlog = fill_pipeline(&mut filler, "stalled").await;
+    assert!(
+        backlog >= OUTBOUND_QUEUE_CAPACITY,
+        "the premise is a full outbound queue: `fill_pipeline` stops on the first \
+         `recipient_backpressure`, which the relay reports only once all \
+         {OUTBOUND_QUEUE_CAPACITY} slots are undrained; observed {backlog}"
+    );
+
+    announcer
+        .send(&announce("a1", "one of you is stalled"))
+        .await;
+
+    assert_eq!(
+        announcer.recv().await,
+        accepted("a1", 2, 1),
+        "the two reading peers were delivered to and the stalled one was shed: one \
+         recipient's state must not fail the fanout, which is the whole reason the \
+         acknowledgement carries counts rather than a status"
+    );
+    assert_eq!(
+        draining.recv().await,
+        notice("a1", "announcer", "one of you is stalled"),
+        "the draining peer receives the notice regardless"
+    );
+    // `filler` is the second delivered recipient; it has its own receipts queued
+    // ahead of the notice, so drain to it rather than expecting it first.
+    let mut found = false;
+    for _ in 0..OUTBOUND_QUEUE_CAPACITY {
+        if filler.recv().await == notice("a1", "announcer", "one of you is stalled") {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "the other reading peer must receive the notice too, behind its own receipts"
+    );
+}
+
+#[tokio::test]
+async fn an_announcement_is_confined_to_its_own_room() {
+    let relay = Relay::start().await;
+    let here = room("announce-here");
+    let elsewhere = room("announce-elsewhere");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut neighbour = Client::join(&relay, &here, "neighbour").await;
+    let mut stranger = Client::join(&relay, &elsewhere, "stranger").await;
+    // Same peer name as the announcer, in the other room: a fanout must not
+    // address it, and must not skip it for sharing the announcer's name either.
+    let mut namesake = Client::join(&relay, &elsewhere, "announcer").await;
+
+    announcer.send(&announce("a1", "room-local news")).await;
+
+    assert_eq!(
+        announcer.recv().await,
+        accepted("a1", 1, 0),
+        "the counts must reflect only the announcer's own room"
+    );
+    assert_eq!(
+        neighbour.recv().await,
+        notice("a1", "announcer", "room-local news")
+    );
+    assert_eq!(
+        stranger.recv_within(QUIET).await,
+        None,
+        "no peer of another room may receive a notice"
+    );
+    assert_eq!(
+        namesake.recv_within(QUIET).await,
+        None,
+        "and the exclusion is by peer within the room, not by name across rooms"
+    );
+}
+
+#[tokio::test]
+async fn an_announced_reply_reference_is_carried_through_and_omitted_when_absent() {
+    let relay = Relay::start().await;
+    let here = room("announce-replies");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut peer = Client::join(&relay, &here, "peer").await;
+
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "a2".to_owned(),
+            body: "answering the room".to_owned(),
+            reply_to: Some("m1".to_owned()),
+        })
+        .await;
+    assert_eq!(announcer.recv().await, accepted("a2", 1, 0));
+    assert_eq!(
+        peer.recv().await,
+        ServerFrame::Notice {
+            id: "a2".to_owned(),
+            from: "announcer".to_owned(),
+            body: "answering the room".to_owned(),
+            reply_to: Some("m1".to_owned()),
+        },
+        "reply_to must be carried through unchanged"
+    );
+
+    announcer.send(&announce("a3", "unprompted")).await;
+    assert_eq!(announcer.recv().await, accepted("a3", 1, 0));
+    assert_eq!(
+        peer.recv().await,
+        notice("a3", "announcer", "unprompted"),
+        "an absent reply_to must stay absent rather than arriving as a null"
+    );
+}
+
+#[tokio::test]
+async fn an_announcement_and_a_directed_message_keep_their_order() {
+    let relay = Relay::start().await;
+    let here = room("announce-ordering");
+
+    let mut sender = Client::join(&relay, &here, "sender").await;
+    let mut recipient = Client::join(&relay, &here, "recipient").await;
+
+    // Ordering across the two classes, not merely within each. A recipient has
+    // one queue and the reader enqueues serially, so an announcement stating a
+    // decision followed by a message depending on it cannot arrive reversed.
+    sender.send(&announce("a1", "the schema landed")).await;
+    sender
+        .send(&send("m1", "recipient", "so apply the migration"))
+        .await;
+
+    assert_eq!(sender.recv().await, accepted("a1", 1, 0));
+    assert_eq!(sender.recv().await, routed("m1", "recipient"));
+
+    assert_eq!(
+        recipient.recv().await,
+        notice("a1", "sender", "the schema landed"),
+        "the notice was read first, so it must be enqueued first"
+    );
+    assert_eq!(
+        recipient.recv().await,
+        ServerFrame::Message {
+            id: "m1".to_owned(),
+            from: "sender".to_owned(),
+            body: "so apply the migration".to_owned(),
+            reply_to: None,
+        },
+        "and the directed message must follow it"
+    );
+}
+
+#[tokio::test]
+async fn an_announcement_is_not_held_for_an_absent_peer() {
+    let relay = Relay::start().await;
+    let here = room("announce-absent");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let absent = Client::join(&relay, &here, "absent").await;
+    drop(absent);
+    wait_until_deregistered(&relay, &here, "absent").await;
+
+    announcer.send(&announce("a1", "while you were out")).await;
+    assert_eq!(
+        announcer.recv().await,
+        accepted("a1", 0, 0),
+        "a disconnected peer is not an addressed recipient, so it is in neither count"
+    );
+
+    let mut returned = Client::join(&relay, &here, "absent").await;
+    assert_eq!(
+        returned.recv_within(QUIET).await,
+        None,
+        "nothing is replayed to a reconnecting peer, for either class"
+    );
+}
+
+#[tokio::test]
+async fn an_over_budget_announcement_harms_nobody_else() {
+    let relay = Relay::start().await;
+    let here = room("announce-over-budget");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut first = Client::join(&relay, &here, "first").await;
+    let mut second = Client::join(&relay, &here, "second").await;
+
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "a1".to_owned(),
+            body: "b".repeat(MAX_BODY_BYTES + 1),
+            reply_to: None,
+        })
+        .await;
+
+    announcer
+        .expect_error_then_close(ErrorCode::FrameTooLarge)
+        .await;
+
+    // The point of checking the budget on the way in, now sharper for a fanout
+    // than for a send: one over-budget frame would otherwise have been discovered
+    // once per recipient, on each of their connections.
+    for (name, peer) in [("first", &mut first), ("second", &mut second)] {
+        assert_eq!(
+            peer.recv_within(QUIET).await,
+            None,
+            "{name} must receive nothing from an over-budget announcement"
+        );
+        peer.send(&ClientFrame::Ping).await;
+        assert_eq!(
+            peer.recv().await,
+            ServerFrame::Pong,
+            "{name}'s connection must survive it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_over_long_announcement_id_is_rejected_without_closing_the_connection() {
+    let relay = Relay::start().await;
+    let here = room("announce-identifiers");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut peer = Client::join(&relay, &here, "peer").await;
+
+    announcer
+        .send(&announce(&"i".repeat(129), "over-long id"))
+        .await;
+    match announcer.recv().await {
+        ServerFrame::Error {
+            code, request_id, ..
+        } => {
+            assert_eq!(code, ErrorCode::InvalidIdentifier);
+            assert_eq!(
+                request_id, None,
+                "a rejected `id` is not a validated identifier, so there is nothing to echo"
+            );
+        }
+        other => panic!("expected an invalid_identifier error, received {other:?}"),
+    }
+
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "a1".to_owned(),
+            body: "over-long reply_to".to_owned(),
+            reply_to: Some("r".repeat(129)),
+        })
+        .await;
+    match announcer.recv().await {
+        ServerFrame::Error {
+            code, request_id, ..
+        } => {
+            assert_eq!(code, ErrorCode::InvalidIdentifier);
+            assert_eq!(
+                request_id,
+                Some("a1".to_owned()),
+                "`id` passed validation, so this rejection can and must name the frame it \
+                 answers: a client pipelining announcements has no other way to tell which \
+                 one failed"
+            );
+        }
+        other => panic!("expected an invalid_identifier error, received {other:?}"),
+    }
+
+    assert_eq!(
+        peer.recv_within(QUIET).await,
+        None,
+        "neither rejected announcement may have been routed"
+    );
+    announcer.send(&ClientFrame::Ping).await;
+    assert_eq!(
+        announcer.recv().await,
+        ServerFrame::Pong,
+        "both rejections are recoverable and keep the connection open"
+    );
+}
+
+/// The fanout counterpart of `a_send_that_cannot_be_acknowledged_is_refused_with_a_stated_cause`.
+///
+/// Both halves are asserted, because either alone is satisfied by a bug: a
+/// stated cause with the notice delivered is an unacknowledged fanout, and an
+/// unrouted announcement closed bare is the defect the diagnostic reserve
+/// exists to prevent.
+#[tokio::test]
+async fn an_announcement_that_cannot_be_acknowledged_is_refused_with_a_stated_cause() {
+    let relay = Relay::start().await;
+    let here = room("announce-saturated-replies");
+
+    let mut filler = Client::join(&relay, &here, "filler").await;
+    let mut witness = Client::join(&relay, &here, "witness").await;
+    // Never read from again: its socket buffer and outbound queue both fill, so
+    // the relay's writer for this peer is blocked for the rest of the test.
+    let mut stalled = Client::join(&relay, &here, "stalled").await;
+
+    let backlog = fill_pipeline(&mut filler, "stalled").await;
+    assert!(
+        backlog >= OUTBOUND_QUEUE_CAPACITY,
+        "the premise is a blocked writer; observed a backlog of {backlog}"
+    );
+
+    // Walk the reply channel to saturation with announcements, one at a time,
+    // stopping at the refusal. Each accepted announcement queues one `accepted`
+    // the blocked writer cannot take, and `witness` reports where the relay
+    // stopped routing. Sending nothing past the refusal leaves nothing unread,
+    // so the close arrives as a close rather than as a reset.
+    let mut delivered = 0usize;
+    for n in 1..=OUTBOUND_QUEUE_CAPACITY {
+        let id = format!("a{n}");
+        stalled
+            .send(&announce(&id, "into a saturating reply queue"))
+            .await;
+
+        match witness.recv_within(QUIET).await {
+            Some(ServerFrame::Notice {
+                id: arrived, from, ..
+            }) => {
+                assert_eq!(from, "stalled", "notice {arrived} came from the wrong peer");
+                assert_eq!(
+                    arrived, id,
+                    "a blocked writer must not stop the reader routing: every announcement \
+                     made while the reply channel still had a slot must be delivered, in \
+                     order"
+                );
+                delivered += 1;
+            }
+            // The relay declined to acknowledge this announcement, so it
+            // declined to route it.
+            None => break,
+            Some(other) => panic!("expected a notice, received {other:?}"),
+        }
+    }
+    assert!(
+        delivered > 0,
+        "the premise failed: not one announcement was routed, so the reply channel was \
+         never the thing that refused one"
+    );
+    assert!(
+        delivered < OUTBOUND_QUEUE_CAPACITY,
+        "the reply channel must have saturated for this test to mean anything, and all \
+         {OUTBOUND_QUEUE_CAPACITY} announcements were routed instead"
+    );
+    println!("{delivered} announcements routed before the reply channel saturated");
+
+    match stalled.drain_until_error().await {
+        Some(ServerFrame::Error { code, message, .. }) => assert_eq!(
+            code,
+            ErrorCode::IdleTimeout,
+            "the close must name the saturated reply path; message {message:?}"
+        ),
+        None => panic!(
+            "the relay closed without an `error` frame: an announcement it declined to \
+             acknowledge must still state why the connection is going"
+        ),
+        Some(other) => panic!("expected an `error` frame, received {other:?}"),
+    }
+    stalled.expect_closed().await;
+
+    assert_eq!(
+        witness.recv_within(QUIET).await,
+        None,
+        "an announcement whose acceptance could not be reserved must not be routed: \
+         zero acknowledgements has to mean zero deliveries, or a resend after \
+         reconnecting is a duplicate"
+    );
+}
+
+#[tokio::test]
+async fn an_announced_body_at_the_relayable_budget_is_delivered_intact() {
+    let relay = Relay::start().await;
+    let here = room("announce-at-budget");
+
+    let mut announcer = Client::join(&relay, &here, "announcer").await;
+    let mut peer = Client::join(&relay, &here, "peer").await;
+
+    let body = "b".repeat(MAX_BODY_BYTES);
+    announcer
+        .send(&ClientFrame::Announce {
+            id: "i".repeat(MAX_IDENTIFIER_BYTES),
+            body: body.clone(),
+            reply_to: Some("r".repeat(128)),
+        })
+        .await;
+
+    assert_eq!(
+        announcer.recv().await,
+        accepted(&"i".repeat(MAX_IDENTIFIER_BYTES), 1, 0),
+        "a body at the budget, with maximal identifiers, must be relayable"
+    );
+    match peer.recv().await {
+        ServerFrame::Notice {
+            body: received,
+            reply_to,
+            ..
+        } => {
+            assert_eq!(
+                received.len(),
+                body.len(),
+                "the announced body must arrive intact at the budget boundary"
+            );
+            assert_eq!(reply_to, Some("r".repeat(128)));
+        }
+        other => panic!("expected a notice, received {other:?}"),
+    }
 }
 
 // -------------------------------------------------------------- replacement
