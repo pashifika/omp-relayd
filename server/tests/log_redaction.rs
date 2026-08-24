@@ -71,6 +71,7 @@ fn assert_every_log_path_was_exercised(captured: &str, lines: usize, transferred
         "announcement shed by a recipient queue",
         "reservation granted",
         "payload stored",
+        "payload fetched",
     ] {
         assert!(
             captured.contains(expected),
@@ -80,15 +81,20 @@ fn assert_every_log_path_was_exercised(captured: &str, lines: usize, transferred
     }
 
     // The transfer's records carry the address and the byte count, which is what
-    // the requirement asks them to carry *instead* of the content.
-    let stored = captured
-        .lines()
-        .find(|line| line.contains("payload stored"))
-        .expect("the upload was exercised above");
-    assert!(
-        stored.contains(&transferred.digest) && stored.contains(&transferred.bytes.to_string()),
-        "the upload record must name the digest and the byte count; observed: {stored}"
-    );
+    // the requirement asks them to carry *instead* of the content. Both halves
+    // are checked: a `GET` that emitted nothing let the fetch half pass by
+    // having no record to inspect.
+    for expected in ["payload stored", "payload fetched"] {
+        let record = captured
+            .lines()
+            .find(|line| line.contains(expected))
+            .expect("the transfer was exercised above");
+        assert!(
+            record.contains(&transferred.digest) && record.contains(&transferred.bytes.to_string()),
+            "the {expected:?} record must name the digest and the byte count; \
+             observed: {record}"
+        );
+    }
 }
 
 /// A `send` whose `protocol` field is a string, so serde's type-mismatch error

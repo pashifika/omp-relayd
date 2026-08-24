@@ -37,6 +37,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Either, Empty, StreamBody};
@@ -45,8 +46,9 @@ use hyper::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 
 use crate::blob::{self, Accepted, UploadError, UploadRefusal};
@@ -69,6 +71,53 @@ const PAYLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 /// detect and no cache that can go stale. No `ETag` accompanies it for the same
 /// reason: revalidation has nothing to compare.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// Ceiling on reading one request's headers.
+///
+/// The same value the frame path gives a connection to state its intent
+/// ([`crate::relay::HELLO_DEADLINE`]), because that is what this is: the accept
+/// path's handshake window ends the moment a non-zero first byte arrives, and
+/// past that nothing bounded this connection at all. A connection that sent `G`
+/// and then stalled held a task and a file descriptor for as long as it liked,
+/// where a frame connection has an idle deadline and a heartbeat.
+///
+/// It bounds the idle gap between keep-alive requests too, because `hyper` arms
+/// it whenever it begins reading a head. That is the bound this surface wants
+/// rather than an accident of one knob: the two requests keep-alive exists for
+/// here are back to back -- a length, then the bytes it authorizes -- and a
+/// client returning later opens a connection instead of reusing an idle one.
+///
+/// It does not bound a body. `hyper` clears it once a head is read, which is
+/// what keeps a maximal upload on a slow link from being failed for working; a
+/// body is bounded by progress instead, in [`BODY_PROGRESS_TIMEOUT`].
+pub const HEADER_READ_TIMEOUT: Duration = crate::relay::HELLO_DEADLINE;
+
+/// Ceiling on the gap between two body frames of one upload.
+///
+/// A bound on *silence*, not on the transfer: the timer restarts on every frame
+/// received, so an upload that is moving takes as long as its size requires. A
+/// total-transfer deadline would fail a maximal payload on a slow link *because
+/// it was working*, which is the defect
+/// [`crate::blob::RESERVATION_TIME_TO_LIVE`] declines to have and the reason
+/// the client bounds its own transfers by progress too.
+///
+/// This is the half [`HEADER_READ_TIMEOUT`] cannot cover, and it is the
+/// expensive half. A stalled head holds a task and a descriptor; a stalled body
+/// holds a room's allowance, because [`crate::blob::Store::begin_upload`] moves
+/// it out of the reservation table and no sweep scans an upload in flight. Eight
+/// stalled maximal uploads hold a whole room's
+/// [`crate::blob::MAX_ROOM_BYTES`] with the store holding no payload at all, and
+/// only the upload's `Drop` gives any of it back.
+///
+/// Twenty seconds is twice the ten the client allows its own transfers before it
+/// aborts one, restarted per 64 KiB offered to the socket -- the same 2x margin
+/// the client's handshake timeout takes over [`crate::relay::HELLO_DEADLINE`],
+/// and for the same reason: the outer bound must not fire inside the inner one,
+/// or a peer about to report a stall to its user gets a bare reset from the
+/// relay instead. Well inside [`crate::relay::IDLE_DEADLINE`], which is the
+/// right order -- a stalled transfer costs a room's budget where a silent frame
+/// connection costs a task.
+pub const BODY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A response body: either a streamed payload or nothing at all.
 type TransferBody = Either<
@@ -106,6 +155,12 @@ where
         // client that has finished its request close its write side while
         // waiting, which is a legitimate thing for a client to do.
         .half_close(true)
+        // The timer is what makes the header bound real rather than nominal:
+        // `hyper` defaults `header_read_timeout` to thirty seconds and then
+        // ignores it unless a timer is set, so this builder had no bound at all.
+        // Both are set here, and the value is [`HEADER_READ_TIMEOUT`].
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(io), service)
         .await
     {
@@ -138,8 +193,8 @@ async fn route(
 
     match *request.method() {
         Method::PUT => put(request, &store, &target, peer_addr).await,
-        Method::GET => get(&store, &target, true).await,
-        Method::HEAD => get(&store, &target, false).await,
+        Method::GET => get(&store, &target, true, peer_addr).await,
+        Method::HEAD => get(&store, &target, false, peer_addr).await,
         // `405` names the routes that do exist, which is the one thing a client
         // that used the wrong method can act on.
         _ => {
@@ -205,7 +260,32 @@ async fn put(
     };
 
     let mut body = request.into_body();
-    while let Some(next) = body.frame().await {
+    loop {
+        // A fresh timeout per frame, which is what makes this a bound on
+        // progress rather than on the transfer: an upload that keeps moving
+        // resets it and may run as long as its size requires.
+        let next = match timeout(BODY_PROGRESS_TIMEOUT, body.frame()).await {
+            Ok(Some(next)) => next,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                // Nothing arrived for the whole interval, so returning here is
+                // the fix rather than a nicety: `Store::begin_upload` moved this
+                // room's allowance out of the reservation table, no sweep scans
+                // an upload in flight, and dropping `upload` on the way out is
+                // the only thing that gives the allowance back and removes the
+                // partial file. Exactly the path an abandoned connection takes,
+                // because a stall is one that has not closed yet.
+                tracing::info!(
+                    %peer_addr,
+                    room = %target.room,
+                    digest = %target.digest,
+                    written = upload.written(),
+                    declared,
+                    "upload failed: no progress within the body bound"
+                );
+                return empty(StatusCode::REQUEST_TIMEOUT);
+            }
+        };
         let frame = match next {
             Ok(frame) => frame,
             Err(error) => {
@@ -276,7 +356,12 @@ fn refuse_upload(
 
 /// Answers a fetch, with the payload's bytes when `with_body` and its length
 /// alone otherwise.
-async fn get(store: &Arc<blob::Store>, target: &Target, with_body: bool) -> Response<TransferBody> {
+async fn get(
+    store: &Arc<blob::Store>,
+    target: &Target,
+    with_body: bool,
+    peer_addr: SocketAddr,
+) -> Response<TransferBody> {
     // The index is the authority, not the filesystem: an expired payload has an
     // entry that is gone before its file is, and reporting from the index is
     // what makes "expired" and "absent" the same answer.
@@ -324,6 +409,19 @@ async fn get(store: &Arc<blob::Store>, target: &Target, with_body: bool) -> Resp
     // break.
     let stream = ReaderStream::new(file).map_ok(Frame::data as fn(Bytes) -> Frame<Bytes>);
     response = response.status(StatusCode::OK);
+    // The other half of what `payload stored` records, and the same fields:
+    // room, digest, byte count, and no payload byte. Emitted here rather than
+    // after the last byte because the body is streamed by the connection once
+    // this handler returns, so this is the last point on this task. What it
+    // states is a fetch answered from an open file -- which, without it, only a
+    // failure left any trace of.
+    tracing::info!(
+        %peer_addr,
+        room = %target.room,
+        digest = %target.digest,
+        bytes,
+        "payload fetched"
+    );
     response
         .body(Either::Left(StreamBody::new(stream)))
         .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
