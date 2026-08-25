@@ -29,6 +29,8 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 
+import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+
 import type { ResolvedClient } from "../../src/config.ts";
 import {
   AGENT_DIR_ENV,
@@ -228,6 +230,25 @@ describe("one invocation produces a setup the extension accepts", () => {
       readFileSync(join(REPO_ROOT, "extension", "skill", "omp-relay", "SKILL.md"), "utf8"),
     );
     console.log(`skill installed at ${installed}`);
+  });
+
+  test("the extension lands where the host scans for it and loads successfully", async () => {
+    const { agentDir, projectRoot } = scratch();
+
+    await run(["--task", "t", "--agent-dir", agentDir, "--project-root", projectRoot]);
+
+    // Native OMP discovery scans `<agent-dir>/extensions/<name>/index.js`.
+    const installed = join(agentDir, "extensions", "omp-relay", "index.js");
+    expect(statSync(installed).isFile()).toBe(true);
+    expect(readFileSync(installed, "utf8")).toBe(
+      readFileSync(join(REPO_ROOT, "extension", "dist", "index.js"), "utf8"),
+    );
+
+    const loaded = await loadExtensions([installed], projectRoot);
+    expect(loaded.errors).toEqual([]);
+    expect(loaded.extensions).toHaveLength(1);
+    expect([...loaded.extensions[0]!.tools.keys()]).toEqual(["mesh"]);
+    console.log(`extension installed and loaded from ${installed}`);
   });
 
   test("it resolves a project root the same way the extension does", async () => {
@@ -430,7 +451,7 @@ describe("the helper's verdict is the extension's verdict", () => {
   );
 });
 
-describe("the helper refuses before it writes", () => {
+describe("the helper preserves existing state and refuses unsafe writes", () => {
   test.each([
     ["a task containing /", ["--task", "feat/x"], "room.task"],
     ["a task with trailing whitespace", ["--task", "review "], "room.task"],
@@ -462,19 +483,59 @@ describe("the helper refuses before it writes", () => {
     expect(snapshot(projectRoot)).toEqual({});
   });
 
-  test("an existing global file is left byte-identical and named", async () => {
+  test("existing configurations are kept while the extension and skill are refreshed", async () => {
     const { agentDir, projectRoot } = scratch();
-    const existing = "transport:\n  mode: local\n  address: 10.0.0.9:9999\n# hand-written\n";
-    const path = join(agentDir, CONFIG_FILE_NAME);
-    writeFileSync(path, existing, "utf8");
+    const global = "transport:\n  mode: local\n  address: 10.0.0.9:9999\n# hand-written\n";
+    const project = 'room:\n  project: "shared"\n  task: "existing"\n';
+    const globalPath = join(agentDir, CONFIG_FILE_NAME);
+    const projectPath = projectConfigPath(projectRoot);
+    const extensionPath = join(agentDir, "extensions", "omp-relay", "index.js");
+    const skillPath = join(agentDir, "skills", "omp-relay", "SKILL.md");
+    mkdirSync(dirname(projectPath), { recursive: true });
+    mkdirSync(dirname(extensionPath), { recursive: true });
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(globalPath, global, "utf8");
+    writeFileSync(projectPath, project, "utf8");
+    writeFileSync(extensionPath, "stale extension\n", "utf8");
+    writeFileSync(skillPath, "stale skill\n", "utf8");
 
-    const result = await run(["--task", "t", "--agent-dir", agentDir, "--project-root", projectRoot]);
+    const result = await run(["--task", "mac-worker", "--agent-dir", agentDir, "--project-root", projectRoot]);
 
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain(path);
-    expect(result.stderr).toContain("--force");
-    expect(readFileSync(path, "utf8")).toBe(existing);
-    console.log(`declined to replace: ${result.stderr.trim()}`);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(`kept ${globalPath}`);
+    expect(result.stdout).toContain(`kept ${projectPath}`);
+    expect(readFileSync(globalPath, "utf8")).toBe(global);
+    expect(readFileSync(projectPath, "utf8")).toBe(project);
+    expect(readFileSync(extensionPath, "utf8")).toBe(
+      readFileSync(join(REPO_ROOT, "extension", "dist", "index.js"), "utf8"),
+    );
+    expect(readFileSync(skillPath, "utf8")).toBe(
+      readFileSync(join(REPO_ROOT, "extension", "skill", "omp-relay", "SKILL.md"), "utf8"),
+    );
+    console.log(`kept both configurations and refreshed ${extensionPath}`);
+  });
+
+  // The keep is per file, not per run: a machine that already has a global file
+  // and a fresh checkout is the second-project case, and refusing the whole run
+  // there would leave the checkout with no room at all.
+  test("an absent counterpart is written while the existing file is kept", async () => {
+    const { agentDir, projectRoot } = scratch();
+    const global = "transport:\n  mode: local\n  address: 10.0.0.9:9999\n# hand-written\n";
+    const globalPath = join(agentDir, CONFIG_FILE_NAME);
+    const projectPath = projectConfigPath(projectRoot);
+    writeFileSync(globalPath, global, "utf8");
+
+    const result = await run(["--task", "second-project", "--agent-dir", agentDir, "--project-root", projectRoot]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(`kept ${globalPath}`);
+    expect(result.stdout).toContain(`wrote ${projectPath}`);
+    expect(readFileSync(globalPath, "utf8")).toBe(global);
+    expect(readFileSync(projectPath, "utf8")).toContain("second-project");
+    expect(statSync(join(agentDir, "extensions", "omp-relay", "index.js")).isFile()).toBe(true);
+    expect(statSync(join(agentDir, "skills", "omp-relay", "SKILL.md")).isFile()).toBe(true);
+    console.log(`kept the global file and wrote ${projectPath}`);
   });
 
   test("--force replaces both files", async () => {
@@ -517,10 +578,30 @@ describe("the helper refuses before it writes", () => {
     expect(result.stdout).toContain(`would write ${join(agentDir, CONFIG_FILE_NAME)}`);
     expect(result.stdout).toContain(`would write ${projectConfigPath(projectRoot)}`);
     expect(result.stdout).toContain(`would install`);
+    expect(result.stdout).toContain(join(agentDir, "extensions", "omp-relay", "index.js"));
     expect(result.stdout).toContain(`would run: bun run build`);
     expect(snapshot(agentDir)).toEqual(beforeAgent);
     expect(snapshot(projectRoot)).toEqual(beforeRoot);
     console.log(`dry run reported ${result.stdout.split("\n").length} lines and wrote nothing`);
+  });
+
+  test("--dry-run reports a kept file as kept and still names both installations", async () => {
+    const { agentDir, projectRoot } = scratch();
+    const globalPath = join(agentDir, CONFIG_FILE_NAME);
+    writeFileSync(globalPath, "transport:\n  mode: local\n  address: 10.0.0.9:9999\n", "utf8");
+    const beforeAgent = snapshot(agentDir);
+    const beforeRoot = snapshot(projectRoot);
+
+    const result = await run(["--task", "t", "--agent-dir", agentDir, "--project-root", projectRoot, "--dry-run"]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain(`would keep ${globalPath}`);
+    expect(result.stdout).toContain(`would write ${projectConfigPath(projectRoot)}`);
+    expect(result.stdout).toContain(join(agentDir, "skills", "omp-relay"));
+    expect(result.stdout).toContain(join(agentDir, "extensions", "omp-relay", "index.js"));
+    expect(snapshot(agentDir)).toEqual(beforeAgent);
+    expect(snapshot(projectRoot)).toEqual(beforeRoot);
+    console.log(`dry run kept the global file and named both installation paths`);
   });
 
   // `[ -e ]` follows a link and cannot see a dangling one, while `mkdir -p` and
@@ -592,6 +673,21 @@ describe("the helper refuses before it writes", () => {
     ["the global file", "agent", CONFIG_FILE_NAME, "directory", "is not a regular file"],
     ["the skills directory", "agent", "skills", "file", "is not a directory"],
     ["the skill target", "agent", join("skills", "omp-relay"), "file", "is not a directory"],
+    ["the extensions directory", "agent", "extensions", "file", "is not a directory"],
+    [
+      "the extension target",
+      "agent",
+      join("extensions", "omp-relay"),
+      "file",
+      "is not a directory",
+    ],
+    [
+      "the extension bundle",
+      "agent",
+      join("extensions", "omp-relay", "index.js"),
+      "directory",
+      "is not a regular file",
+    ],
     ["the project's .omp", "project", ".omp", "file", "is not a directory"],
     [
       "the project file",
@@ -839,18 +935,17 @@ describe("the helper's scope stops at the client", () => {
     expect(text).toContain("PI_CODING_AGENT_DIR");
   });
 
-  test("a successful run starts nothing and prints the command instead", async () => {
+  test("a successful run ends with installation complete", async () => {
     const { agentDir, projectRoot } = scratch();
 
     const result = await run(["--task", "t", "--agent-dir", agentDir, "--project-root", projectRoot]);
 
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("started no relay and ran no agent");
-    expect(result.stdout).toContain("Deployment and security");
-    const lines = result.stdout.trimEnd().split("\n");
-    expect(lines.at(-1)).toBe(
-      `omp --extension "${join(REPO_ROOT, "extension", "dist", "index.js")}"`,
+    expect(result.stdout).toContain(
+      `installed the omp-relay extension to ${join(agentDir, "extensions", "omp-relay", "index.js")}`,
     );
+    const lines = result.stdout.trimEnd().split("\n");
+    expect(lines.at(-1)).toBe("setup-client: installation complete.");
     console.log(`final line: ${lines.at(-1)}`);
   });
 

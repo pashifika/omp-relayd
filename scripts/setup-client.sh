@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # Writes the two OMP Relay client configuration files and installs the
-# collaboration skill.
+# extension and its collaboration skill.
 #
 # This exists because the two-layer configuration made manual setup tedious: one
-# heredoc became two files in two locations plus a skill installation. It is a
+# heredoc became two files in two locations plus two installations. It is a
 # script rather than a Makefile because what it does is validation and
 # parameterised imperative effects, not a dependency graph over file targets —
 # it has to measure identifiers in UTF-8 bytes and refuse before writing
@@ -45,12 +45,13 @@ readonly DEFAULT_ADDRESS="127.0.0.1:7788"
 readonly DEFAULT_STARTUP="manual"
 readonly CONFIG_FILE_NAME="omp-relay.yml"
 readonly SKILL_NAME="omp-relay"
+readonly EXTENSION_NAME="omp-relay"
 
 readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
   cat <<USAGE
-setup-client.sh — write the OMP Relay client configuration and install its skill
+setup-client.sh — write OMP Relay client configuration and install its extension and skill
 
 Usage:
   scripts/setup-client.sh --task <task> [options]
@@ -81,21 +82,21 @@ Options and their defaults:
   --help                   Print this text
 
 Files written:
-  <agent-dir>/${CONFIG_FILE_NAME}                 transport, startup, peer
-  <project-root>/.omp/${CONFIG_FILE_NAME}         room
-  <agent-dir>/skills/${SKILL_NAME}/          the collaboration skill (always refreshed)
+  <agent-dir>/${CONFIG_FILE_NAME}                         transport, startup, peer
+  <project-root>/.omp/${CONFIG_FILE_NAME}                 room
+  <agent-dir>/extensions/${EXTENSION_NAME}/index.js       the OMP extension
+  <agent-dir>/skills/${SKILL_NAME}/                       the collaboration skill
 
-The global file is refused without --force; it may hold a purpose you wrote. An
-existing project file is instead kept and named: it holds the room a colleague
-committed, so --project and --task decide nothing, and --force replaces it.
+Existing global and project files are kept and named unless --force is passed.
+The corresponding flags then decide nothing, while the extension and skill are
+still refreshed.
 
 What this script will not do:
   * It installs no toolchain. A missing bun is reported with the version this
     project expects; nothing is fetched.
   * It starts no relay, through Compose or otherwise. Where a relay runs is a
     deployment decision; see "Deployment and security" in README.md.
-  * It does not run the agent. The command is printed instead, because it is
-    worth reading before it executes.
+  * It does not run the agent.
 USAGE
 }
 
@@ -309,6 +310,9 @@ fi
 
 global_path="$agent_dir/$CONFIG_FILE_NAME"
 project_path="$project_root/.omp/$CONFIG_FILE_NAME"
+extension_source="$REPO_ROOT/extension/dist/index.js"
+extension_target_dir="$agent_dir/extensions/$EXTENSION_NAME"
+extension_target="$extension_target_dir/index.js"
 skill_source="$REPO_ROOT/extension/skill/$SKILL_NAME"
 skill_target="$agent_dir/skills/$SKILL_NAME"
 
@@ -338,13 +342,17 @@ if [ -n "$purpose_file" ]; then
 fi
 
 [ -d "$skill_source" ] || fail "the skill source $skill_source is missing from this checkout"
+if [ "$do_build" -eq 0 ]; then
+  [ -f "$extension_source" ] || fail "the extension bundle $extension_source is missing; re-run with --build"
+fi
 
 # `[ -L ]` is lstat-based where `[ -e ]` is not: it sees a dangling link, and it
 # is the only test that refuses before `mkdir -p` and `>` follow one. A
 # repository can track `.omp` or the project file as a symlink, and following it
 # writes outside the checkout or truncates whatever it points at, so every
 # destination and every directory this creates is refused by name.
-for linked in "$agent_dir" "$global_path" "$agent_dir/skills" "$skill_target" \
+for linked in "$agent_dir" "$global_path" "$agent_dir/extensions" \
+  "$extension_target_dir" "$extension_target" "$agent_dir/skills" "$skill_target" \
   "$project_root/.omp" "$project_path"; do
   if [ -L "$linked" ]; then
     fail "$linked is a symbolic link; this writes regular files into real directories, so move the link aside and re-run"
@@ -355,14 +363,15 @@ done
 # only once they reach it: a regular-file `.omp` failed the second parent
 # creation after the global file had already been replaced. Every type here is
 # knowable before the first write, so each wrong one is refused by name.
-for must_be_dir in "$agent_dir" "$agent_dir/skills" "$skill_target" "$project_root/.omp"; do
+for must_be_dir in "$agent_dir" "$agent_dir/extensions" "$extension_target_dir" \
+  "$agent_dir/skills" "$skill_target" "$project_root/.omp"; do
   if [ -e "$must_be_dir" ] && [ ! -d "$must_be_dir" ]; then
     fail "$must_be_dir exists and is not a directory; this creates a directory there, so move it aside and re-run"
   fi
 done
-for must_be_file in "$global_path" "$project_path"; do
+for must_be_file in "$global_path" "$extension_target" "$project_path"; do
   if [ -e "$must_be_file" ] && [ ! -f "$must_be_file" ]; then
-    fail "$must_be_file exists and is not a regular file; this writes a configuration file there, so move it aside and re-run"
+    fail "$must_be_file exists and is not a regular file; this writes a regular file there, so move it aside and re-run"
   fi
 done
 
@@ -394,30 +403,25 @@ compose_project() {
   printf 'room:\n  project: %s\n  task: %s\n' "$(yaml_scalar "$project")" "$(yaml_scalar "$task")"
 }
 
-# The global refusal is decided before anything is written, so a declined run
-# leaves both files as it found them.
-#
-# An existing project file is kept whatever room it names, and this run's
-# --project and --task then decide nothing. It is the repository's own statement
-# of the room -- the two-machine procedure has both ends resolve the room from
-# this one committed file -- so the helper has no standing to overrule it.
-# Judging it is not available to a shell script anyway: a hand-written
-# `project: shared` and the quoted scalar composed above are the same room, and
-# no comparison short of the parser the extension has tells that from a real
-# disagreement -- so comparing refuses exactly the hand-written file this keep
-# exists for. It is kept and reported instead, and --force still replaces it.
+# Existing operator configuration is preserved by default, but it must not
+# prevent the shipped extension and skill from being refreshed. `--force`
+# replaces both configuration files; otherwise each existing file is kept and
+# reported, and only its absent counterpart is composed.
+global_keep=0
 project_keep=0
 if [ "$force" -eq 0 ]; then
-  if [ -e "$global_path" ]; then
-    fail "$global_path already exists; pass --force to replace it, or move it aside"
-  fi
+  [ ! -e "$global_path" ] || global_keep=1
   [ ! -e "$project_path" ] || project_keep=1
 fi
 
 if [ "$dry_run" -eq 1 ]; then
   printf 'setup-client: dry run; nothing below is performed.\n'
-  printf '  would write %s:\n' "$global_path"
-  compose_global | sed 's/^/    | /'
+  if [ "$global_keep" -eq 1 ]; then
+    printf '  would keep %s; transport, startup, and peer would remain from that file\n' "$global_path"
+  else
+    printf '  would write %s:\n' "$global_path"
+    compose_global | sed 's/^/    | /'
+  fi
   if [ "$project_keep" -eq 1 ]; then
     printf '  would keep %s; the room would come from that file, not from --project/--task:\n' "$project_path"
     sed 's/^/    | /' <"$project_path"
@@ -429,15 +433,19 @@ if [ "$dry_run" -eq 1 ]; then
   if [ "$do_build" -eq 1 ]; then
     printf '  would run: bun run build (in %s/extension)\n' "$REPO_ROOT"
   fi
-  printf '  would print the command that registers the extension\n'
+  printf '  would install the extension bundle %s to %s\n' "$extension_source" "$extension_target"
   exit 0
 fi
 
 # --- Writing -------------------------------------------------------------------
 
 mkdir -p -- "$agent_dir"
-compose_global >"$global_path"
-printf 'setup-client: wrote %s\n' "$global_path"
+if [ "$global_keep" -eq 1 ]; then
+  printf 'setup-client: kept %s; transport, startup, and peer remain from that file\n' "$global_path"
+else
+  compose_global >"$global_path"
+  printf 'setup-client: wrote %s\n' "$global_path"
+fi
 
 if [ "$project_keep" -eq 1 ]; then
   printf 'setup-client: kept %s; the room comes from that file, not from --project/--task:\n' "$project_path"
@@ -463,12 +471,13 @@ if [ "$do_build" -eq 1 ]; then
   (cd -- "$REPO_ROOT/extension" && bun run build)
 fi
 
-# --- What to do next -------------------------------------------------------------
+# The host discovers `<agent-dir>/extensions/<name>/index.js` without a CLI
+# flag. Copy after an optional build so `--build` installs the bundle it made.
+[ -f "$extension_source" ] || fail "the build completed without producing $extension_source"
+mkdir -p -- "$extension_target_dir"
+cp -- "$extension_source" "$extension_target"
+printf 'setup-client: installed the %s extension to %s\n' "$EXTENSION_NAME" "$extension_target"
 
-cat <<NEXT
-setup-client: done. This script started no relay and ran no agent.
-setup-client: to start a relay, see "Deployment and security" in $REPO_ROOT/README.md.
-setup-client: register the extension and start the agent with:
+# --- Completion -----------------------------------------------------------------
 
-omp --extension "$REPO_ROOT/extension/dist/index.js"
-NEXT
+printf 'setup-client: installation complete.\n'
