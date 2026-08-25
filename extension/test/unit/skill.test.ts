@@ -78,18 +78,56 @@ const OBLIGATIONS: readonly Obligation[] = [
   },
   {
     requirement: "The skill joins before it addresses anyone",
-    states: "a join may carry the room as parameters when the operator named one",
-    pattern: /When the operator named a room, pass it: [^\n]+/,
+    states: "the common two-component selector maps to task and as, with no project",
+    pattern:
+      /\| `<task>\/<peer>` \|[^|]+\| `mesh\(action: "join", task: "<task>", as: "<peer>"\)` \|/,
   },
   {
     requirement: "The skill joins before it addresses anyone",
-    states: "otherwise the room resolves from the project file",
-    pattern: /the room resolves from the project file at\n?[^\n]+/,
+    states: "the three-component selector maps all three to join parameters",
+    pattern:
+      /\| `<project>\/<task>\/<peer>` \|[^|]+\| `mesh\(action: "join", project: "<project>", task: "<task>", as: "<peer>"\)` \|/,
   },
   {
     requirement: "The skill joins before it addresses anyone",
-    states: "a parameter-sourced room is reported back to the operator",
-    pattern: /\*\*When the room came from a join parameter[^*]+\*\*/,
+    states: "the two-component form leaves the project to the file or the root's directory name",
+    pattern:
+      /The two-component form passes no `project` at all\.[\s\S]{0,200}?directory name when no file names\n?one/,
+  },
+  {
+    requirement: "The skill joins before it addresses anyone",
+    states: "only two or three non-empty components are a selector, and nothing is guessed",
+    pattern:
+      /\*\*Exactly two or three non-empty components are\n?a selector\.\*\*[\s\S]{0,200}?invented component\./,
+  },
+  {
+    requirement: "The skill joins before it addresses anyone",
+    states: "a selector names this session's local peer, not a recipient",
+    pattern:
+      /A selector is not an address\.[\s\S]{0,400}?peer component of a selector\./,
+  },
+  {
+    requirement: "The skill joins before it addresses anyone",
+    states: "no selector means every value resolves from configuration and derivation",
+    pattern: /Omit `project`, `task`, and `as` entirely and let all three resolve\./,
+  },
+  {
+    requirement: "The skill joins before it addresses anyone",
+    states: "a selector or a derived project is reported with the room, local peer, and sources",
+    pattern:
+      /\*\*Report the resolved room, this session's peer name, and each source whenever\nthe operator supplied a selector or the project came from `derivation`\.\*\*/,
+  },
+  {
+    requirement: "The skill joins before it addresses anyone",
+    states: "a derived project makes two differently renamed clones two rooms",
+    pattern:
+      /`omp-relayd\/two-machine-check` and `relayd\/two-machine-check` are two rooms/,
+  },
+  {
+    requirement: "The skill joins before it addresses anyone",
+    states: "a project-file room with no selector needs no confirmation",
+    pattern:
+      /When the room came entirely from the project file and no selector was supplied,\nno confirmation is needed[^.]*\. Proceed\./,
   },
   {
     requirement: "An informal peer reference is resolved against the roster",

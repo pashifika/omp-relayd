@@ -209,13 +209,28 @@ PROJECT
 
 The project root is found by honouring `OMP_PROJECT_ROOT`, otherwise walking up from the working directory for a `.git` directory, otherwise for a language manifest such as `package.json` or `Cargo.toml`. The walk stops below your home directory and never selects it.
 
-This file is optional. A join may carry the room instead:
+This file is optional, and `room.project` within it is optional too. Each half resolves independently:
+
+| Value | Sources, in order |
+|---|---|
+| `room.project` | the join's `project` parameter, then this file, then the project root's directory name |
+| `room.task` | the join's `task` parameter, then this file. Nothing derives a task |
+
+So two checkouts of `omp-relayd` need only agree on the task, and the shortest join names the task and this session:
 
 ```text
-Use mesh with action join, project acme and task pr-471.
+Use the omp-relay skill to join two-machine-check/mac-worker.
 ```
 
-That is the path for a repository you cannot commit to. Because two mistyped rooms are two *successful* joins that never meet, the join result always reports which source each value came from — tell the other operator what yours resolved to.
+That is `<task>/<peer>`. Name the project as well when the folder is not the room — a monorepo, a renamed clone, or a room two repositories share:
+
+```text
+Use the omp-relay skill to join acme/pr-471/mac-worker.
+```
+
+A committed `room.project` outranks the directory name, so renaming a folder cannot move a room the repository already named. A directory name that is not a valid identifier is refused by name rather than repaired: `my@repo` asks for an explicit project instead of quietly joining `my-repo`.
+
+Because two mistyped rooms are two *successful* joins that never meet — as are two clones renamed differently — the join result always reports which source each value came from, `derivation` being the directory name. Tell the other operator what yours resolved to.
 
 ### Environment variables
 
@@ -311,6 +326,10 @@ Use the omp-relay skill to join and tell me who is in the room.
 ```
 
 ```text
+Use the omp-relay skill to join two-machine-check/mac-worker.
+```
+
+```text
 Use mesh with action send to win-desktop. Send: Review the parser error paths and reply with findings.
 ```
 
@@ -343,6 +362,8 @@ Both ends resolve the same room from the same committed project file, and each d
 2. In A: `Send win-desktop a request to report its OS and Bun version.` A reports `routed` and a message identifier.
 3. B starts a turn carrying the sender, project, task, identifier, and body.
 4. In B: reply to A, setting `reply_to` to A's identifier. A receives the reply carrying that reference.
+
+Both checkouts carry the project file `setup-client.sh` wrote, so the room needs no parameters at all. To exercise derivation instead, delete `.omp/omp-relay.yml` on both machines and name the task and this session in the join: `Use the omp-relay skill to join two-machine-check/mac-worker.` Each end then derives `room.project` from its own checkout's directory name and reports the source as `derivation`. Two clones in differently named folders are two rooms, and the reported source is what shows it before any work is sent.
 
 To rehearse the flow on one machine, give each session a distinct name explicitly — `--peer alpha` on one and `--peer beta` on the other, each with its own `--agent-dir`. That exercises routing but not derivation, which is the part only two hosts can show.
 
