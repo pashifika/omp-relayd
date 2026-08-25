@@ -349,4 +349,113 @@ describe("the documented setup reaches a joined session", () => {
       }
     }
   }, RELAY_SETUP_TIMEOUT_MS);
+
+  // The two-machine claim, reduced to what one machine can actually show. Two
+  // independent runtime instances, two distinct project roots whose directory
+  // names match, no project file anywhere, and no `project` parameter: if both
+  // arrive in the same room and each reports `derivation`, the room came from
+  // the directory name on both sides rather than from anything either was told.
+  //
+  // What is still owed to two hosts is peer-name derivation, since both sessions
+  // here share one host name. `local_docs/omp-relay-pending-verification`
+  // records that boundary.
+  test("two sessions in identically named checkouts derive the same room", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "omp-relay-derive-agent-"));
+    await writeFile(
+      join(agentDir, "omp-relay.yml"),
+      [
+        "transport:",
+        "  mode: local",
+        `  address: "127.0.0.1:${relay.port}"`,
+        "startup: manual",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    // `OMP_PROJECT_ROOT` wins outright over the walk, and it is process-wide, so
+    // it must be absent for two sessions to resolve two different roots. Each
+    // root is decided by its own `.git` marker instead.
+    delete process.env[PROJECT_ROOT_ENV];
+    process.env[AGENT_DIR_ENV] = agentDir;
+    setAgentDir(agentDir);
+
+    const sessions = await Promise.all(
+      ["mac-worker", "win-worker"].map(async (peer) => {
+        const parent = await mkdtemp(join(tmpdir(), `omp-relay-derive-${peer}-`));
+        const projectRoot = join(parent, "omp-relayd-derived");
+        await mkdir(join(projectRoot, ".git"), { recursive: true });
+
+        const deployment = await mkdtemp(join(tmpdir(), `omp-relay-derive-ext-${peer}-`));
+        const extensionPath = join(deployment, "index.js");
+        await copyFile(BUNDLE, extensionPath);
+        const loaded = await loadExtensions([extensionPath], deployment);
+        expect(loaded.errors).toEqual([]);
+        const extension = loaded.extensions[0];
+        if (extension === undefined) throw new Error(`no extension loaded for ${peer}`);
+
+        const ctx = context(projectRoot, []);
+        const mesh = extension.tools.get("mesh");
+        if (mesh === undefined) throw new Error(`mesh not registered for ${peer}`);
+        return { peer, projectRoot, extension, mesh, ctx };
+      }),
+    );
+
+    try {
+      const results: Array<Record<string, unknown>> = [];
+      for (const session of sessions) {
+        // Exactly what the skill's `<task>/<peer>` selector maps to: a task, a
+        // local peer name, and no project at all.
+        const joined = await session.mesh.definition.execute(
+          `derive-${session.peer}`,
+          { action: "join", task: "derived-room-check", as: session.peer },
+          undefined,
+          undefined,
+          session.ctx,
+        );
+        const details = joined.details as Record<string, unknown>;
+        expect(details["status"]).toBeUndefined();
+        expect(details["project"]).toBe("omp-relayd-derived");
+        expect(details["task"]).toBe("derived-room-check");
+        expect(details["peer"]).toBe(session.peer);
+        expect(details["sources"]).toEqual({
+          project: "derivation",
+          task: "parameter",
+          peer: "parameter",
+        });
+        // The operator-facing text has to name the derivation, not just the
+        // machine-readable source.
+        expect((joined.content as Array<{ text: string }>)[0]?.text).toContain(
+          "Room project came from the project root's directory name",
+        );
+        results.push(details);
+        console.log(
+          `${session.peer}: root ${session.projectRoot} -> ${String(details["project"])}/${String(details["task"])} (project source ${String((details["sources"] as Record<string, unknown>)["project"])})`,
+        );
+      }
+
+      // The relay's own roster, so the agreement is the relay's observation
+      // rather than two clients each believing it separately.
+      const listed = await sessions[1]!.mesh.definition.execute(
+        "derive-list",
+        { action: "list" },
+        undefined,
+        undefined,
+        sessions[1]!.ctx,
+      );
+      expect(((listed.details as Record<string, unknown>)["peers"] as string[]).toSorted()).toEqual([
+        "mac-worker",
+        "win-worker",
+      ]);
+      console.log(
+        `both derived rooms met: roster ${JSON.stringify((listed.details as Record<string, unknown>)["peers"])}`,
+      );
+    } finally {
+      for (const session of sessions) {
+        for (const handler of session.extension.handlers.get("session_shutdown") ?? []) {
+          await handler({ type: "session_shutdown" }, session.ctx);
+        }
+      }
+    }
+  }, RELAY_SETUP_TIMEOUT_MS);
 });

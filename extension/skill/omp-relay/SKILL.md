@@ -29,22 +29,58 @@ conversations. Everything below follows from that.
 `mesh(action: "join")` is the first call. Before it there is no connection, no
 roster, and no way to send anything.
 
-- When the operator named a room, pass it: `mesh(action: "join", project: "...", task: "...")`.
-- When they did not, omit both and the room resolves from the project file at
-  `<project_root>/.omp/omp-relay.yml`.
-- `as` overrides this machine's peer name. Leave it alone unless the operator
-  asks for a specific name.
+### The startup selector
+
+An operator starting collaboration names the work and what to call this machine.
+Two slash-delimited forms carry that. They are **startup selectors**: each one
+chooses this session's room and its own local peer name.
+
+| Selector | Means | Join call |
+|---|---|---|
+| `<task>/<peer>` | the common case: this task, and this session called this | `mesh(action: "join", task: "<task>", as: "<peer>")` |
+| `<project>/<task>/<peer>` | the operator is overriding the project as well | `mesh(action: "join", project: "<project>", task: "<task>", as: "<peer>")` |
+
+The two-component form passes no `project` at all. The project then resolves from
+the project file, or from the project root's directory name when no file names
+one — which is why two checkouts of the same repository need only agree on the
+task. Use the three-component form when the folder name is not the room, as in a
+monorepo, a renamed clone, or a room two different repositories share.
+
+`/` and `@` are forbidden inside every identifier, so the components are
+unambiguous and need no escaping. **Exactly two or three non-empty components are
+a selector.** One component, four of them, or an empty component between two
+slashes is not: report the two accepted forms and do not join with a guessed or
+invented component.
+
+A selector is not an address. `<task>/<peer>` names *this* session, and its peer
+component becomes the name other operators see in their roster. The directed
+address `<project>/<task>@<peer>` names *someone else*, is usable only after
+joining, and only against a name the roster actually reports. Nothing is sent to
+the peer component of a selector.
+
+### When the operator supplied no selector
+
+Omit `project`, `task`, and `as` entirely and let all three resolve. `as`
+overrides this machine's peer name; leave it alone unless the operator asks for a
+specific name.
+
+### Report what resolved
 
 The join result reports the resolved room, the resolved peer name, and the
 **source** each came from — `parameter`, `project-file`, `global-file`, or
 `derivation`.
 
-**When the room came from a join parameter, report the resolved room and its
-source back to the operator.** Two mistyped rooms are two *successful* joins that
-never meet, and an empty roster is the only symptom. Saying "joined
-`acme/pr-471`, from the room you gave me" while both operators are present is
-what catches the typo. When the room came from the project file, no confirmation
-is needed — both ends read the same committed file.
+**Report the resolved room, this session's peer name, and each source whenever
+the operator supplied a selector or the project came from `derivation`.** Two
+mistyped rooms are two *successful* joins that never meet, and an empty roster is
+the only symptom. Two clones whose folders were renamed differently fail the same
+way: `omp-relayd/two-machine-check` and `relayd/two-machine-check` are two rooms,
+and each end derived its own in good faith. Saying "joined
+`omp-relayd/two-machine-check` as `mac-worker`; the project came from the project
+root's directory name" while both operators are present is what catches either.
+
+When the room came entirely from the project file and no selector was supplied,
+no confirmation is needed — both ends read the same committed file. Proceed.
 
 Join again at any time to change room or peer name; it reconnects. Joining the
 room you already hold changes nothing and reports current state.
@@ -294,7 +330,11 @@ failed" is not, and it hides which of the three responses applies.
 | Situation | Action |
 |---|---|
 | Nothing connected yet | `mesh(action: "join")` |
-| Room came from a parameter | Report the resolved room and its source to the operator |
+| Operator gave `<task>/<peer>` | `mesh(action: "join", task: ..., as: ...)`; pass no `project` |
+| Operator gave `<project>/<task>/<peer>` | Pass all three; the project is being overridden on purpose |
+| Selector has one component, or four, or an empty one | Report the two accepted forms; do not guess |
+| Selector supplied, or project source is `derivation` | Report the resolved room, this session's peer, and each source |
+| Room came entirely from the project file, no selector | Proceed; no confirmation needed |
 | Operator named a peer informally | `mesh(action: "list")`, match against the roster |
 | Reference matches nothing | Report the roster; do not send |
 | Reference matches several | Report the candidates; do not choose |

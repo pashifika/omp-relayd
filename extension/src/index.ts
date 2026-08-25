@@ -587,12 +587,20 @@ function acceptedResult(
   });
 }
 
-/** How each resolved value's origin is named to the operator. */
-const SOURCE_LABEL: Record<ValueSource, string> = {
+/**
+ * How a value's origin is named to the operator.
+ *
+ * `derivation` is absent because it is one source in the report and two
+ * different sentences here: a derived project is the project root's directory
+ * name, a derived peer is the host name. Rendering both as one word would leave
+ * the operator to guess which machine fact moved the room, and a renamed folder
+ * and a renamed host are not the same mistake to go looking for. The two call
+ * sites name their own, and `sources.task` is never derived at all.
+ */
+const SOURCE_LABEL: Record<Exclude<ValueSource, "derivation">, string> = {
   parameter: "this join's parameter",
   "project-file": "the project file",
   "global-file": "the global file",
-  derivation: "the host name",
 };
 
 /**
@@ -638,7 +646,9 @@ function joinResult(report: JoinReport): MeshToolResult {
   const others = report.peers.filter((name) => name !== report.peer);
   const lines = [
     joinHeadline(report),
-    `Room project came from ${SOURCE_LABEL[report.sources.project]}, task from ${SOURCE_LABEL[report.sources.task]}, peer name from ${SOURCE_LABEL[report.sources.peer]}.`,
+    `Room project came from ${report.sources.project === "derivation" ? "the project root's directory name" : SOURCE_LABEL[report.sources.project]}, ` +
+      `task from ${SOURCE_LABEL[report.sources.task]}, ` +
+      `peer name from ${report.sources.peer === "derivation" ? "the host name" : SOURCE_LABEL[report.sources.peer]}.`,
     report.rosterFailure !== null
       ? `The roster is unknown: ${report.rosterFailure}`
       : others.length === 0
@@ -1431,7 +1441,9 @@ export default function ompRelay(pi: ExtensionAPI): void {
     project: pi.zod
       .string()
       .optional()
-      .describe("join only: room project, overriding the project configuration file"),
+      .describe(
+        "join only: room project, overriding the project configuration file and the project root's directory name",
+      ),
     task: pi.zod
       .string()
       .optional()

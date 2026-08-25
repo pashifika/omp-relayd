@@ -49,7 +49,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
   asRecord,
@@ -197,7 +197,12 @@ export type ValueSource = "parameter" | "project-file" | "global-file" | "deriva
 /** The origin of each resolved value. */
 export interface ResolvedSources {
   readonly project: ValueSource;
-  readonly task: ValueSource;
+  /**
+   * Never `derivation`. No machine fact says what two people are meeting about,
+   * so a task has exactly two sources and the type says so rather than leaving
+   * a third to be handled in every reader.
+   */
+  readonly task: Exclude<ValueSource, "derivation">;
   readonly peer: ValueSource;
 }
 
@@ -638,13 +643,56 @@ export function derivePeerName(
 }
 
 /**
+ * Derives a room project from the project root's directory name.
+ *
+ * The root is already resolved — {@link PROJECT_ROOT_ENV} or the marker walk
+ * decided it — so this names a value the session already holds rather than
+ * discovering a new one. It is deterministic, offline, cross-platform, and it is
+ * the same default `scripts/setup-client.sh` writes into a new project file, so
+ * a derived room and a written one agree by construction.
+ *
+ * A Git remote was the alternative and is worse at exactly the job: a checkout
+ * may have no remote, several, or a fork whose name is not the project the two
+ * operators talk about, and reading one costs a subprocess on a path that has
+ * to stay offline.
+ *
+ * The name is validated, never repaired. Folding `my repo` into `my-repo` would
+ * put two machines in different rooms while both reported success, and a room
+ * nobody arrives in is the one failure a derived value must not be able to
+ * produce. Naming `room.project` and asking for an explicit one is the only
+ * honest answer.
+ */
+export function deriveProjectName(
+  root: string,
+): { readonly ok: true; readonly value: string } | { readonly ok: false; readonly problem: ConfigProblem } {
+  const name = basename(root);
+  const broken = identifierProblem(name);
+  if (broken !== null) {
+    return problem(
+      "room.project",
+      `no room project is configured and the project root ${describeValue(root)} cannot supply one because its ` +
+        `directory name ${describeValue(name)} ${describeIdentifierProblem(broken)}; pass project to the join ` +
+        `request or set room.project in ${projectConfigPath(root)}`,
+    );
+  }
+  return { ok: true, value: name };
+}
+
+/**
  * Resolves both layers and a join request's parameters into one connection's
  * configuration.
  *
- * Precedence, and the reason it is not symmetric: the room comes from the
- * parameters, else the project file, and never from the global file — a
- * machine-global room is the defect the layering removes. The peer name comes
- * from the parameter, else the global file, else derivation.
+ * Precedence, and the reasons it is not symmetric. The project comes from the
+ * parameter, else the project file, else the project root's directory name. The
+ * task comes from the parameter, else the project file, and otherwise fails —
+ * nothing about a directory says what two people are meeting about. Neither
+ * comes from the global file: a machine-global room is the defect the layering
+ * removes. The peer name comes from the parameter, else the global file, else
+ * the host name.
+ *
+ * The project file outranks derivation rather than the reverse, because it is
+ * shared project configuration that someone committed on purpose. A folder
+ * rename must not silently move a room the repository already named.
  *
  * Nothing is cached. Resolution happens where it is asked for, so a session
  * whose working directory moved to another project root joins that root's room
@@ -688,23 +736,39 @@ export async function resolveWithGlobal(
   const projectFile = loaded.config;
   const projectPath = loaded.path;
 
-  const project = parameters.project ?? projectFile.project;
+  let project: string;
+  let projectSource: ValueSource;
+  if (parameters.project !== undefined) {
+    project = parameters.project;
+    projectSource = "parameter";
+  } else if (projectFile.project !== null) {
+    project = projectFile.project;
+    projectSource = "project-file";
+  } else {
+    const derived = deriveProjectName(projectRoot.path);
+    if (!derived.ok) {
+      return { ok: false, path: projectPath, absent: false, problem: derived.problem };
+    }
+    project = derived.value;
+    projectSource = "derivation";
+  }
+
+  // Checked after the project, because a root whose name cannot be an
+  // identifier is the harder blocker: the operator has to choose a project,
+  // where a missing task they simply supply. Reporting the choice first sends
+  // them to the project file, which is also where the task belongs.
   const task = parameters.task ?? projectFile.task;
-  if (project === null || task === null) {
-    const missing = [
-      ...(project === null ? ["room.project"] : []),
-      ...(task === null ? ["room.task"] : []),
-    ];
+  if (task === null) {
     return {
       ok: false,
       path: projectPath,
       absent: false,
       problem: {
-        field: missing[0] as string,
+        field: "room.task",
         reason:
-          `${missing.join(" and ")} ${missing.length === 1 ? "has" : "have"} no value: ` +
-          `${projectPath === null ? `no project file exists at ${projectConfigPath(projectRoot.path)}` : `${projectPath} does not name ${missing.join(" or ")}`}` +
-          `, and the join request supplied ${missing.length === 1 ? "no value for it" : "neither"}`,
+          `room.task has no value: ` +
+          `${projectPath === null ? `no project file exists at ${projectConfigPath(projectRoot.path)}` : `${projectPath} does not name room.task`}` +
+          `, and the join request supplied no value for it`,
       },
     };
   }
@@ -733,7 +797,7 @@ export async function resolveWithGlobal(
       startup: global.startup,
       purpose: global.purpose,
       sources: {
-        project: parameters.project === undefined ? "project-file" : "parameter",
+        project: projectSource,
         task: parameters.task === undefined ? "project-file" : "parameter",
         peer: peerSource,
       },

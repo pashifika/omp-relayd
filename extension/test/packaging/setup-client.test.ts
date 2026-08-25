@@ -38,6 +38,7 @@ import {
   MAX_PURPOSE_BYTES,
   PROJECT_MARKERS,
   PROJECT_ROOT_ENV,
+  deriveProjectName,
   parseAddress,
   projectConfigPath,
   resolveClient,
@@ -449,6 +450,49 @@ describe("the helper's verdict is the extension's verdict", () => {
       console.log(`a ${size}-byte file became a ${bytes}-byte purpose, exactly the budget`);
     },
   );
+
+  // Both sides default a missing project to the project root's directory name,
+  // so both have to reach the same verdict on that name. The helper writes the
+  // file the extension then reads; a name one accepts and the other rejects
+  // would be a setup that validates at write time and fails at join time.
+  test.each([
+    ["omp-relayd", true],
+    ["omp@relayd", false],
+  ])("a project root named %p, with no --project", async (name, accepted) => {
+    const { agentDir } = scratch();
+    const parent = mkdtempSync(join(tmpdir(), "omp-relay-setup-parent-"));
+    const projectRoot = join(parent, name);
+    mkdirSync(projectRoot, { recursive: true });
+
+    const derived = deriveProjectName(projectRoot);
+    expect(derived.ok).toBe(accepted);
+
+    const result = await run(["--task", "t", "--agent-dir", agentDir, "--project-root", projectRoot]);
+
+    if (!accepted) {
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("room.project");
+      expect(snapshot(agentDir)).toEqual({});
+      expect(existsSync(projectConfigPath(projectRoot))).toBe(false);
+      console.log(`both refused the root name ${JSON.stringify(name)}: ${result.stderr.trim()}`);
+      return;
+    }
+
+    expect(result.code).toBe(0);
+    if (!derived.ok) return;
+    expect(derived.value).toBe(name);
+    const resolved = await resolveClient({
+      env: { [AGENT_DIR_ENV]: agentDir, [PROJECT_ROOT_ENV]: projectRoot, HOME: parent },
+      cwd: projectRoot,
+      hostName: "probe.local",
+    });
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    expect(resolved.resolved.config.room.project).toBe(name);
+    console.log(
+      `helper wrote and the extension read project ${resolved.resolved.config.room.project}, source ${resolved.resolved.sources.project}`,
+    );
+  });
 });
 
 describe("the helper preserves existing state and refuses unsafe writes", () => {
@@ -504,6 +548,10 @@ describe("the helper preserves existing state and refuses unsafe writes", () => 
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain(`kept ${globalPath}`);
+    // A kept global makes this run's transport flags decide nothing, so it has
+    // to name them: "I passed --address and nothing changed" is the whole
+    // complaint the keep would otherwise produce.
+    expect(result.stdout).toContain("not from --address/--startup/--peer/--purpose-file");
     expect(result.stdout).toContain(`kept ${projectPath}`);
     expect(readFileSync(globalPath, "utf8")).toBe(global);
     expect(readFileSync(projectPath, "utf8")).toBe(project);
@@ -596,6 +644,7 @@ describe("the helper preserves existing state and refuses unsafe writes", () => 
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain(`would keep ${globalPath}`);
+    expect(result.stdout).toContain("not from --address/--startup/--peer/--purpose-file");
     expect(result.stdout).toContain(`would write ${projectConfigPath(projectRoot)}`);
     expect(result.stdout).toContain(join(agentDir, "skills", "omp-relay"));
     expect(result.stdout).toContain(join(agentDir, "extensions", "omp-relay", "index.js"));

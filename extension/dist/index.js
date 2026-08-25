@@ -2593,7 +2593,7 @@ class RelayClient {
 import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { hostname } from "os";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 var AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 var PROJECT_ROOT_ENV = "OMP_PROJECT_ROOT";
 var AGENT_DIR_SEGMENTS = [".omp", "agent"];
@@ -2826,6 +2826,14 @@ function derivePeerName(raw) {
   }
   return { ok: true, value: label };
 }
+function deriveProjectName(root) {
+  const name = basename(root);
+  const broken = identifierProblem(name);
+  if (broken !== null) {
+    return problem("room.project", `no room project is configured and the project root ${describeValue(root)} cannot supply one because its ` + `directory name ${describeValue(name)} ${describeIdentifierProblem(broken)}; pass project to the join ` + `request or set room.project in ${projectConfigPath(root)}`);
+  }
+  return { ok: true, value: name };
+}
 async function resolveClient(options) {
   const global = await loadGlobalConfig(options.env, options.agentDir);
   if (!global.ok) {
@@ -2842,20 +2850,31 @@ async function resolveWithGlobal(global, globalPath, options) {
   }
   const projectFile = loaded.config;
   const projectPath = loaded.path;
-  const project = parameters.project ?? projectFile.project;
+  let project;
+  let projectSource;
+  if (parameters.project !== undefined) {
+    project = parameters.project;
+    projectSource = "parameter";
+  } else if (projectFile.project !== null) {
+    project = projectFile.project;
+    projectSource = "project-file";
+  } else {
+    const derived = deriveProjectName(projectRoot.path);
+    if (!derived.ok) {
+      return { ok: false, path: projectPath, absent: false, problem: derived.problem };
+    }
+    project = derived.value;
+    projectSource = "derivation";
+  }
   const task = parameters.task ?? projectFile.task;
-  if (project === null || task === null) {
-    const missing = [
-      ...project === null ? ["room.project"] : [],
-      ...task === null ? ["room.task"] : []
-    ];
+  if (task === null) {
     return {
       ok: false,
       path: projectPath,
       absent: false,
       problem: {
-        field: missing[0],
-        reason: `${missing.join(" and ")} ${missing.length === 1 ? "has" : "have"} no value: ` + `${projectPath === null ? `no project file exists at ${projectConfigPath(projectRoot.path)}` : `${projectPath} does not name ${missing.join(" or ")}`}` + `, and the join request supplied ${missing.length === 1 ? "no value for it" : "neither"}`
+        field: "room.task",
+        reason: `room.task has no value: ` + `${projectPath === null ? `no project file exists at ${projectConfigPath(projectRoot.path)}` : `${projectPath} does not name room.task`}` + `, and the join request supplied no value for it`
       }
     };
   }
@@ -2882,7 +2901,7 @@ async function resolveWithGlobal(global, globalPath, options) {
       startup: global.startup,
       purpose: global.purpose,
       sources: {
-        project: parameters.project === undefined ? "project-file" : "parameter",
+        project: projectSource,
         task: parameters.task === undefined ? "project-file" : "parameter",
         peer: peerSource
       },
@@ -3105,8 +3124,7 @@ function acceptedResult(accepted, attachment, expiry) {
 var SOURCE_LABEL = {
   parameter: "this join's parameter",
   "project-file": "the project file",
-  "global-file": "the global file",
-  derivation: "the host name"
+  "global-file": "the global file"
 };
 function joinHeadline(report) {
   const room = `${singleLine(report.room.project)}/${singleLine(report.room.task)}`;
@@ -3123,7 +3141,7 @@ function joinResult(report) {
   const others = report.peers.filter((name) => name !== report.peer);
   const lines = [
     joinHeadline(report),
-    `Room project came from ${SOURCE_LABEL[report.sources.project]}, task from ${SOURCE_LABEL[report.sources.task]}, peer name from ${SOURCE_LABEL[report.sources.peer]}.`,
+    `Room project came from ${report.sources.project === "derivation" ? "the project root's directory name" : SOURCE_LABEL[report.sources.project]}, ` + `task from ${SOURCE_LABEL[report.sources.task]}, ` + `peer name from ${report.sources.peer === "derivation" ? "the host name" : SOURCE_LABEL[report.sources.peer]}.`,
     report.rosterFailure !== null ? `The roster is unknown: ${report.rosterFailure}` : others.length === 0 ? "No other peer is in this room; nobody will receive a message sent now." : `Other peers in this room: ${others.map(singleLine).join(", ")}`
   ];
   if (report.purpose !== null) {
@@ -3563,7 +3581,7 @@ function ompRelay(pi) {
   };
   const parameters = pi.zod.object({
     action: pi.zod.enum(["join", "list", "send", "announce", "fetch"]).describe("Connect to a room, list connected peers, send a message to one peer, announce to every other peer in the room, or fetch a payload someone attached"),
-    project: pi.zod.string().optional().describe("join only: room project, overriding the project configuration file"),
+    project: pi.zod.string().optional().describe("join only: room project, overriding the project configuration file and the project root's directory name"),
     task: pi.zod.string().optional().describe("join only: room task, overriding the project configuration file"),
     as: pi.zod.string().optional().describe("join only: this session's peer name"),
     to: pi.zod.string().optional().describe("Peer name; required for send, and rejected for announce"),

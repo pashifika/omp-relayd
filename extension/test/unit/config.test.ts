@@ -20,6 +20,7 @@ import {
   AGENT_DIR_ENV,
   CONFIG_FILE_NAME,
   derivePeerName,
+  deriveProjectName,
   globalConfigPath,
   loadGlobalConfig,
   loadProjectConfig,
@@ -74,10 +75,17 @@ interface Machine {
  * reading nothing.
  */
 async function machine(
-  layers: { global?: string | null; project?: string | null } = {},
+  layers: { global?: string | null; project?: string | null; rootName?: string } = {},
 ): Promise<Machine> {
   const agentDir = await scratch();
-  const projectRoot = await scratch();
+  const parent = await scratch();
+  // A named root when the test is about what the directory name derives to; the
+  // scratch directory itself otherwise, whose `mkdtemp` suffix is a valid
+  // identifier and so derives without saying anything interesting.
+  const projectRoot = layers.rootName === undefined ? parent : join(parent, layers.rootName);
+  if (layers.rootName !== undefined) {
+    await mkdir(projectRoot, { recursive: true });
+  }
   const globalPath = join(agentDir, CONFIG_FILE_NAME);
   const projectPath = projectConfigPath(projectRoot);
 
@@ -537,6 +545,36 @@ describe("host-name derivation", () => {
   });
 });
 
+describe("project-root derivation", () => {
+  test.each([
+    ["/work/omp-relayd", "omp-relayd"],
+    ["/work/omp-relayd/", "omp-relayd"],
+    ["/omp-relayd", "omp-relayd"],
+  ])("%p derives %p", (root, expected) => {
+    const derived = deriveProjectName(root);
+    expect(derived.ok).toBe(true);
+    if (!derived.ok) return;
+    expect(derived.value).toBe(expected);
+  });
+
+  // Every rule the relay's `validate_identifier` applies, checked here rather
+  // than at `hello`: a derived room the relay rejects would turn one startup
+  // message into a connect-reject loop. The table above is the control that
+  // keeps this one from passing by rejecting everything.
+  test.each([
+    ["/", "a root with no directory name"],
+    ["/work/omp@relayd", "a name containing @"],
+    [`/work/${"p".repeat(65)}`, "a name over the byte limit"],
+    ["/work/trailing ", "a name ending in whitespace"],
+  ])("%p is reported rather than repaired (%s)", (root) => {
+    const derived = deriveProjectName(root);
+    expect(derived.ok).toBe(false);
+    if (derived.ok) return;
+    expect(derived.problem.field).toBe("room.project");
+    expect(derived.problem.reason).toContain("pass project to the join request");
+  });
+});
+
 describe("precedence between the layers and a join request", () => {
   test("the project file supplies the room and derivation supplies the peer", async () => {
     const scope = await machine({ global: "transport:\n  mode: local\n  address: 127.0.0.1:7788\n" });
@@ -612,16 +650,16 @@ describe("precedence between the layers and a join request", () => {
     expect(outcome.resolved.projectPath).toBeNull();
   });
 
-  test("a room with no source names what is missing and where it looked", async () => {
+  test("no project file leaves only the task unsourced, because the root name supplies the project", async () => {
     const scope = await machine({ project: null });
     const outcome = await resolveClient({ env: scope.env, cwd: scope.projectRoot });
 
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
-    expect(outcome.problem.field).toBe("room.project");
-    expect(outcome.problem.reason).toContain("room.project and room.task");
+    expect(outcome.problem.field).toBe("room.task");
     expect(outcome.problem.reason).toContain(scope.projectPath);
-    console.log(`no room from either source: ${outcome.problem.reason}`);
+    expect(outcome.problem.reason).not.toContain("room.project");
+    console.log(`no project file: ${outcome.problem.reason}`);
   });
 
   test("a project file naming only the project reports the half that is missing", async () => {
@@ -632,7 +670,78 @@ describe("precedence between the layers and a join request", () => {
     if (outcome.ok) return;
     expect(outcome.problem.field).toBe("room.task");
     expect(outcome.problem.reason).toContain("room.task");
-    expect(outcome.problem.reason).not.toContain("room.project and");
+    expect(outcome.problem.reason).not.toContain("room.project");
+  });
+
+  test("the project-root basename supplies a missing project, attributed to derivation", async () => {
+    const scope = await machine({ project: null, rootName: "omp-relayd" });
+    const outcome = await resolveClient({
+      env: scope.env,
+      cwd: scope.projectRoot,
+      parameters: { task: "two-machine-check" },
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.resolved.config.room).toEqual({
+      project: "omp-relayd",
+      task: "two-machine-check",
+    });
+    expect(outcome.resolved.sources).toEqual({
+      project: "derivation",
+      task: "parameter",
+      peer: "global-file",
+    });
+    console.log(
+      `root ${scope.projectRoot} derived project "${outcome.resolved.config.room.project}" as ${outcome.resolved.sources.project}`,
+    );
+  });
+
+  test("a committed project outranks the basename, so a folder rename cannot move the room", async () => {
+    const scope = await machine({
+      project: "room:\n  project: shared\n  task: two-machine-check\n",
+      rootName: "renamed-clone",
+    });
+    const outcome = await resolveClient({ env: scope.env, cwd: scope.projectRoot });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.resolved.config.room.project).toBe("shared");
+    expect(outcome.resolved.sources.project).toBe("project-file");
+    console.log(
+      `root basename "renamed-clone" lost to the committed project "${outcome.resolved.config.room.project}"`,
+    );
+  });
+
+  test("an explicit project outranks both the project file and the basename", async () => {
+    const scope = await machine({ rootName: "omp-relayd" });
+    const outcome = await resolveClient({
+      env: scope.env,
+      cwd: scope.projectRoot,
+      parameters: { project: "acme" },
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.resolved.config.room.project).toBe("acme");
+    expect(outcome.resolved.sources.project).toBe("parameter");
+  });
+
+  test("a basename that is not an identifier is refused and asks for an explicit project", async () => {
+    const scope = await machine({ project: null, rootName: "omp@relayd" });
+    const outcome = await resolveClient({
+      env: scope.env,
+      cwd: scope.projectRoot,
+      parameters: { task: "two-machine-check" },
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.problem.field).toBe("room.project");
+    expect(outcome.problem.reason).toContain('reserved separator "@"');
+    expect(outcome.problem.reason).toContain("pass project to the join request");
+    expect(outcome.problem.reason).toContain(scope.projectPath);
+    console.log(`invalid basename refused: ${outcome.problem.reason}`);
   });
 
   test("an unusable host name fails naming peer.name rather than substituting one", async () => {
@@ -683,6 +792,31 @@ describe("precedence between the layers and a join request", () => {
     expect(there.resolved.config.room).toEqual({ project: "other-repo", task: "other-task" });
     console.log(
       `same global file, cwd ${first.projectRoot} resolved ${here.resolved.config.room.task}; cwd ${second.projectRoot} resolved ${there.resolved.config.room.task}`,
+    );
+  });
+
+  test("a moved working directory derives the new root's project, not the old one", async () => {
+    // The file-backed half of this is covered above. Derivation has to follow
+    // the same move: a cached basename would keep a session in the room of the
+    // checkout it started in, which is the failure nothing else would show.
+    const first = await machine({ project: null, rootName: "first-checkout" });
+    const second = await machine({ global: null, project: null, rootName: "second-checkout" });
+    const env: Environment = { HOME: first.env["HOME"], [AGENT_DIR_ENV]: first.agentDir };
+    const parameters = { task: "moved-root-check" };
+
+    const here = await resolveClient({ env, cwd: first.projectRoot, parameters });
+    expect(here.ok).toBe(true);
+    if (!here.ok) return;
+    expect(here.resolved.config.room.project).toBe("first-checkout");
+    expect(here.resolved.sources.project).toBe("derivation");
+
+    const there = await resolveClient({ env, cwd: second.projectRoot, parameters });
+    expect(there.ok).toBe(true);
+    if (!there.ok) return;
+    expect(there.resolved.config.room.project).toBe("second-checkout");
+    expect(there.resolved.sources.project).toBe("derivation");
+    console.log(
+      `same global file, cwd ${first.projectRoot} derived ${here.resolved.config.room.project}; cwd ${second.projectRoot} derived ${there.resolved.config.room.project}`,
     );
   });
 });
