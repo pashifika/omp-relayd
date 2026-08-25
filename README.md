@@ -24,7 +24,6 @@ OMP Relay lets two OMP terminals hand work to each other without sharing a proce
 - [Configuration](#configuration)
 - [Startup modes](#startup-modes)
 - [Manual setup](#manual-setup)
-- [Register the extension](#register-the-extension)
 - [Use the `mesh` tool](#use-the-mesh-tool)
 - [Verify two machines](#verify-two-machines)
 - [Protocol](#protocol)
@@ -56,9 +55,16 @@ Write both configuration files and install the extension and collaboration skill
 scripts/setup-client.sh --task code-review
 ```
 
-It reports the project root it resolved and the marker that decided it, writes `~/.omp/agent/omp-relay.yml` and `<project-root>/.omp/omp-relay.yml`, installs the extension to `~/.omp/agent/extensions/omp-relay/index.js`, and installs the `omp-relay` skill to `~/.omp/agent/skills/omp-relay/`. Run it with `--dry-run` first to see every file it would touch.
+It reports the project root it resolved and the marker that decided it, then writes four things:
 
-Re-running the helper keeps existing configuration files byte-for-byte unless `--force` is passed, but still refreshes the installed extension and skill.
+| Path | Holds |
+|---|---|
+| `~/.omp/agent/omp-relay.yml` | transport, startup mode, peer name |
+| `<project-root>/.omp/omp-relay.yml` | the room |
+| `~/.omp/agent/extensions/omp-relay/index.js` | the extension bundle |
+| `~/.omp/agent/skills/omp-relay/` | the collaboration skill |
+
+Run it with `--dry-run` first to see every file it would touch. Re-running it keeps both configuration files byte-for-byte unless `--force` is passed, and always refreshes the bundle and the skill.
 
 Its scope stops at the client: it installs no toolchain, starts no relay, and does not run the agent. Run `scripts/setup-client.sh --help` for every parameter and default, or see [Manual setup](#manual-setup) to do the same work by hand.
 
@@ -275,29 +281,18 @@ Everything `scripts/setup-client.sh` does, by hand. Do this if you would rather 
    (cd extension && bun install --frozen-lockfile && bun run build)
    ```
 
-5. Install the extension as in [Register the extension](#register-the-extension).
+   The build writes one ESM file with `@msgpack/msgpack` embedded, so nothing has to resolve beside it.
+
+5. Install the extension by copying that bundle into OMP's user extension directory:
+
+   ```bash
+   mkdir -p ~/.omp/agent/extensions/omp-relay
+   cp extension/dist/index.js ~/.omp/agent/extensions/omp-relay/index.js
+   ```
+
+   OMP discovers `<agent-dir>/extensions/<name>/index.js` on its own, so no `--extension` flag is needed.
+
 6. Start the agent from the repository root with `omp`.
-
-## Register the extension
-
-Registration copies the self-contained bundle into OMP's native user extension directory:
-
-```bash
-mkdir -p ~/.omp/agent/extensions/omp-relay
-cp extension/dist/index.js ~/.omp/agent/extensions/omp-relay/index.js
-```
-
-OMP discovers `<agent-dir>/extensions/<name>/index.js` automatically, so no `--extension` flag is required. `scripts/setup-client.sh` performs this copy using the active agent directory.
-
-Rebuild the bundle after changing `extension/src/`:
-
-```bash
-cd extension
-bun install --frozen-lockfile
-bun run build
-```
-
-The build produces the single ESM file `extension/dist/index.js`. It embeds `@msgpack/msgpack`; OMP supplies the runtime API and resolves no third-party package beside the bundle.
 
 ## Use the `mesh` tool
 
@@ -363,7 +358,7 @@ Both ends resolve the same room from the same committed project file, and each d
 3. B starts a turn carrying the sender, project, task, identifier, and body.
 4. In B: reply to A, setting `reply_to` to A's identifier. A receives the reply carrying that reference.
 
-Both checkouts carry the project file `setup-client.sh` wrote, so the room needs no parameters at all. To exercise derivation instead, delete `.omp/omp-relay.yml` on both machines and name the task and this session in the join: `Use the omp-relay skill to join two-machine-check/mac-worker.` Each end then derives `room.project` from its own checkout's directory name and reports the source as `derivation`. Two clones in differently named folders are two rooms, and the reported source is what shows it before any work is sent.
+To exercise derivation instead, delete `.omp/omp-relay.yml` on both machines and join by naming only the task and this session: `Use the omp-relay skill to join two-machine-check/mac-worker.` Each end then derives `room.project` from its own checkout's directory name and reports the source as `derivation`. Two clones in differently named folders are two rooms, and the reported source is what shows that before any work is sent.
 
 To rehearse the flow on one machine, give each session a distinct name explicitly — `--peer alpha` on one and `--peer beta` on the other, each with its own `--agent-dir`. That exercises routing but not derivation, which is the part only two hosts can show.
 
