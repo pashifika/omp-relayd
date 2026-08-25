@@ -794,6 +794,31 @@ describe("precedence between the layers and a join request", () => {
       `same global file, cwd ${first.projectRoot} resolved ${here.resolved.config.room.task}; cwd ${second.projectRoot} resolved ${there.resolved.config.room.task}`,
     );
   });
+
+  test("a moved working directory derives the new root's project, not the old one", async () => {
+    // The file-backed half of this is covered above. Derivation has to follow
+    // the same move: a cached basename would keep a session in the room of the
+    // checkout it started in, which is the failure nothing else would show.
+    const first = await machine({ project: null, rootName: "first-checkout" });
+    const second = await machine({ global: null, project: null, rootName: "second-checkout" });
+    const env: Environment = { HOME: first.env["HOME"], [AGENT_DIR_ENV]: first.agentDir };
+    const parameters = { task: "moved-root-check" };
+
+    const here = await resolveClient({ env, cwd: first.projectRoot, parameters });
+    expect(here.ok).toBe(true);
+    if (!here.ok) return;
+    expect(here.resolved.config.room.project).toBe("first-checkout");
+    expect(here.resolved.sources.project).toBe("derivation");
+
+    const there = await resolveClient({ env, cwd: second.projectRoot, parameters });
+    expect(there.ok).toBe(true);
+    if (!there.ok) return;
+    expect(there.resolved.config.room.project).toBe("second-checkout");
+    expect(there.resolved.sources.project).toBe("derivation");
+    console.log(
+      `same global file, cwd ${first.projectRoot} derived ${here.resolved.config.room.project}; cwd ${second.projectRoot} derived ${there.resolved.config.room.project}`,
+    );
+  });
 });
 
 describe("address parsing", () => {
