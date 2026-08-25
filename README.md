@@ -221,7 +221,7 @@ That is the path for a repository you cannot commit to. Because two mistyped roo
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PI_CODING_AGENT_DIR` | `~/.omp/agent` | The agent directory holding the global file and installed skills. OMP's own variable; a named profile sets it for you |
+| `PI_CODING_AGENT_DIR` | `~/.omp/agent` | Optional OMP override for the active agent directory holding the global file, skills, and extensions. The extension receives the resolved directory from OMP, so this variable is not required |
 | `OMP_PROJECT_ROOT` | discovered | Names the project root instead of discovering it |
 | `OMP_RELAY_BIND` | `127.0.0.1` | Host address published by Compose |
 | `RUST_LOG` | `info` | Relay log filter |

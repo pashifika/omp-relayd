@@ -22,6 +22,7 @@ import { join, resolve } from "node:path";
 
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
 import { AGENT_DIR_ENV, PROJECT_ROOT_ENV, projectConfigPath } from "../../src/config.ts";
 import { PACKAGE_ROOT, REPO_ROOT } from "../support/paths.ts";
@@ -38,6 +39,7 @@ const HELPER = join(REPO_ROOT, "scripts", "setup-client.sh");
 
 let relay: RelayProcess;
 const previousEnv: Record<string, string | undefined> = {};
+const previousAgentDir = getAgentDir();
 
 beforeAll(async () => {
   previousEnv[AGENT_DIR_ENV] = process.env[AGENT_DIR_ENV];
@@ -46,6 +48,7 @@ beforeAll(async () => {
 }, RELAY_SETUP_TIMEOUT_MS);
 
 afterAll(async () => {
+  setAgentDir(previousAgentDir);
   for (const [key, value] of Object.entries(previousEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -141,6 +144,7 @@ describe("the documented setup reaches a joined session", () => {
     const deployment = await mkdtemp(join(tmpdir(), "omp-relay-e2e-ext-"));
     const extensionPath = join(deployment, "index.js");
     await copyFile(BUNDLE, extensionPath);
+    setAgentDir(agentDir);
     const loaded = await loadExtensions([extensionPath], deployment);
     expect(loaded.errors).toEqual([]);
     expect(loaded.extensions).toHaveLength(1);
@@ -236,6 +240,7 @@ describe("the documented setup reaches a joined session", () => {
 
     process.env[AGENT_DIR_ENV] = agentDir;
     process.env[PROJECT_ROOT_ENV] = projectRoot;
+    setAgentDir(agentDir);
 
     // Three independent runtime instances from three copies of the committed
     // bundle. The copied paths defeat module-instance sharing; all three still

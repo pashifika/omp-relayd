@@ -1300,7 +1300,12 @@ export default function ompRelay(pi: ExtensionAPI): void {
     parameters: JoinParameters,
   ): Promise<JoinOutcome> => {
     const thisGeneration = ++generation;
-    const outcome = await resolveClient({ env: process.env, cwd: ctx.cwd, parameters });
+    const outcome = await resolveClient({
+      env: process.env,
+      cwd: ctx.cwd,
+      parameters,
+      agentDir: pi.pi.getAgentDir(),
+    });
     if (thisGeneration !== generation) {
       return {
         ok: false,
@@ -1501,7 +1506,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
     // Only the global layer, and only to learn the startup mode. Under `manual`
     // nothing further is read and no socket is opened, so a session in a
     // checkout this machine never meant to join stays inert.
-    const global = await loadGlobalConfig(process.env);
+    const global = await loadGlobalConfig(process.env, pi.pi.getAgentDir());
     if (thisGeneration !== generation) {
       return;
     }

@@ -206,7 +206,7 @@ interface FactoryHarness {
   readonly runtimeCalls: { sendMessage: number };
 }
 
-function factoryHarness(): FactoryHarness {
+function factoryHarness(agentDirectory?: string): FactoryHarness {
   const handlers = new Map<string, SessionHandler>();
   const tools: Array<Record<string, unknown>> = [];
   const runtimeCalls = { sendMessage: 0 };
@@ -241,6 +241,11 @@ function factoryHarness(): FactoryHarness {
       },
       object() {
         return chain;
+      },
+    },
+    pi: {
+      getAgentDir() {
+        return agentDirectory ?? process.env[AGENT_DIR_ENV] ?? join(tmpdir(), "omp-relay-unconfigured-agent");
       },
     },
     logger: { error() {} },
@@ -357,6 +362,37 @@ describe("extension registration", () => {
     expect(notifications[0]?.message).toContain("transport.mode");
     expect(notifications[0]?.type).toBe("error");
     console.log(`session start reported: ${notifications[0]?.message}`);
+  });
+
+  test("the host agent directory works without HOME or PI_CODING_AGENT_DIR", async () => {
+    const directory = agentDir("transport:\n  mode: private\n  address: 127.0.0.1:7788\n");
+    const notifications: string[] = [];
+    const harness = factoryHarness(directory);
+    ompRelay(harness.api);
+    const previousHome = process.env["HOME"];
+    const previousAgentDir = process.env[AGENT_DIR_ENV];
+    delete process.env["HOME"];
+    delete process.env[AGENT_DIR_ENV];
+    try {
+      await harness.handlers.get("session_start")?.(
+        { type: "session_start" },
+        context({
+          ui: {
+            notify(message) {
+              notifications.push(message);
+            },
+          } as ExtensionContext["ui"],
+        }),
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = previousHome;
+      if (previousAgentDir === undefined) delete process.env[AGENT_DIR_ENV];
+      else process.env[AGENT_DIR_ENV] = previousAgentDir;
+    }
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]).toContain("transport.mode");
   });
 
   test("a non-interactive session does not read configuration or start a client", async () => {

@@ -183,6 +183,13 @@ describe("the global layer's path", () => {
     expect(resolved.path).toBe("/opt/profiles/work/agent/omp-relay.yml");
   });
 
+  test("the host agent directory does not require HOME or an environment override", () => {
+    const resolved = globalConfigPath({}, "/profiles/work/agent");
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    expect(resolved.path).toBe("/profiles/work/agent/omp-relay.yml");
+  });
+
   test("the default is one documented location under HOME", () => {
     const resolved = globalConfigPath({ HOME: "/home/dev" });
     expect(resolved.ok).toBe(true);

@@ -35,10 +35,10 @@
  * the extension stays inert: the global file is the grant, so a cloned
  * repository alone can never cause a connection.
  *
- * There is no search path, no merging beyond that fixed placement, and no
- * environment variable that replaces a whole file. `PI_CODING_AGENT_DIR`
- * relocates the agent directory and `OMP_PROJECT_ROOT` names the project root;
- * both are the host's own variables rather than this extension's.
+ * There is no search path and no merging beyond that fixed placement. At
+ * runtime the host supplies its active agent directory, including the Windows
+ * default and named profiles. `PI_CODING_AGENT_DIR` remains the fallback for
+ * direct callers, and `OMP_PROJECT_ROOT` names the project root.
  *
  * Every failure here is returned, never thrown. A host that fails to start
  * because an optional feature's configuration file is absent is worse than one
@@ -253,6 +253,8 @@ export type Environment = Readonly<Record<string, string | undefined>>;
 /** What {@link resolveClient} needs. Only `env` and `cwd` are required. */
 export interface ResolveOptions {
   readonly env: Environment;
+  /** The active agent directory reported by the host. */
+  readonly agentDir?: string;
   /** The session's working directory, from which the project root is found. */
   readonly cwd: string;
   /** A join request's overrides, when the resolution was triggered by one. */
@@ -313,12 +315,17 @@ export function resolveProjectRoot(env: Environment, cwd: string): ProjectRoot {
 /**
  * Resolves the global layer's path.
  *
- * `HOME` is consulted only to build the default: when {@link AGENT_DIR_ENV} is
- * set, `HOME` is not read at all.
+ * `agentDir` is the host's authoritative active directory. The environment
+ * variable remains a fallback for direct callers and tests that run without an
+ * {@link ExtensionAPI}.
  */
 export function globalConfigPath(
   env: Environment,
+  agentDir?: string,
 ): { readonly ok: true; readonly path: string } | { readonly ok: false; readonly problem: ConfigProblem } {
+  if (agentDir !== undefined && agentDir.length > 0) {
+    return { ok: true, path: join(agentDir, CONFIG_FILE_NAME) };
+  }
   const override = env[AGENT_DIR_ENV];
   if (override !== undefined && override.length > 0) {
     return { ok: true, path: join(override, CONFIG_FILE_NAME) };
@@ -380,8 +387,8 @@ async function parseFile(path: string): Promise<ParseOutcome> {
  * Never throws: a missing file, unparseable YAML, and a rejected field all
  * return `ok: false` with a reason the caller reports once.
  */
-export async function loadGlobalConfig(env: Environment): Promise<GlobalOutcome> {
-  const resolved = globalConfigPath(env);
+export async function loadGlobalConfig(env: Environment, agentDir?: string): Promise<GlobalOutcome> {
+  const resolved = globalConfigPath(env, agentDir);
   if (!resolved.ok) {
     return { ok: false, path: null, absent: false, problem: resolved.problem };
   }
@@ -644,7 +651,7 @@ export function derivePeerName(
  * rather than the one it started under.
  */
 export async function resolveClient(options: ResolveOptions): Promise<ResolveOutcome> {
-  const global = await loadGlobalConfig(options.env);
+  const global = await loadGlobalConfig(options.env, options.agentDir);
   if (!global.ok) {
     return { ok: false, path: global.path, absent: global.absent, problem: global.problem };
   }
