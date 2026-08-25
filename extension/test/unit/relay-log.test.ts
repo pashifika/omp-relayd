@@ -51,13 +51,30 @@ describe("startup line parsing", () => {
     ).toEqual({ host: "[::1]", port: 7788 });
   });
 
-  test.each([
-    ["another log event", "  INFO omp_relayd: termination signal received"],
-    ["the bind-failure event", "  ERROR omp_relayd: could not bind listener listen=x"],
-    ["a port that is not a number", "relay listening local_addr=127.0.0.1:http"],
-    ["a port out of range", "relay listening local_addr=127.0.0.1:70000"],
-    ["no port at all", "relay listening local_addr=127.0.0.1"],
-  ])("%s is not a bound address", (_label, line) => {
+  const notAnAddress = [
+    {
+      scenario: "another log event is not a bound address",
+      line: "  INFO omp_relayd: termination signal received",
+    },
+    {
+      scenario: "the bind-failure event is not a bound address",
+      line: "  ERROR omp_relayd: could not bind listener listen=x",
+    },
+    {
+      scenario: "a port that is not a number is not a bound address",
+      line: "relay listening local_addr=127.0.0.1:http",
+    },
+    {
+      scenario: "a port out of range is not a bound address",
+      line: "relay listening local_addr=127.0.0.1:70000",
+    },
+    {
+      scenario: "no port at all is not a bound address",
+      line: "relay listening local_addr=127.0.0.1",
+    },
+  ];
+
+  test.each(notAnAddress)("$scenario", ({ line }) => {
     expect(parseListeningAddress(line)).toBeNull();
   });
 });

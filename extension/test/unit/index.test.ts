@@ -45,6 +45,7 @@ import ompRelay, {
   type AnnouncedDetails,
   type JoinOutcome,
   type JoinReport,
+  type MeshArguments,
   type MeshClient,
   type MeshHost,
   type OutboundDetails,
@@ -425,11 +426,25 @@ describe("extension registration", () => {
 });
 
 describe("mesh join", () => {
-  test.each([
-    ["project", { action: "join", project: "a/b" }],
-    ["task", { action: "join", task: "  spaced  " }],
-    ["as", { action: "join", as: "a@b" }],
-  ])("names %s as the parameter it refused, before any socket write", async (name, args) => {
+  const refusedParameters: { readonly scenario: string; readonly name: string; readonly args: MeshArguments }[] = [
+    {
+      scenario: "names project as the parameter it refused, before any socket write",
+      name: "project",
+      args: { action: "join", project: "a/b" },
+    },
+    {
+      scenario: "names task as the parameter it refused, before any socket write",
+      name: "task",
+      args: { action: "join", task: "  spaced  " },
+    },
+    {
+      scenario: "names as as the parameter it refused, before any socket write",
+      name: "as",
+      args: { action: "join", as: "a@b" },
+    },
+  ];
+
+  test.each(refusedParameters)("$scenario", async ({ name, args }) => {
     const host = new RecordingHost();
 
     const output = await executeMesh(host, args);
@@ -439,10 +454,12 @@ describe("mesh join", () => {
     expect(host.joins).toEqual([]);
   });
 
-  test.each([
-    ["project", { action: "join", project: 7 }],
-    ["task", { action: "join", task: false }],
-  ])("a non-string %s is refused", async (name, args) => {
+  const nonStringParameters: { readonly scenario: string; readonly name: string; readonly args: MeshArguments }[] = [
+    { scenario: "a non-string project is refused", name: "project", args: { action: "join", project: 7 } },
+    { scenario: "a non-string task is refused", name: "task", args: { action: "join", task: false } },
+  ];
+
+  test.each(nonStringParameters)("$scenario", async ({ name, args }) => {
     const host = new RecordingHost();
 
     const output = await executeMesh(host, args);
@@ -604,16 +621,39 @@ describe("mesh join", () => {
 });
 
 describe("mesh tool", () => {
-  test.each([
-    ["unknown action", { action: "wait" }],
-    ["empty target", { action: "send", to: "", message: "work" }],
-    ["missing message", { action: "send", to: "beta" }],
-    ["a non-string reply_to", { action: "send", to: "beta", message: "work", reply_to: 7 }],
-    ["an unusable reply_to", { action: "send", to: "beta", message: "work", reply_to: "" }],
-    ["an announcement with no message", { action: "announce" }],
-    ["an announcement with a non-string message", { action: "announce", message: 7 }],
-    ["an announcement with an unusable reply_to", { action: "announce", message: "x", reply_to: "" }],
-  ])("rejects %s before contacting the client", async (_name, args) => {
+  const malformedCalls: { readonly scenario: string; readonly args: MeshArguments }[] = [
+    { scenario: "rejects an unknown action before contacting the client", args: { action: "wait" } },
+    {
+      scenario: "rejects an empty target before contacting the client",
+      args: { action: "send", to: "", message: "work" },
+    },
+    {
+      scenario: "rejects a missing message before contacting the client",
+      args: { action: "send", to: "beta" },
+    },
+    {
+      scenario: "rejects a non-string reply_to before contacting the client",
+      args: { action: "send", to: "beta", message: "work", reply_to: 7 },
+    },
+    {
+      scenario: "rejects an unusable reply_to before contacting the client",
+      args: { action: "send", to: "beta", message: "work", reply_to: "" },
+    },
+    {
+      scenario: "rejects an announcement with no message before contacting the client",
+      args: { action: "announce" },
+    },
+    {
+      scenario: "rejects an announcement with a non-string message before contacting the client",
+      args: { action: "announce", message: 7 },
+    },
+    {
+      scenario: "rejects an announcement with an unusable reply_to before contacting the client",
+      args: { action: "announce", message: "x", reply_to: "" },
+    },
+  ];
+
+  test.each(malformedCalls)("$scenario", async ({ args }) => {
     const client = new RecordingClient();
     const host = new RecordingHost(client);
 
@@ -627,36 +667,63 @@ describe("mesh tool", () => {
     expect(host.announced).toEqual([]);
   });
 
-  test.each([
-    ["to", { action: "announce", message: "everyone", to: "beta" }, '"send"'],
-    ["project", { action: "announce", message: "everyone", project: "other" }, '"join"'],
-    ["task", { action: "announce", message: "everyone", task: "room" }, '"join"'],
-    ["as", { action: "announce", message: "everyone", as: "gamma" }, '"join"'],
-  ])(
-    "an announcement carrying %s is refused, naming it and the action that takes it",
-    async (field, args, pointsAt) => {
-      // A model that supplied one of these believed it was addressing something
-      // else: `to` one peer, `project`/`task` another room, `as` under another
-      // name. Announcing anyway would broadcast into the room this session
-      // already holds, under the name it already registered -- the wrong peers,
-      // silently, which is worse than a stated refusal.
-      const client = new RecordingClient();
-      const host = new RecordingHost(client);
+  interface MisdirectedAnnounce {
+    readonly scenario: string;
+    readonly field: string;
+    readonly args: MeshArguments;
+    /** The action that does take the field, quoted as the refusal quotes it. */
+    readonly pointsAt: string;
+  }
 
-      const output = await executeMesh(host, args);
-
-      const text = output.content[0]?.text ?? "";
-      expect(text).toStartWith("Invalid mesh arguments:");
-      expect(text).toContain(`no ${field}`);
-      expect(text).toContain(pointsAt);
-      // Refused is only half the property. The defect this covers did refuse
-      // `to` and accepted the other three, so nothing-was-sent is what catches
-      // it: both the relay call and the session record must be absent.
-      expect(client.announcements).toEqual([]);
-      expect(client.sends).toEqual([]);
-      expect(host.announced).toEqual([]);
+  const misdirected: MisdirectedAnnounce[] = [
+    {
+      scenario: "an announcement carrying to is refused, naming it and the action that takes it",
+      field: "to",
+      args: { action: "announce", message: "everyone", to: "beta" },
+      pointsAt: '"send"',
     },
-  );
+    {
+      scenario: "an announcement carrying project is refused, naming it and the action that takes it",
+      field: "project",
+      args: { action: "announce", message: "everyone", project: "other" },
+      pointsAt: '"join"',
+    },
+    {
+      scenario: "an announcement carrying task is refused, naming it and the action that takes it",
+      field: "task",
+      args: { action: "announce", message: "everyone", task: "room" },
+      pointsAt: '"join"',
+    },
+    {
+      scenario: "an announcement carrying as is refused, naming it and the action that takes it",
+      field: "as",
+      args: { action: "announce", message: "everyone", as: "gamma" },
+      pointsAt: '"join"',
+    },
+  ];
+
+  test.each(misdirected)("$scenario", async ({ field, args, pointsAt }) => {
+    // A model that supplied one of these believed it was addressing something
+    // else: `to` one peer, `project`/`task` another room, `as` under another
+    // name. Announcing anyway would broadcast into the room this session
+    // already holds, under the name it already registered -- the wrong peers,
+    // silently, which is worse than a stated refusal.
+    const client = new RecordingClient();
+    const host = new RecordingHost(client);
+
+    const output = await executeMesh(host, args);
+
+    const text = output.content[0]?.text ?? "";
+    expect(text).toStartWith("Invalid mesh arguments:");
+    expect(text).toContain(`no ${field}`);
+    expect(text).toContain(pointsAt);
+    // Refused is only half the property. The defect this covers did refuse
+    // `to` and accepted the other three, so nothing-was-sent is what catches
+    // it: both the relay call and the session record must be absent.
+    expect(client.announcements).toEqual([]);
+    expect(client.sends).toEqual([]);
+    expect(host.announced).toEqual([]);
+  });
 
   test("list reports every peer returned by the relay", async () => {
     const client = new RecordingClient();
@@ -819,11 +886,25 @@ describe("mesh tool", () => {
     expect(host.announced).toEqual([]);
   });
 
-  test.each([
-    ["peer_offline", "is offline"],
-    ["recipient_backpressure", "queue is full"],
-    ["invalid_target", "not a valid target"],
-  ] as const)("gives %s a distinct result", async (status, wording) => {
+  const receipts: {
+    readonly scenario: string;
+    readonly status: ReceiptFrame["status"];
+    readonly wording: string;
+  }[] = [
+    { scenario: "gives peer_offline a distinct result", status: "peer_offline", wording: "is offline" },
+    {
+      scenario: "gives recipient_backpressure a distinct result",
+      status: "recipient_backpressure",
+      wording: "queue is full",
+    },
+    {
+      scenario: "gives invalid_target a distinct result",
+      status: "invalid_target",
+      wording: "not a valid target",
+    },
+  ];
+
+  test.each(receipts)("$scenario", async ({ status, wording }) => {
     const client = new RecordingClient();
     client.receiptStatus = status;
 
@@ -1266,10 +1347,18 @@ describe("mesh attachments", () => {
     expect(JSON.stringify(host.records[0])).not.toContain("diff --git");
   });
 
-  test.each([
-    ["send", { action: "send", to: "windows-main", message: "x", attach: "/absent" }],
-    ["announce", { action: "announce", message: "x", attach: "/absent" }],
-  ])("an unreadable path fails the %s before any reserve", async (_name, args) => {
+  const unreadableAttachments: { readonly scenario: string; readonly args: MeshArguments }[] = [
+    {
+      scenario: "an unreadable path fails the send before any reserve",
+      args: { action: "send", to: "windows-main", message: "x", attach: "/absent" },
+    },
+    {
+      scenario: "an unreadable path fails the announce before any reserve",
+      args: { action: "announce", message: "x", attach: "/absent" },
+    },
+  ];
+
+  test.each(unreadableAttachments)("$scenario", async ({ args }) => {
     const host = new RecordingHost();
     const client = host.client as RecordingClient;
 
@@ -1282,11 +1371,36 @@ describe("mesh attachments", () => {
     expect(client.announcements).toEqual([]);
   });
 
-  test.each([
-    ["payload_too_large" as const],
-    ["room_full" as const],
-    ["store_full" as const],
-  ])("a %s refusal sends nothing rather than dropping the attachment", async (status) => {
+  interface RefusalCase {
+    readonly scenario: string;
+    readonly status: "payload_too_large" | "room_full" | "store_full";
+    /**
+     * The recovery the refusal must offer. It differs by bound: a payload over
+     * the maximum will never fit, so telling a caller to wait would send it in
+     * a circle.
+     */
+    readonly recovery: string;
+  }
+
+  const refusals: RefusalCase[] = [
+    {
+      scenario: "a payload_too_large refusal sends nothing rather than dropping the attachment",
+      status: "payload_too_large",
+      recovery: "waiting will not help",
+    },
+    {
+      scenario: "a room_full refusal sends nothing rather than dropping the attachment",
+      status: "room_full",
+      recovery: "retrying later",
+    },
+    {
+      scenario: "a store_full refusal sends nothing rather than dropping the attachment",
+      status: "store_full",
+      recovery: "retrying later",
+    },
+  ];
+
+  test.each(refusals)("$scenario", async ({ status, recovery }) => {
     const host = hostWithFile();
     const client = host.client as RecordingClient;
     client.attachFailure = new RequestFailed("refused", `the relay refused: ${status}`, {
@@ -1305,11 +1419,7 @@ describe("mesh attachments", () => {
     expect(output.details["refusal"]).toBe(status);
     expect(client.sends).toEqual([]);
     expect(host.records).toEqual([]);
-    // The recovery differs by bound: a payload over the maximum will never fit,
-    // so telling a caller to wait would send it in a circle.
-    expect(output.content[0]?.text).toContain(
-      status === "payload_too_large" ? "waiting will not help" : "retrying later",
-    );
+    expect(output.content[0]?.text).toContain(recovery);
     console.log(`${status} reported: ${output.content[0]?.text}`);
   });
 
@@ -1411,15 +1521,21 @@ describe("mesh attachments", () => {
     expect(host.saved.size).toBe(0);
   });
 
-  test("a malformed reference is refused before any request", async () => {
+  const malformedReferences = [
+    { scenario: "an empty reference is refused before any request", bad: "" },
+    { scenario: "a short reference is refused before any request", bad: "short" },
+    { scenario: "an over-long reference is refused before any request", bad: "A".repeat(44) },
+    { scenario: "a traversal reference is refused before any request", bad: "../../etc/passwd" },
+  ];
+
+  test.each(malformedReferences)("$scenario", async ({ bad }) => {
     const host = new RecordingHost();
     const client = host.client as RecordingClient;
 
-    for (const bad of ["", "short", "A".repeat(44), "../../etc/passwd"]) {
-      const output = await executeMesh(host, { action: "fetch", reference: bad });
-      expect(output.content[0]?.text).toStartWith("Invalid mesh arguments:");
-      expect(output.content[0]?.text).toContain("reference");
-    }
+    const output = await executeMesh(host, { action: "fetch", reference: bad });
+
+    expect(output.content[0]?.text).toStartWith("Invalid mesh arguments:");
+    expect(output.content[0]?.text).toContain("reference");
     expect(client.fetches).toEqual([]);
     expect(client.lengths).toEqual([]);
   });
@@ -1441,14 +1557,19 @@ describe("mesh attachments", () => {
     },
   );
 
-  test("a negative or fractional ceiling is refused", async () => {
+  const unusableCeilings: { readonly scenario: string; readonly bad: unknown }[] = [
+    { scenario: "a negative ceiling is refused", bad: -1 },
+    { scenario: "a fractional ceiling is refused", bad: 1.5 },
+    { scenario: "a ceiling given as a string is refused", bad: "1024" },
+  ];
+
+  test.each(unusableCeilings)("$scenario", async ({ bad }) => {
     const host = new RecordingHost();
     const reference = await digestOf(PAYLOAD);
 
-    for (const bad of [-1, 1.5, "1024"]) {
-      const output = await executeMesh(host, { action: "fetch", reference, max_bytes: bad });
-      expect(output.content[0]?.text).toContain("max_bytes must be a non-negative integer");
-    }
+    const output = await executeMesh(host, { action: "fetch", reference, max_bytes: bad });
+
+    expect(output.content[0]?.text).toContain("max_bytes must be a non-negative integer");
   });
 
   test("an inbound reference is rendered, not downloaded", async () => {

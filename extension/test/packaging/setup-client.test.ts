@@ -116,10 +116,24 @@ describe("the helper and the extension agree on their shared constants", () => {
     console.log(`shared project markers (${fromScript.length}): ${fromScript.join(", ")}`);
   });
 
-  test.each([
-    ["MAX_IDENTIFIER_BYTES", MAX_IDENTIFIER_BYTES],
-    ["MAX_PURPOSE_BYTES", MAX_PURPOSE_BYTES],
-  ])("%s matches the extension's value", (name, expected) => {
+  const sharedConstants: {
+    readonly scenario: string;
+    readonly name: string;
+    readonly expected: number;
+  }[] = [
+    {
+      scenario: "MAX_IDENTIFIER_BYTES matches the extension's value",
+      name: "MAX_IDENTIFIER_BYTES",
+      expected: MAX_IDENTIFIER_BYTES,
+    },
+    {
+      scenario: "MAX_PURPOSE_BYTES matches the extension's value",
+      name: "MAX_PURPOSE_BYTES",
+      expected: MAX_PURPOSE_BYTES,
+    },
+  ];
+
+  test.each(sharedConstants)("$scenario", ({ name, expected }) => {
     const found = new RegExp(`readonly ${name}=(\\d+)`).exec(source)?.[1];
     expect(found).toBeDefined();
     expect(Number(found)).toBe(expected);
@@ -303,12 +317,17 @@ describe("a value YAML would reinterpret is written so YAML does not", () => {
     return outcome.resolved;
   }
 
-  test.each([
-    ["a leading # is part of the task, not a comment", "#471"],
-    ["a colon and space is part of the task, not a mapping", "triage: parser errors"],
-    ["a leading ! is part of the task, not a tag", "!urgent"],
-    ["a quote and a backslash stay literal", 'say "hi" \\ then go'],
-  ])("%s", async (_label, task) => {
+  const literalTasks = [
+    { scenario: "a leading # is part of the task, not a comment", task: "#471" },
+    {
+      scenario: "a colon and space is part of the task, not a mapping",
+      task: "triage: parser errors",
+    },
+    { scenario: "a leading ! is part of the task, not a tag", task: "!urgent" },
+    { scenario: "a quote and a backslash stay literal", task: 'say "hi" \\ then go' },
+  ];
+
+  test.each(literalTasks)("$scenario", async ({ task }) => {
     const resolved = await resolveWhatItWrote(["--task", task]);
 
     expect(resolved.config.room.task).toBe(task);
@@ -455,29 +474,32 @@ describe("the helper's verdict is the extension's verdict", () => {
   // so both have to reach the same verdict on that name. The helper writes the
   // file the extension then reads; a name one accepts and the other rejects
   // would be a setup that validates at write time and fails at join time.
-  test.each([
-    ["omp-relayd", true],
-    ["omp@relayd", false],
-  ])("a project root named %p, with no --project", async (name, accepted) => {
+  /**
+   * Runs the helper in a project root named `name`, with no `--project`, so the
+   * name is what both sides have to reach a verdict on.
+   *
+   * A builder rather than a column: the two verdicts assert entirely different
+   * things — one that nothing was written, one that the extension reads back
+   * what the helper wrote — so a single body would have to branch on its own
+   * case, and a table whose body branches is two tests wearing one name.
+   */
+  async function setUpUnderRootNamed(name: string) {
     const { agentDir } = scratch();
     const parent = mkdtempSync(join(tmpdir(), "omp-relay-setup-parent-"));
     const projectRoot = join(parent, name);
     mkdirSync(projectRoot, { recursive: true });
 
     const derived = deriveProjectName(projectRoot);
-    expect(derived.ok).toBe(accepted);
-
     const result = await run(["--task", "t", "--agent-dir", agentDir, "--project-root", projectRoot]);
 
-    if (!accepted) {
-      expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain("room.project");
-      expect(snapshot(agentDir)).toEqual({});
-      expect(existsSync(projectConfigPath(projectRoot))).toBe(false);
-      console.log(`both refused the root name ${JSON.stringify(name)}: ${result.stderr.trim()}`);
-      return;
-    }
+    return { agentDir, parent, projectRoot, derived, result };
+  }
 
+  test("a project root with a usable name, and no --project, is read back by the extension", async () => {
+    const name = "omp-relayd";
+    const { agentDir, parent, projectRoot, derived, result } = await setUpUnderRootNamed(name);
+
+    expect(derived.ok).toBe(true);
     expect(result.code).toBe(0);
     if (!derived.ok) return;
     expect(derived.value).toBe(name);
@@ -493,17 +515,58 @@ describe("the helper's verdict is the extension's verdict", () => {
       `helper wrote and the extension read project ${resolved.resolved.config.room.project}, source ${resolved.resolved.sources.project}`,
     );
   });
+
+  test("a project root whose name the extension refuses is refused by the helper too, writing nothing", async () => {
+    const name = "omp@relayd";
+    const { agentDir, projectRoot, derived, result } = await setUpUnderRootNamed(name);
+
+    expect(derived.ok).toBe(false);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("room.project");
+    expect(snapshot(agentDir)).toEqual({});
+    expect(existsSync(projectConfigPath(projectRoot))).toBe(false);
+    console.log(`both refused the root name ${JSON.stringify(name)}: ${result.stderr.trim()}`);
+  });
 });
 
 describe("the helper preserves existing state and refuses unsafe writes", () => {
-  test.each([
-    ["a task containing /", ["--task", "feat/x"], "room.task"],
-    ["a task with trailing whitespace", ["--task", "review "], "room.task"],
-    ["a peer name over 64 UTF-8 bytes", ["--task", "t", "--peer", "p".repeat(65)], "peer.name"],
-    ["a peer name containing @", ["--task", "t", "--peer", "a@b"], "peer.name"],
-    ["an unrecognized startup mode", ["--task", "t", "--startup", "automatic"], "--startup"],
-    ["an address with no port", ["--task", "t", "--address", "127.0.0.1"], "--address"],
-  ])("%s writes nothing", async (_label, args, named) => {
+  interface RefusedInvocation {
+    readonly scenario: string;
+    readonly args: readonly string[];
+    /** What the refusal must name: a configuration field or the flag itself. */
+    readonly named: string;
+  }
+
+  const refusedInvocations: RefusedInvocation[] = [
+    { scenario: "a task containing / writes nothing", args: ["--task", "feat/x"], named: "room.task" },
+    {
+      scenario: "a task with trailing whitespace writes nothing",
+      args: ["--task", "review "],
+      named: "room.task",
+    },
+    {
+      scenario: "a peer name over 64 UTF-8 bytes writes nothing",
+      args: ["--task", "t", "--peer", "p".repeat(65)],
+      named: "peer.name",
+    },
+    {
+      scenario: "a peer name containing @ writes nothing",
+      args: ["--task", "t", "--peer", "a@b"],
+      named: "peer.name",
+    },
+    {
+      scenario: "an unrecognized startup mode writes nothing",
+      args: ["--task", "t", "--startup", "automatic"],
+      named: "--startup",
+    },
+    {
+      scenario: "an address with no port writes nothing",
+      args: ["--task", "t", "--address", "127.0.0.1"],
+      named: "--address",
+    },
+  ];
+
+  test.each(refusedInvocations)("$scenario", async ({ args, named }) => {
     const { agentDir, projectRoot } = scratch();
     const before = snapshot(agentDir);
 
@@ -717,35 +780,84 @@ describe("the helper preserves existing state and refuses unsafe writes", () => 
   // file, the global file was already replaced when the project parent failed.
   // Every path the helper creates or writes has a knowable type beforehand, so
   // the wrong one is refused by name beside the symlink cases above.
-  test.each([
-    ["the agent directory", "agent", "", "file", "is not a directory"],
-    ["the global file", "agent", CONFIG_FILE_NAME, "directory", "is not a regular file"],
-    ["the skills directory", "agent", "skills", "file", "is not a directory"],
-    ["the skill target", "agent", join("skills", "omp-relay"), "file", "is not a directory"],
-    ["the extensions directory", "agent", "extensions", "file", "is not a directory"],
-    [
-      "the extension target",
-      "agent",
-      join("extensions", "omp-relay"),
-      "file",
-      "is not a directory",
-    ],
-    [
-      "the extension bundle",
-      "agent",
-      join("extensions", "omp-relay", "index.js"),
-      "directory",
-      "is not a regular file",
-    ],
-    ["the project's .omp", "project", ".omp", "file", "is not a directory"],
-    [
-      "the project file",
-      "project",
-      join(".omp", CONFIG_FILE_NAME),
-      "directory",
-      "is not a regular file",
-    ],
-  ])("%s of the wrong type is refused with nothing written", async (_label, owner, rel, kind, wording) => {
+  interface WrongTypeCase {
+    readonly scenario: string;
+    /** Which tree holds the path: the agent directory or the project root. */
+    readonly owner: "agent" | "project";
+    /** The path inside that tree, relative to it. */
+    readonly rel: string;
+    /** What is put there instead of what the helper would create. */
+    readonly kind: "file" | "directory";
+    readonly wording: string;
+  }
+
+  const wrongTypes: WrongTypeCase[] = [
+    {
+      scenario: "the agent directory of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: "",
+      kind: "file",
+      wording: "is not a directory",
+    },
+    {
+      scenario: "the global file of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: CONFIG_FILE_NAME,
+      kind: "directory",
+      wording: "is not a regular file",
+    },
+    {
+      scenario: "the skills directory of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: "skills",
+      kind: "file",
+      wording: "is not a directory",
+    },
+    {
+      scenario: "the skill target of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: join("skills", "omp-relay"),
+      kind: "file",
+      wording: "is not a directory",
+    },
+    {
+      scenario: "the extensions directory of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: "extensions",
+      kind: "file",
+      wording: "is not a directory",
+    },
+    {
+      scenario: "the extension target of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: join("extensions", "omp-relay"),
+      kind: "file",
+      wording: "is not a directory",
+    },
+    {
+      scenario: "the extension bundle of the wrong type is refused with nothing written",
+      owner: "agent",
+      rel: join("extensions", "omp-relay", "index.js"),
+      kind: "directory",
+      wording: "is not a regular file",
+    },
+    {
+      scenario: "the project's .omp of the wrong type is refused with nothing written",
+      owner: "project",
+      rel: ".omp",
+      kind: "file",
+      wording: "is not a directory",
+    },
+    {
+      scenario: "the project file of the wrong type is refused with nothing written",
+      owner: "project",
+      rel: join(".omp", CONFIG_FILE_NAME),
+      kind: "directory",
+      wording: "is not a regular file",
+    },
+  ];
+
+  test.each(wrongTypes)("$scenario", async ({ owner, rel, kind, wording }) => {
     // The agent directory is nested one level down so that the case where it is
     // itself a regular file still has a directory to snapshot.
     const agentParent = mkdtempSync(join(tmpdir(), "omp-relay-setup-agent-"));
@@ -859,20 +971,40 @@ describe("a second checkout of the same repository can still set itself up", () 
   // to be committed by a person, a person writes `project: shared`, and the
   // helper always writes `project: "shared"`, so a comparing helper refuses the
   // normal case. The rest are what a colleague's checkout and editor do to it.
-  test.each([
-    ["plain unquoted scalars, as a person writes them", "room:\n  project: shared\n  task: two-machine-check\n"],
-    [
-      "CRLF line endings, as a Windows checkout commits them",
-      "room:\r\n  project: shared\r\n  task: two-machine-check\r\n",
-    ],
-    ["a trailing blank line", 'room:\n  project: "shared"\n  task: "two-machine-check"\n\n'],
-    ["leading indentation", "  room:\n    project: shared\n    task: two-machine-check\n"],
-    ["an interior blank line", "room:\n\n  project: shared\n  task: two-machine-check\n"],
-    [
-      "a comment",
-      "# the room for this pairing session; both machines read it\nroom:\n  project: shared\n  task: two-machine-check\n",
-    ],
-  ])("a committed file written with %s is kept and machine B set up around it", async (label, text) => {
+  const committedShapes = [
+    {
+      scenario: "a committed file of plain unquoted scalars is kept and machine B set up around it",
+      shape: "plain unquoted scalars, as a person writes them",
+      text: "room:\n  project: shared\n  task: two-machine-check\n",
+    },
+    {
+      scenario: "a committed file with CRLF line endings is kept and machine B set up around it",
+      shape: "CRLF line endings, as a Windows checkout commits them",
+      text: "room:\r\n  project: shared\r\n  task: two-machine-check\r\n",
+    },
+    {
+      scenario: "a committed file with a trailing blank line is kept and machine B set up around it",
+      shape: "a trailing blank line",
+      text: 'room:\n  project: "shared"\n  task: "two-machine-check"\n\n',
+    },
+    {
+      scenario: "a committed file with leading indentation is kept and machine B set up around it",
+      shape: "leading indentation",
+      text: "  room:\n    project: shared\n    task: two-machine-check\n",
+    },
+    {
+      scenario: "a committed file with an interior blank line is kept and machine B set up around it",
+      shape: "an interior blank line",
+      text: "room:\n\n  project: shared\n  task: two-machine-check\n",
+    },
+    {
+      scenario: "a committed file with a comment is kept and machine B set up around it",
+      shape: "a comment",
+      text: "# the room for this pairing session; both machines read it\nroom:\n  project: shared\n  task: two-machine-check\n",
+    },
+  ];
+
+  test.each(committedShapes)("$scenario", async ({ shape, text }) => {
     const { projectRoot } = scratch();
     const second = mkdtempSync(join(tmpdir(), "omp-relay-setup-agent-b-"));
     const committed = commit(projectRoot, text);
@@ -892,7 +1024,7 @@ describe("a second checkout of the same repository can still set itself up", () 
     const resolved = await roomOn(second, projectRoot);
     expect(resolved.config.room.project).toBe("shared");
     expect(resolved.config.room.task).toBe("two-machine-check");
-    console.log(`machine B kept a file with ${label} and still installed its own half`);
+    console.log(`machine B kept a file with ${shape} and still installed its own half`);
   });
 
   test("a committed room the flags disagree with is kept, and the report names the room that applies", async () => {
