@@ -80,11 +80,36 @@ const SERVER_FRAMES: readonly ServerFrame[] = [
   { type: "error", code: "invalid_identifier", request_id: "msg-1" },
 ];
 
+/**
+ * Names one frame so that no sibling shares the name.
+ *
+ * Six of the types below appear twice — the pairs are exactly the ones the
+ * codec tests exist to tell apart, `reply_to` present against absent — so the
+ * type alone would report two cases under one name and identify neither.
+ */
+function frameScenario(frame: ClientFrame | ServerFrame): string {
+  const parts: string[] = [frame.type];
+  if ("code" in frame) parts.push(frame.code);
+  if ("id" in frame) parts.push(frame.id);
+  if ("request_id" in frame && frame.request_id !== undefined) parts.push(frame.request_id);
+  if ("reply_to" in frame && frame.reply_to !== undefined) parts.push(`replying to ${frame.reply_to}`);
+  if (frame.type === "accepted") parts.push(`${frame.delivered} delivered, ${frame.shed} shed`);
+  return `a ${parts.join(" ")} frame`;
+}
+
 describe("codec", () => {
   const inventory = [...CLIENT_FRAMES, ...SERVER_FRAMES].map((frame) => ({
-    scenario: `a ${frame.type} frame`,
+    scenario: frameScenario(frame),
     frame,
   }));
+
+  test("every frame in the inventory has a scenario no other frame shares", () => {
+    // The control on both tables below: a duplicate name reports two cases as
+    // one, so a failure would identify neither of them.
+    const names = new Set(inventory.map((entry) => entry.scenario));
+    expect(names.size).toBe(inventory.length);
+    console.log(`${inventory.length} frames, ${names.size} distinct scenarios`);
+  });
 
   test.each(inventory)("$scenario round-trips through the codec", ({ frame }) => {
     const decoded = decodePayload(encodePayload(frame));
@@ -408,16 +433,19 @@ describe("server frame validation", () => {
     expect(outcome.kind).toBe("frame");
   });
 
-  test("every frame the relay may send validates", () => {
-    for (const frame of SERVER_FRAMES) {
-      const decoded = decodePayload(encodePayload(frame));
-      expect(decoded.ok).toBe(true);
-      if (!decoded.ok) continue;
-      const outcome = validateServerFrame(decoded.value);
-      expect(outcome.kind).toBe("frame");
-      if (outcome.kind !== "frame") continue;
-      expect(outcome.frame).toEqual(frame);
-    }
+  const relayFrames = SERVER_FRAMES.map((frame) => ({
+    scenario: `${frameScenario(frame)} the relay may send validates`,
+    frame,
+  }));
+
+  test.each(relayFrames)("$scenario", ({ frame }) => {
+    const decoded = decodePayload(encodePayload(frame));
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    const outcome = validateServerFrame(decoded.value);
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame).toEqual(frame);
   });
 
   test("a notice is surfaced as its own class, not folded into a message", () => {

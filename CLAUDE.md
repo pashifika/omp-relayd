@@ -170,29 +170,56 @@ of objects, and spreading a copy at every call site to satisfy the type would ad
 noise that explains nothing. `readonly` fields on a named case type cost nothing
 and are worth having.
 
-Two rules follow, and one distinction:
+Three rules follow, and two distinctions:
 
+- **The expected outcome is a column.** A case carries what it expects, so the
+  body is one assertion sequence every case runs unchanged and adding a case is
+  adding a row. Recomputing the expectation in the body from the input is a
+  second implementation of the code under test, agreeing with the first for the
+  wrong reasons.
 - **A multi-column table is never positional.** `[["a", 1], …]` makes the reader
   count columns and forces an unwanted value to be received as a parameter just
   to be discarded. A single-column table of scalars — `test.each(["auto",
   "manual"])("startup %p is accepted", …)` — keeps its printf title, because the
   one column is the whole case.
+- **Every case's name is its own.** Two cases reporting under one name identify
+  neither when one fails, which is the whole point of naming them. Derive a
+  scenario from what *distinguishes* the case, not from a field its siblings
+  share: a table built by `.map` over an inventory with two `send` frames in it
+  needs more than the frame's type.
 - **A set of cases is a table, not a loop.** A `for … of [ … ]` inside one
-  `test()` stops at its first failure and never names the case it stopped on. A
-  loop over values one subject must all satisfy — six keys a fixture must not
-  contain, twelve flags `--help` must mention — is not a case set and stays a
-  loop.
+  `test()` stops at its first failure and never names the case it stopped on. The
+  test is one subject per row: six malformed digests are six cases, because each
+  is judged on its own. A loop stays a loop when there is one subject per *test*
+  and the list is part of the property — the keys one fixture must not contain,
+  the flags one `--help` text must mention. Both of those fail as one thing, and
+  the failure already names the subject correctly.
 - **A column may carry the action under test; it may not carry the assertion.**
   A body that branches on which case is running is two tests wearing one name:
   split it, and share the setup through a builder instead.
 
-`extension/test/unit/test-style.test.ts` enforces the first rule and the title
-rule, naming the file and line of anything it refuses. It deliberately judges
-nothing else: whether a table's cases belong together, and whether its
-expectations are columns rather than recomputed in the body, stay review
-concerns. The Rust suite under `server/` is outside this convention — a tuple
-loop over data that is not a case table is ordinary Rust, and per-case isolation
-there has to be built rather than being a property of the runner.
+`extension/test/unit/test-style.test.ts` enforces this in two halves, because one
+instrument cannot reach both:
+
+- A **shape** scan (`test/support/test-style.ts`) reads the test tree and refuses
+  a positional table or a title that names a case by rendering a value the scan
+  cannot see to be single. It follows a table hoisted into a `const`, which the
+  convention's own example does — without that it would classify every
+  conforming table as opaque and pass vacuously. Where it cannot establish a
+  shape it reports that rather than staying quiet, because silence and
+  conformance must not look alike. Its one stated gap: an opaque array of tuples
+  under a single-placeholder title.
+- A **name** gate reads the names the runner actually printed, over
+  `test/unit`, and fails on two cases in one file sharing a name or on a title
+  that kept a `%d`. No text scan can see either, which is why the gate reads
+  `--reporter=junit` output instead. `test/packaging` and `test/integration` are
+  outside its reach; their shapes are still scanned.
+
+Both deliberately judge nothing else: whether a table's cases belong together,
+and whether its expectations are columns, stay review concerns. The Rust suite
+under `server/` is outside this convention — a tuple loop over data that is not a
+case table is ordinary Rust, and per-case isolation there has to be built rather
+than being a property of the runner.
 
 A verification that exists only as a report is a claim without a method. Retain
 what was run, what it produced, and the revision it ran against, so a reader can

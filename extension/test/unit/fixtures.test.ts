@@ -495,19 +495,33 @@ describe("this implementation decodes the Rust relay's fixtures", () => {
     expect(containsKey(committed, "reply_to")).toBe(false);
   });
 
-  test("a delivered attachment is validated as a digest, not as free text", async () => {
+  /** A frame body every case below varies by its `attachment` alone. */
+  const DELIVERED = {
+    type: "message",
+    id: "msg-2",
+    from: "macbook-reviewer",
+    body: "attached",
+  };
+
+  test("a digest-shaped attachment is accepted", () => {
+    // The control on the refusals below: a validator rejecting everything would
+    // pass all of them.
+    expect(validateServerFrame({ ...DELIVERED, attachment: FIXTURE_DIGEST }).kind).toBe("frame");
+  });
+
+  const refusedAttachments: { readonly scenario: string; readonly attachment: unknown }[] = [
+    { scenario: "an empty attachment is refused", attachment: "" },
+    { scenario: "a short attachment is refused", attachment: "short" },
+    { scenario: "an over-long attachment is refused", attachment: `${FIXTURE_DIGEST}x` },
+    { scenario: "a traversal attachment is refused", attachment: "../../etc/passwd" },
+    { scenario: "a numeric attachment is refused", attachment: 7 },
+    { scenario: "a map-valued attachment is refused", attachment: {} },
+  ];
+
+  test.each(refusedAttachments)("$scenario", ({ attachment }) => {
     // A relay that sent something else would otherwise have its value carried
     // into a URL path component and into the name of a local file.
-    const base = {
-      type: "message",
-      id: "msg-2",
-      from: "macbook-reviewer",
-      body: "attached",
-    };
-    expect(validateServerFrame({ ...base, attachment: FIXTURE_DIGEST }).kind).toBe("frame");
-    for (const bad of ["", "short", `${FIXTURE_DIGEST}x`, "../../etc/passwd", 7, {}]) {
-      expect(validateServerFrame({ ...base, attachment: bad }).kind).toBe("invalid");
-    }
+    expect(validateServerFrame({ ...DELIVERED, attachment }).kind).toBe("invalid");
   });
 });
 
