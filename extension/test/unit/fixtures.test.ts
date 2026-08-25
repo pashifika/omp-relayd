@@ -347,32 +347,32 @@ describe("this implementation decodes the Rust relay's fixtures", () => {
     );
   });
 
-  test("field order does not decide what a Rust fixture means", async () => {
+  const reencodable = [
+    "rust-announce.msgpack",
+    "rust-notice.msgpack",
+    "rust-accepted.msgpack",
+    "rust-reserve.msgpack",
+    "rust-reserved.msgpack",
+    "rust-send-attachment.msgpack",
+  ].map((name) => ({ scenario: `field order does not decide what ${name} means`, name }));
+
+  test.each(reencodable)("$scenario", async ({ name }) => {
     // Named maps, not positional tuples: the whole set depends on it, and the
     // cheapest proof is to re-encode the decoded value with its keys reversed
     // and require the same reading back.
-    for (const name of [
-      "rust-announce.msgpack",
-      "rust-notice.msgpack",
-      "rust-accepted.msgpack",
-      "rust-reserve.msgpack",
-      "rust-reserved.msgpack",
-      "rust-send-attachment.msgpack",
-    ]) {
-      const committed = await requireRustFixture(name);
-      const decoded = decodePayload(committed);
-      expect(decoded.ok).toBe(true);
-      if (!decoded.ok) continue;
-      const map = asRecord(decoded.value);
-      expect(map).not.toBeNull();
-      if (map === null) continue;
+    const committed = await requireRustFixture(name);
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    const map = asRecord(decoded.value);
+    expect(map).not.toBeNull();
+    if (map === null) return;
 
-      const reversed = Object.fromEntries(Object.entries(map).reverse());
-      const roundTrip = decodePayload(rawEncode(reversed));
-      expect(roundTrip.ok).toBe(true);
-      if (!roundTrip.ok) continue;
-      expect(roundTrip.value).toEqual(decoded.value);
-    }
+    const reversed = Object.fromEntries(Object.entries(map).reverse());
+    const roundTrip = decodePayload(rawEncode(reversed));
+    expect(roundTrip.ok).toBe(true);
+    if (!roundTrip.ok) return;
+    expect(roundTrip.value).toEqual(decoded.value);
   });
 
   test("an unknown extra field on an announce is ignored, not refused", async () => {
@@ -495,49 +495,66 @@ describe("this implementation decodes the Rust relay's fixtures", () => {
     expect(containsKey(committed, "reply_to")).toBe(false);
   });
 
-  test("a delivered attachment is validated as a digest, not as free text", async () => {
+  /** A frame body every case below varies by its `attachment` alone. */
+  const DELIVERED = {
+    type: "message",
+    id: "msg-2",
+    from: "macbook-reviewer",
+    body: "attached",
+  };
+
+  test("a digest-shaped attachment is accepted", () => {
+    // The control on the refusals below: a validator rejecting everything would
+    // pass all of them.
+    expect(validateServerFrame({ ...DELIVERED, attachment: FIXTURE_DIGEST }).kind).toBe("frame");
+  });
+
+  const refusedAttachments: { readonly scenario: string; readonly attachment: unknown }[] = [
+    { scenario: "an empty attachment is refused", attachment: "" },
+    { scenario: "a short attachment is refused", attachment: "short" },
+    { scenario: "an over-long attachment is refused", attachment: `${FIXTURE_DIGEST}x` },
+    { scenario: "a traversal attachment is refused", attachment: "../../etc/passwd" },
+    { scenario: "a numeric attachment is refused", attachment: 7 },
+    { scenario: "a map-valued attachment is refused", attachment: {} },
+  ];
+
+  test.each(refusedAttachments)("$scenario", ({ attachment }) => {
     // A relay that sent something else would otherwise have its value carried
     // into a URL path component and into the name of a local file.
-    const base = {
-      type: "message",
-      id: "msg-2",
-      from: "macbook-reviewer",
-      body: "attached",
-    };
-    expect(validateServerFrame({ ...base, attachment: FIXTURE_DIGEST }).kind).toBe("frame");
-    for (const bad of ["", "short", `${FIXTURE_DIGEST}x`, "../../etc/passwd", 7, {}]) {
-      expect(validateServerFrame({ ...base, attachment: bad }).kind).toBe("invalid");
-    }
+    expect(validateServerFrame({ ...DELIVERED, attachment }).kind).toBe("invalid");
   });
 });
 
 describe("this implementation produces fixtures for the Rust relay", () => {
-  test.each(TS_FIXTURES.map((fixture) => [fixture.name, fixture] as const))(
-    "%s is committed and still matches a fresh encode",
-    async (name, fixture) => {
-      const fresh = encodePayload(fixture.frame);
-      const committed = await readFixture(name);
+  const produced = TS_FIXTURES.map((fixture) => ({
+    scenario: `${fixture.name} is committed and still matches a fresh encode`,
+    name: fixture.name,
+    fixture,
+  }));
 
-      if (updating || committed === null) {
-        await writeFile(join(FIXTURE_DIR, name), fresh);
-        expect(updating).toBe(true);
-        console.log(`${name}: written, ${fresh.length} bytes; commit it and re-run`);
-        return;
-      }
+  test.each(produced)("$scenario", async ({ name, fixture }) => {
+    const fresh = encodePayload(fixture.frame);
+    const committed = await readFixture(name);
 
-      // The committed bytes must still decode to the value they document. That
-      // is the semantic contract the Rust side depends on.
-      const decoded = decodePayload(committed);
-      expect(decoded.ok).toBe(true);
-      if (!decoded.ok) return;
-      expect(decoded.value).toEqual(fixture.frame);
+    if (updating || committed === null) {
+      await writeFile(join(FIXTURE_DIR, name), fresh);
+      expect(updating).toBe(true);
+      console.log(`${name}: written, ${fresh.length} bytes; commit it and re-run`);
+      return;
+    }
 
-      // And a fresh encode must still equal them, so silent encoding drift
-      // fails the suite instead of quietly rewriting the file.
-      expect([...committed]).toEqual([...fresh]);
-      console.log(`${name}: ${committed.length} bytes, covering ${fixture.risk}`);
-    },
-  );
+    // The committed bytes must still decode to the value they document. That
+    // is the semantic contract the Rust side depends on.
+    const decoded = decodePayload(committed);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.value).toEqual(fixture.frame);
+
+    // And a fresh encode must still equal them, so silent encoding drift
+    // fails the suite instead of quietly rewriting the file.
+    expect([...committed]).toEqual([...fresh]);
+    console.log(`${name}: ${committed.length} bytes, covering ${fixture.risk}`);
+  });
 
   test("ts-send.msgpack omits reply_to and ts-receipt.msgpack spells its status out", async () => {
     // The two encoding properties the Rust side asserts from its own direction,

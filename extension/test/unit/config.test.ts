@@ -34,6 +34,7 @@ import {
   validateGlobalConfig,
   validateProjectConfig,
   type Environment,
+  type JoinParameters,
 } from "../../src/config.ts";
 
 const GLOBAL = `
@@ -240,15 +241,26 @@ describe("the global layer's schema", () => {
     expect(outcome.problem.field).toBe("transport.mode");
   });
 
-  test.each([
-    ["127.0.0.1", "no port at all"],
-    ["127.0.0.1:", "an empty port"],
-    ["127.0.0.1:http", "a non-numeric port"],
-    ["127.0.0.1:0", "port zero"],
-    ["127.0.0.1:65536", "a port above the range"],
-    [":7788", "no host"],
-    ["::1:7788", "an unbracketed IPv6 literal"],
-  ])("transport.address %p is refused (%s)", (address) => {
+  const refusedAddresses = [
+    { scenario: "transport.address with no port at all is refused", address: "127.0.0.1" },
+    { scenario: "transport.address with an empty port is refused", address: "127.0.0.1:" },
+    {
+      scenario: "transport.address with a non-numeric port is refused",
+      address: "127.0.0.1:http",
+    },
+    { scenario: "transport.address of port zero is refused", address: "127.0.0.1:0" },
+    {
+      scenario: "transport.address with a port above the range is refused",
+      address: "127.0.0.1:65536",
+    },
+    { scenario: "transport.address with no host is refused", address: ":7788" },
+    {
+      scenario: "transport.address with an unbracketed IPv6 literal is refused",
+      address: "::1:7788",
+    },
+  ];
+
+  test.each(refusedAddresses)("$scenario", ({ address }) => {
     const outcome = check(GLOBAL.replace("127.0.0.1:7788", JSON.stringify(address)));
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
@@ -348,10 +360,12 @@ describe("the global layer's schema", () => {
     expect(outcome.ok).toBe(true);
   });
 
-  test.each([
-    ["a list", "- one\n- two\n"],
-    ["a scalar", "just-a-string\n"],
-  ])("a document that is %s is refused", (_label, body) => {
+  const documentShapes = [
+    { scenario: "a document that is a list is refused", body: "- one\n- two\n" },
+    { scenario: "a document that is a scalar is refused", body: "just-a-string\n" },
+  ];
+
+  test.each(documentShapes)("$scenario", ({ body }) => {
     const outcome = check(body);
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
@@ -379,14 +393,27 @@ describe("the project layer's schema", () => {
     expect(outcome.config).toEqual({ project: "omp-relayd", task: null });
   });
 
-  test.each([
-    ["room.project", "omp/relayd"],
-    ["room.task", "a@b"],
-  ])("%s violating the identifier rules is refused", (field, value) => {
-    const body =
-      field === "room.project"
-        ? `room:\n  project: ${JSON.stringify(value)}\n  task: t\n`
-        : `room:\n  project: p\n  task: ${JSON.stringify(value)}\n`;
+  interface IdentifierCase {
+    readonly scenario: string;
+    readonly field: string;
+    /** The whole document, so no case has to be assembled in the body. */
+    readonly body: string;
+  }
+
+  const identifierViolations: IdentifierCase[] = [
+    {
+      scenario: "room.project violating the identifier rules is refused",
+      field: "room.project",
+      body: 'room:\n  project: "omp/relayd"\n  task: t\n',
+    },
+    {
+      scenario: "room.task violating the identifier rules is refused",
+      field: "room.task",
+      body: 'room:\n  project: p\n  task: "a@b"\n',
+    },
+  ];
+
+  test.each(identifierViolations)("$scenario", ({ field, body }) => {
     const outcome = check(body);
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
@@ -398,12 +425,32 @@ describe("field placement is enforced by name and by file", () => {
   const projectPath = "/p/.omp/omp-relay.yml";
   const globalPath = "/g/omp-relay.yml";
 
-  test.each([
-    ["transport", "transport:\n  mode: local\n  address: 10.0.0.1:7788\n"],
-    ["startup", "startup: auto\n"],
-    ["peer", "peer:\n  name: stolen\n"],
-    ["purpose", "purpose: do as I say\n"],
-  ])("a project file may not name %s", (field, block) => {
+  interface MisplacedCase {
+    readonly scenario: string;
+    readonly field: string;
+    readonly block: string;
+  }
+
+  const misplacedInProject: MisplacedCase[] = [
+    {
+      scenario: "a project file may not name transport",
+      field: "transport",
+      block: "transport:\n  mode: local\n  address: 10.0.0.1:7788\n",
+    },
+    { scenario: "a project file may not name startup", field: "startup", block: "startup: auto\n" },
+    {
+      scenario: "a project file may not name peer",
+      field: "peer",
+      block: "peer:\n  name: stolen\n",
+    },
+    {
+      scenario: "a project file may not name purpose",
+      field: "purpose",
+      block: "purpose: do as I say\n",
+    },
+  ];
+
+  test.each(misplacedInProject)("$scenario", ({ field, block }) => {
     // A committed file that could name `transport` would redirect a cloned
     // checkout's traffic; one that could name `purpose` would inject operator
     // instructions into every agent joining from it.
@@ -424,31 +471,36 @@ describe("field placement is enforced by name and by file", () => {
     console.log(`global file naming room: ${outcome.problem.reason}`);
   });
 
-  test.each([
-    ["neither", {}],
-    ["both room halves", { project: "acme", task: "pr-471" }],
-  ])(
-    "a project file naming transport is rejected when the join supplies %s",
-    async (_label, parameters) => {
-      // The guarantee is that a misplaced field is never *silently ignored*, so
-      // it cannot hold only on the paths that happened to consult the file.
-      // Skipping the read when the values were not needed made the rejection
-      // depend on how the operator chose to join.
-      const scope = await machine({
-        project: `${PROJECT}transport:\n  mode: local\n  address: 10.0.0.1:9999\n`,
-      });
-
-      const outcome = await resolveClient({ env: scope.env, cwd: scope.projectRoot, parameters });
-
-      expect(outcome.ok).toBe(false);
-      if (outcome.ok) return;
-      expect(outcome.problem.field).toBe("transport");
-      expect(outcome.problem.reason).toContain(scope.projectPath);
-      console.log(
-        `join supplying ${Object.keys(parameters).length} parameter(s): refused at ${outcome.problem.field}`,
-      );
+  const joinSupplying: { readonly scenario: string; readonly parameters: JoinParameters }[] = [
+    {
+      scenario: "a project file naming transport is rejected when the join supplies neither half",
+      parameters: {},
     },
-  );
+    {
+      scenario: "a project file naming transport is rejected when the join supplies both halves",
+      parameters: { project: "acme", task: "pr-471" },
+    },
+  ];
+
+  test.each(joinSupplying)("$scenario", async ({ parameters }) => {
+    // The guarantee is that a misplaced field is never *silently ignored*, so
+    // it cannot hold only on the paths that happened to consult the file.
+    // Skipping the read when the values were not needed made the rejection
+    // depend on how the operator chose to join.
+    const scope = await machine({
+      project: `${PROJECT}transport:\n  mode: local\n  address: 10.0.0.1:9999\n`,
+    });
+
+    const outcome = await resolveClient({ env: scope.env, cwd: scope.projectRoot, parameters });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.problem.field).toBe("transport");
+    expect(outcome.problem.reason).toContain(scope.projectPath);
+    console.log(
+      `join supplying ${Object.keys(parameters).length} parameter(s): refused at ${outcome.problem.field}`,
+    );
+  });
 });
 
 describe("loading", () => {
@@ -531,12 +583,20 @@ describe("host-name derivation", () => {
     expect(derived.value).toBe("win-desktop");
   });
 
-  test.each([
-    ["", "an empty host name"],
-    [".local", "an empty first label"],
-    ["a@b.local", "a first label containing @"],
-    [`${"p".repeat(65)}.local`, "a first label over the byte limit"],
-  ])("%p is reported rather than replaced (%s)", (raw) => {
+  const unusableHosts = [
+    { scenario: "an empty host name is reported rather than replaced", raw: "" },
+    { scenario: "an empty first label is reported rather than replaced", raw: ".local" },
+    {
+      scenario: "a first label containing @ is reported rather than replaced",
+      raw: "a@b.local",
+    },
+    {
+      scenario: "a first label over the byte limit is reported rather than replaced",
+      raw: `${"p".repeat(65)}.local`,
+    },
+  ];
+
+  test.each(unusableHosts)("$scenario", ({ raw }) => {
     const derived = derivePeerName(raw);
     expect(derived.ok).toBe(false);
     if (derived.ok) return;
@@ -546,11 +606,19 @@ describe("host-name derivation", () => {
 });
 
 describe("project-root derivation", () => {
-  test.each([
-    ["/work/omp-relayd", "omp-relayd"],
-    ["/work/omp-relayd/", "omp-relayd"],
-    ["/omp-relayd", "omp-relayd"],
-  ])("%p derives %p", (root, expected) => {
+  interface DerivationCase {
+    readonly scenario: string;
+    readonly root: string;
+    readonly expected: string;
+  }
+
+  const derivations: DerivationCase[] = [
+    { scenario: "a root under a parent derives its own name", root: "/work/omp-relayd", expected: "omp-relayd" },
+    { scenario: "a trailing slash derives the same name", root: "/work/omp-relayd/", expected: "omp-relayd" },
+    { scenario: "a root directly below / derives its name", root: "/omp-relayd", expected: "omp-relayd" },
+  ];
+
+  test.each(derivations)("$scenario", ({ root, expected }) => {
     const derived = deriveProjectName(root);
     expect(derived.ok).toBe(true);
     if (!derived.ok) return;
@@ -561,12 +629,23 @@ describe("project-root derivation", () => {
   // than at `hello`: a derived room the relay rejects would turn one startup
   // message into a connect-reject loop. The table above is the control that
   // keeps this one from passing by rejecting everything.
-  test.each([
-    ["/", "a root with no directory name"],
-    ["/work/omp@relayd", "a name containing @"],
-    [`/work/${"p".repeat(65)}`, "a name over the byte limit"],
-    ["/work/trailing ", "a name ending in whitespace"],
-  ])("%p is reported rather than repaired (%s)", (root) => {
+  const unusableRoots = [
+    { scenario: "a root with no directory name is reported rather than repaired", root: "/" },
+    {
+      scenario: "a name containing @ is reported rather than repaired",
+      root: "/work/omp@relayd",
+    },
+    {
+      scenario: "a name over the byte limit is reported rather than repaired",
+      root: `/work/${"p".repeat(65)}`,
+    },
+    {
+      scenario: "a name ending in whitespace is reported rather than repaired",
+      root: "/work/trailing ",
+    },
+  ];
+
+  test.each(unusableRoots)("$scenario", ({ root }) => {
     const derived = deriveProjectName(root);
     expect(derived.ok).toBe(false);
     if (derived.ok) return;
@@ -822,12 +901,26 @@ describe("precedence between the layers and a join request", () => {
 });
 
 describe("address parsing", () => {
-  test.each([
-    ["127.0.0.1:7788", "127.0.0.1", 7788],
-    ["relay.internal:1", "relay.internal", 1],
-    ["[::1]:65535", "::1", 65535],
-    ["[fe80::1%25eth0]:7788", "fe80::1%25eth0", 7788],
-  ])("%p splits into %p and %d", (value, host, port) => {
+  interface AddressCase {
+    readonly scenario: string;
+    readonly value: string;
+    readonly host: string;
+    readonly port: number;
+  }
+
+  const addresses: AddressCase[] = [
+    { scenario: "an IPv4 literal splits at its colon", value: "127.0.0.1:7788", host: "127.0.0.1", port: 7788 },
+    { scenario: "a host name splits at its colon", value: "relay.internal:1", host: "relay.internal", port: 1 },
+    { scenario: "a bracketed IPv6 literal loses its brackets", value: "[::1]:65535", host: "::1", port: 65535 },
+    {
+      scenario: "a bracketed IPv6 literal keeps its percent-encoded zone",
+      value: "[fe80::1%25eth0]:7788",
+      host: "fe80::1%25eth0",
+      port: 7788,
+    },
+  ];
+
+  test.each(addresses)("$scenario", ({ value, host, port }) => {
     expect(parseAddress(value)).toEqual({ host, port });
   });
 

@@ -80,26 +80,51 @@ const SERVER_FRAMES: readonly ServerFrame[] = [
   { type: "error", code: "invalid_identifier", request_id: "msg-1" },
 ];
 
+/**
+ * Names one frame so that no sibling shares the name.
+ *
+ * Six of the types below appear twice — the pairs are exactly the ones the
+ * codec tests exist to tell apart, `reply_to` present against absent — so the
+ * type alone would report two cases under one name and identify neither.
+ */
+function frameScenario(frame: ClientFrame | ServerFrame): string {
+  const parts: string[] = [frame.type];
+  if ("code" in frame) parts.push(frame.code);
+  if ("id" in frame) parts.push(frame.id);
+  if ("request_id" in frame && frame.request_id !== undefined) parts.push(frame.request_id);
+  if ("reply_to" in frame && frame.reply_to !== undefined) parts.push(`replying to ${frame.reply_to}`);
+  if (frame.type === "accepted") parts.push(`${frame.delivered} delivered, ${frame.shed} shed`);
+  return `a ${parts.join(" ")} frame`;
+}
+
 describe("codec", () => {
-  test("every frame in the v1 inventory round-trips through the codec", () => {
-    for (const frame of [...CLIENT_FRAMES, ...SERVER_FRAMES]) {
-      const decoded = decodePayload(encodePayload(frame));
-      expect(decoded.ok).toBe(true);
-      if (!decoded.ok) continue;
-      expect(decoded.value).toEqual(frame);
-    }
+  const inventory = [...CLIENT_FRAMES, ...SERVER_FRAMES].map((frame) => ({
+    scenario: frameScenario(frame),
+    frame,
+  }));
+
+  test("every frame in the inventory has a scenario no other frame shares", () => {
+    // The control on both tables below: a duplicate name reports two cases as
+    // one, so a failure would identify neither of them.
+    const names = new Set(inventory.map((entry) => entry.scenario));
+    expect(names.size).toBe(inventory.length);
+    console.log(`${inventory.length} frames, ${names.size} distinct scenarios`);
   });
 
-  test("every payload is a MessagePack map, never a positional array", () => {
+  test.each(inventory)("$scenario round-trips through the codec", ({ frame }) => {
+    const decoded = decodePayload(encodePayload(frame));
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.value).toEqual(frame);
+  });
+
+  test.each(inventory)("$scenario encodes as a MessagePack map, never a positional array", ({ frame }) => {
     // A positional encoder on either side couples both implementations to field
     // order, and the divergence stays invisible until a field is added.
-    for (const frame of [...CLIENT_FRAMES, ...SERVER_FRAMES]) {
-      const marker = encodePayload(frame)[0];
-      expect(marker).toBeDefined();
-      const isMap =
-        (marker! >= 0x80 && marker! <= 0x8f) || marker === 0xde || marker === 0xdf;
-      expect(isMap).toBe(true);
-    }
+    const marker = encodePayload(frame)[0];
+    expect(marker).toBeDefined();
+    const isMap = (marker! >= 0x80 && marker! <= 0x8f) || marker === 0xde || marker === 0xdf;
+    expect(isMap).toBe(true);
   });
 
   test("an absent reply_to produces no key at all, rather than a nil value", () => {
@@ -202,10 +227,20 @@ describe("codec", () => {
     expect(decodePayload(padded).ok).toBe(false);
   });
 
-  test.each([
-    ["bin8", new Uint8Array([0xc4, 0x01, 0x00])],
-    ["timestamp32", new Uint8Array([0xd6, 0xff, 0x00, 0x00, 0x00, 0x00])],
-  ])("a %s value carrying bytes is refused by its size bound", (kind, payload) => {
+  const outsideProfile = [
+    {
+      scenario: "a bin8 value carrying bytes is refused by its size bound",
+      kind: "bin8",
+      payload: new Uint8Array([0xc4, 0x01, 0x00]),
+    },
+    {
+      scenario: "a timestamp32 value carrying bytes is refused by its size bound",
+      kind: "timestamp32",
+      payload: new Uint8Array([0xd6, 0xff, 0x00, 0x00, 0x00, 0x00]),
+    },
+  ];
+
+  test.each(outsideProfile)("$scenario", ({ kind, payload }) => {
     // `spec.md:126` puts binary, extension-codec, and timestamp values outside
     // the compatibility profile. Both of these decoded into a value before the
     // decoder was bounded — a `Uint8Array` and a `Date` respectively — leaving
@@ -284,11 +319,13 @@ describe("server frame validation", () => {
     expect(outcome.reason).toContain("array");
   });
 
-  test.each([
-    ["nil", null],
-    ["a string", "receipt"],
-    ["an integer", 7],
-  ])("a %s payload is rejected", (_label, value) => {
+  const nonMapPayloads = [
+    { scenario: "a nil payload is rejected", value: null as unknown },
+    { scenario: "a string payload is rejected", value: "receipt" as unknown },
+    { scenario: "an integer payload is rejected", value: 7 as unknown },
+  ];
+
+  test.each(nonMapPayloads)("$scenario", ({ value }) => {
     expect(validateServerFrame(value).kind).toBe("invalid");
   });
 
@@ -396,16 +433,19 @@ describe("server frame validation", () => {
     expect(outcome.kind).toBe("frame");
   });
 
-  test("every frame the relay may send validates", () => {
-    for (const frame of SERVER_FRAMES) {
-      const decoded = decodePayload(encodePayload(frame));
-      expect(decoded.ok).toBe(true);
-      if (!decoded.ok) continue;
-      const outcome = validateServerFrame(decoded.value);
-      expect(outcome.kind).toBe("frame");
-      if (outcome.kind !== "frame") continue;
-      expect(outcome.frame).toEqual(frame);
-    }
+  const relayFrames = SERVER_FRAMES.map((frame) => ({
+    scenario: `${frameScenario(frame)} the relay may send validates`,
+    frame,
+  }));
+
+  test.each(relayFrames)("$scenario", ({ frame }) => {
+    const decoded = decodePayload(encodePayload(frame));
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    const outcome = validateServerFrame(decoded.value);
+    expect(outcome.kind).toBe("frame");
+    if (outcome.kind !== "frame") return;
+    expect(outcome.frame).toEqual(frame);
   });
 
   test("a notice is surfaced as its own class, not folded into a message", () => {
@@ -423,21 +463,24 @@ describe("server frame validation", () => {
     expect(outcome.frame.type).toBe("notice");
   });
 
-  test("an accepted frame with a non-integer count is rejected and names it", () => {
+  const fractionalCounts = [
+    { scenario: "an accepted frame with a fractional delivered is rejected and names it", field: "delivered" },
+    { scenario: "an accepted frame with a fractional shed is rejected and names it", field: "shed" },
+  ];
+
+  test.each(fractionalCounts)("$scenario", ({ field }) => {
     // A fractional count is not a smaller number of recipients; it is a frame
     // this client should not have believed.
-    for (const field of ["delivered", "shed"] as const) {
-      const outcome = validateServerFrame({
-        type: "accepted",
-        id: "ann-1",
-        delivered: 2,
-        shed: 0,
-        [field]: 1.5,
-      });
-      expect(outcome.kind).toBe("invalid");
-      if (outcome.kind !== "invalid") continue;
-      expect(outcome.reason).toContain(field);
-    }
+    const outcome = validateServerFrame({
+      type: "accepted",
+      id: "ann-1",
+      delivered: 2,
+      shed: 0,
+      [field]: 1.5,
+    });
+    expect(outcome.kind).toBe("invalid");
+    if (outcome.kind !== "invalid") return;
+    expect(outcome.reason).toContain(field);
   });
 
   test("an accepted frame with a negative count is rejected", () => {
@@ -505,19 +548,22 @@ describe("identifier rules", () => {
     },
   );
 
-  test("U+0085 is refused at either end, where trim() would have accepted it", () => {
+  const nextLine = [
+    { scenario: "U+0085 at the start is refused, where trim() would have accepted it", value: "\u0085peer" },
+    { scenario: "U+0085 at the end is refused, where trim() would have accepted it", value: "peer\u0085" },
+  ];
+
+  test.each(nextLine)("$scenario", ({ value }) => {
     // Rust's `char::is_whitespace` uses the Unicode `White_Space` property,
     // which includes U+0085 NEXT LINE; JavaScript's `trim()` does not. Accepting
     // one of these turns a configuration error reportable once at startup into
     // a connect-reject-reconnect loop against the relay's own `hello` check.
-    for (const value of ["\u0085peer", "peer\u0085"]) {
-      expect(value.trim()).toBe(value);
-      expect(identifierProblem(value)).toEqual({ kind: "surrounding_whitespace" });
-      console.log(
-        `refused code points [${[...value].map((c) => c.codePointAt(0)).join(", ")}] ` +
-          `that trim() left unchanged`,
-      );
-    }
+    expect(value.trim()).toBe(value);
+    expect(identifierProblem(value)).toEqual({ kind: "surrounding_whitespace" });
+    console.log(
+      `refused code points [${[...value].map((c) => c.codePointAt(0)).join(", ")}] ` +
+        `that trim() left unchanged`,
+    );
   });
 
   test("an empty identifier is refused", () => {

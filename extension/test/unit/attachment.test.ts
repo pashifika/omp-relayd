@@ -21,7 +21,12 @@ import {
   type Report,
 } from "../../src/client.ts";
 import type { RelayConfig } from "../../src/config.ts";
-import { digestOf, PROTOCOL_VERSION, type DeliveryFrame } from "../../src/protocol.ts";
+import {
+  digestOf,
+  PROTOCOL_VERSION,
+  type ClientFrame,
+  type DeliveryFrame,
+} from "../../src/protocol.ts";
 import { FakeScheduler } from "../support/fake-scheduler.ts";
 import {
   frameField,
@@ -317,15 +322,23 @@ describe("reserving", () => {
     }
   });
 
-  test("a malformed digest is refused before anything is written", async () => {
+  const malformedDigests = [
+    { scenario: "an empty digest is refused before anything is written", bad: "" },
+    { scenario: "a short digest is refused before anything is written", bad: "short" },
+    { scenario: "an over-long digest is refused before anything is written", bad: "A".repeat(44) },
+    {
+      scenario: "a padded digest is refused before anything is written",
+      bad: `${"A".repeat(42)}=`,
+    },
+  ];
+
+  test.each(malformedDigests)("$scenario", async ({ bad }) => {
     const { relay, harness, close } = await joined(GRANT);
     try {
-      for (const bad of ["", "short", "A".repeat(44), `${"A".repeat(42)}=`]) {
-        const outcome = await settlement(harness.client.reserve(bad, 1));
-        expect(outcome.status).toBe("rejected");
-        if (outcome.status !== "rejected") continue;
-        expect((outcome.reason as RequestFailed).reason).toBe("invalid_request");
-      }
+      const outcome = await settlement(harness.client.reserve(bad, 1));
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status !== "rejected") return;
+      expect((outcome.reason as RequestFailed).reason).toBe("invalid_request");
       expect(relay.received.filter((frame) => isFrame(frame, "reserve"))).toEqual([]);
     } finally {
       await close();
@@ -334,41 +347,50 @@ describe("reserving", () => {
 });
 
 describe("attaching to a message", () => {
-  test.each([
-    ["send", "send"] as const,
-    ["announce", "announce"] as const,
-  ])(
-    "a %s carries its reference only after the payload is in place",
-    async (kind, frameType) => {
-      const { relay, harness, close } = await joined(GRANT);
-      try {
-        const payload = new TextEncoder().encode("a diff");
-        const attached = await harness.client.attach(payload);
-        if (kind === "send") {
-          await harness.client.send({
-            to: "windows-main",
-            body: "attached",
-            attachment: attached.digest,
-          });
-        } else {
-          await harness.client.announce({ body: "attached", attachment: attached.digest });
-        }
-
-        // Read off one clock, so this observes the interleaving rather than
-        // constructing it. Concatenating the frame list and the transfer list by
-        // category would produce this same array even if the frame had overtaken
-        // its own upload — and a frame that overtook its upload would reference a
-        // payload no recipient could fetch. The `announce` case matters more than
-        // the `send`: a premature reference there reaches every peer in the room.
-        expect(relay.timeline).toEqual(["hello", "reserve", "transfer:PUT", frameType]);
-
-        const written = relay.received.find((frame) => isFrame(frame, frameType));
-        expect(frameField(written, "attachment")).toBe(attached.digest);
-      } finally {
-        await close();
-      }
+  /**
+   * Which request carries the reference is the case; everything asserted below
+   * is the same for both. A column may carry the action under test — it may not
+   * carry the assertion, which is what would make the body branch on its case.
+   */
+  const carriers: {
+    readonly scenario: string;
+    readonly frameType: ClientFrame["type"];
+    readonly issue: (client: RelayClient, digest: string) => Promise<unknown>;
+  }[] = [
+    {
+      scenario: "a send carries its reference only after the payload is in place",
+      frameType: "send",
+      issue: async (client, digest) =>
+        client.send({ to: "windows-main", body: "attached", attachment: digest }),
     },
-  );
+    {
+      scenario: "an announce carries its reference only after the payload is in place",
+      frameType: "announce",
+      issue: async (client, digest) => client.announce({ body: "attached", attachment: digest }),
+    },
+  ];
+
+  test.each(carriers)("$scenario", async ({ frameType, issue }) => {
+    const { relay, harness, close } = await joined(GRANT);
+    try {
+      const payload = new TextEncoder().encode("a diff");
+      const attached = await harness.client.attach(payload);
+      await issue(harness.client, attached.digest);
+
+      // Read off one clock, so this observes the interleaving rather than
+      // constructing it. Concatenating the frame list and the transfer list by
+      // category would produce this same array even if the frame had overtaken
+      // its own upload — and a frame that overtook its upload would reference a
+      // payload no recipient could fetch. The `announce` case matters more than
+      // the `send`: a premature reference there reaches every peer in the room.
+      expect(relay.timeline).toEqual(["hello", "reserve", "transfer:PUT", frameType]);
+
+      const written = relay.received.find((frame) => isFrame(frame, frameType));
+      expect(frameField(written, "attachment")).toBe(attached.digest);
+    } finally {
+      await close();
+    }
+  });
 
   test("a refused reservation writes no frame carrying a reference", async () => {
     const { relay, harness, close } = await joined(refuseWith("room_full"));
