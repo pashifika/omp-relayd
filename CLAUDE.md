@@ -148,6 +148,52 @@ heartbeat timeout, and correlation of replies to requests. The cross-language
 fixtures under `test-fixtures/protocol-v1/` are the contract between the Rust
 and TypeScript implementations; both directions must decode the other's output.
 
+### Parameterized tests in `extension/`
+
+A test that exercises one behavior over several inputs writes its cases as
+objects with a `scenario` field and titles the run `"$scenario"`, so each case
+names itself in the runner's output:
+
+```ts
+const refusedAddresses = [
+  { scenario: "transport.address with no port at all is refused", address: "127.0.0.1" },
+  { scenario: "transport.address with an empty port is refused", address: "127.0.0.1:" },
+];
+
+test.each(refusedAddresses)("$scenario", ({ address }) => { … });
+```
+
+Name the case type with an `interface` once it has three or more columns, or
+when a column needs a type the literal cannot express. Do not annotate the table
+`readonly Case[]`: `bun-types` 1.3.14 has no `each` overload for a readonly array
+of objects, and spreading a copy at every call site to satisfy the type would add
+noise that explains nothing. `readonly` fields on a named case type cost nothing
+and are worth having.
+
+Two rules follow, and one distinction:
+
+- **A multi-column table is never positional.** `[["a", 1], …]` makes the reader
+  count columns and forces an unwanted value to be received as a parameter just
+  to be discarded. A single-column table of scalars — `test.each(["auto",
+  "manual"])("startup %p is accepted", …)` — keeps its printf title, because the
+  one column is the whole case.
+- **A set of cases is a table, not a loop.** A `for … of [ … ]` inside one
+  `test()` stops at its first failure and never names the case it stopped on. A
+  loop over values one subject must all satisfy — six keys a fixture must not
+  contain, twelve flags `--help` must mention — is not a case set and stays a
+  loop.
+- **A column may carry the action under test; it may not carry the assertion.**
+  A body that branches on which case is running is two tests wearing one name:
+  split it, and share the setup through a builder instead.
+
+`extension/test/unit/test-style.test.ts` enforces the first rule and the title
+rule, naming the file and line of anything it refuses. It deliberately judges
+nothing else: whether a table's cases belong together, and whether its
+expectations are columns rather than recomputed in the body, stay review
+concerns. The Rust suite under `server/` is outside this convention — a tuple
+loop over data that is not a case table is ordinary Rust, and per-case isolation
+there has to be built rather than being a property of the runner.
+
 A verification that exists only as a report is a claim without a method. Retain
 what was run, what it produced, and the revision it ran against, so a reader can
 re-derive the conclusion instead of trusting it. A check asserting a structural
