@@ -548,6 +548,10 @@ describe("the helper preserves existing state and refuses unsafe writes", () => 
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain(`kept ${globalPath}`);
+    // A kept global makes this run's transport flags decide nothing, so it has
+    // to name them: "I passed --address and nothing changed" is the whole
+    // complaint the keep would otherwise produce.
+    expect(result.stdout).toContain("not from --address/--startup/--peer/--purpose-file");
     expect(result.stdout).toContain(`kept ${projectPath}`);
     expect(readFileSync(globalPath, "utf8")).toBe(global);
     expect(readFileSync(projectPath, "utf8")).toBe(project);
@@ -640,6 +644,7 @@ describe("the helper preserves existing state and refuses unsafe writes", () => 
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain(`would keep ${globalPath}`);
+    expect(result.stdout).toContain("not from --address/--startup/--peer/--purpose-file");
     expect(result.stdout).toContain(`would write ${projectConfigPath(projectRoot)}`);
     expect(result.stdout).toContain(join(agentDir, "skills", "omp-relay"));
     expect(result.stdout).toContain(join(agentDir, "extensions", "omp-relay", "index.js"));

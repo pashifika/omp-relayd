@@ -417,7 +417,7 @@ fi
 if [ "$dry_run" -eq 1 ]; then
   printf 'setup-client: dry run; nothing below is performed.\n'
   if [ "$global_keep" -eq 1 ]; then
-    printf '  would keep %s; transport, startup, and peer would remain from that file\n' "$global_path"
+    printf '  would keep %s; transport, startup, and peer would come from that file, not from --address/--startup/--peer/--purpose-file\n' "$global_path"
   else
     printf '  would write %s:\n' "$global_path"
     compose_global | sed 's/^/    | /'
@@ -441,7 +441,7 @@ fi
 
 mkdir -p -- "$agent_dir"
 if [ "$global_keep" -eq 1 ]; then
-  printf 'setup-client: kept %s; transport, startup, and peer remain from that file\n' "$global_path"
+  printf 'setup-client: kept %s; transport, startup, and peer come from that file, not from --address/--startup/--peer/--purpose-file\n' "$global_path"
 else
   compose_global >"$global_path"
   printf 'setup-client: wrote %s\n' "$global_path"
