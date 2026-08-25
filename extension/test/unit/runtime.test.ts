@@ -245,6 +245,11 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
     },
   };
   const api = {
+    pi: {
+      getAgentDir() {
+        return process.env[AGENT_DIR_ENV] ?? join(cwd, ".omp-relay-test-agent");
+      },
+    },
     zod: {
       enum() {
         return chain;

@@ -2642,7 +2642,10 @@ function resolveProjectRoot(env, cwd) {
   }
   return { path: resolve(cwd), marker: "working directory" };
 }
-function globalConfigPath(env) {
+function globalConfigPath(env, agentDir) {
+  if (agentDir !== undefined && agentDir.length > 0) {
+    return { ok: true, path: join(agentDir, CONFIG_FILE_NAME) };
+  }
   const override = env[AGENT_DIR_ENV];
   if (override !== undefined && override.length > 0) {
     return { ok: true, path: join(override, CONFIG_FILE_NAME) };
@@ -2679,8 +2682,8 @@ async function parseFile(path) {
     };
   }
 }
-async function loadGlobalConfig(env) {
-  const resolved = globalConfigPath(env);
+async function loadGlobalConfig(env, agentDir) {
+  const resolved = globalConfigPath(env, agentDir);
   if (!resolved.ok) {
     return { ok: false, path: null, absent: false, problem: resolved.problem };
   }
@@ -2824,7 +2827,7 @@ function derivePeerName(raw) {
   return { ok: true, value: label };
 }
 async function resolveClient(options) {
-  const global = await loadGlobalConfig(options.env);
+  const global = await loadGlobalConfig(options.env, options.agentDir);
   if (!global.ok) {
     return { ok: false, path: global.path, absent: global.absent, problem: global.problem };
   }
@@ -3485,7 +3488,12 @@ function ompRelay(pi) {
   };
   const performJoin = async (ctx, parameters2) => {
     const thisGeneration = ++generation;
-    const outcome = await resolveClient({ env: process.env, cwd: ctx.cwd, parameters: parameters2 });
+    const outcome = await resolveClient({
+      env: process.env,
+      cwd: ctx.cwd,
+      parameters: parameters2,
+      agentDir: pi.pi.getAgentDir()
+    });
     if (thisGeneration !== generation) {
       return {
         ok: false,
@@ -3598,7 +3606,7 @@ function ompRelay(pi) {
     if (ctx.mode !== INTERACTIVE_MODE || thisGeneration !== generation) {
       return;
     }
-    const global = await loadGlobalConfig(process.env);
+    const global = await loadGlobalConfig(process.env, pi.pi.getAgentDir());
     if (thisGeneration !== generation) {
       return;
     }

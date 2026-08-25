@@ -50,20 +50,22 @@ cd omp-relayd
 docker compose up -d
 ```
 
-Write both configuration files and install the collaboration skill in one command. `--task` names the topic the two ends will meet on, and is the one value the helper never guesses:
+Write both configuration files and install the extension and collaboration skill in one command. `--task` names the topic the two ends will meet on, and is the one value the helper never guesses:
 
 ```bash
 scripts/setup-client.sh --task code-review
 ```
 
-It reports the project root it resolved and the marker that decided it, writes `~/.omp/agent/omp-relay.yml` and `<project-root>/.omp/omp-relay.yml`, installs the `omp-relay` skill to `~/.omp/agent/skills/omp-relay/`, and prints the command to start OMP. Run it with `--dry-run` first to see every file it would touch.
+It reports the project root it resolved and the marker that decided it, writes `~/.omp/agent/omp-relay.yml` and `<project-root>/.omp/omp-relay.yml`, installs the extension to `~/.omp/agent/extensions/omp-relay/index.js`, and installs the `omp-relay` skill to `~/.omp/agent/skills/omp-relay/`. Run it with `--dry-run` first to see every file it would touch.
+
+Re-running the helper keeps existing configuration files byte-for-byte unless `--force` is passed, but still refreshes the installed extension and skill.
 
 Its scope stops at the client: it installs no toolchain, starts no relay, and does not run the agent. Run `scripts/setup-client.sh --help` for every parameter and default, or see [Manual setup](#manual-setup) to do the same work by hand.
 
-Start OMP from the repository root with the bundled extension:
+Start OMP from the repository root. It discovers the installed extension automatically:
 
 ```bash
-omp --extension "$PWD/extension/dist/index.js"
+omp
 ```
 
 Then ask OMP to join: `Use the omp-relay skill to join and list the peers.` The join result reports the room it resolved, where each part of it came from, and who else is present.
@@ -219,7 +221,7 @@ That is the path for a repository you cannot commit to. Because two mistyped roo
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PI_CODING_AGENT_DIR` | `~/.omp/agent` | The agent directory holding the global file and installed skills. OMP's own variable; a named profile sets it for you |
+| `PI_CODING_AGENT_DIR` | `~/.omp/agent` | Optional OMP override for the active agent directory holding the global file, skills, and extensions. The extension receives the resolved directory from OMP, so this variable is not required |
 | `OMP_PROJECT_ROOT` | discovered | Names the project root instead of discovering it |
 | `OMP_RELAY_BIND` | `127.0.0.1` | Host address published by Compose |
 | `RUST_LOG` | `info` | Relay log filter |
@@ -255,20 +257,22 @@ Everything `scripts/setup-client.sh` does, by hand. Do this if you would rather 
 4. Build the bundle, only if you changed `extension/src/`. The committed `extension/dist/index.js` is what a fresh clone loads:
 
    ```bash
-   cd extension && bun install --frozen-lockfile && bun run build
+   (cd extension && bun install --frozen-lockfile && bun run build)
    ```
 
-5. Start the agent with the extension path, as in [Register the extension](#register-the-extension).
+5. Install the extension as in [Register the extension](#register-the-extension).
+6. Start the agent from the repository root with `omp`.
 
 ## Register the extension
 
-Registration uses an explicit OMP extension path:
+Registration copies the self-contained bundle into OMP's native user extension directory:
 
 ```bash
-omp --extension "$PWD/extension/dist/index.js"
+mkdir -p ~/.omp/agent/extensions/omp-relay
+cp extension/dist/index.js ~/.omp/agent/extensions/omp-relay/index.js
 ```
 
-The repository does not use `package.json#omp.extensions`. An explicit path matches the tested deployment: one JavaScript file copied into an otherwise empty directory.
+OMP discovers `<agent-dir>/extensions/<name>/index.js` automatically, so no `--extension` flag is required. `scripts/setup-client.sh` performs this copy using the active agent directory.
 
 Rebuild the bundle after changing `extension/src/`:
 
@@ -330,7 +334,7 @@ On each machine, from a checkout of the same repository:
 
 ```bash
 scripts/setup-client.sh --task two-machine-check --address 192.168.1.10:7788
-omp --extension "$PWD/extension/dist/index.js"
+omp
 ```
 
 Both ends resolve the same room from the same committed project file, and each derives its own peer name from its own host name. Then:
