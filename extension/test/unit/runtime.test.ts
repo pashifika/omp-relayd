@@ -1223,9 +1223,10 @@ describe("the machine's purpose under automatic startup", () => {
       await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
 
       // The precondition, asserted rather than assumed: auto startup resolved
-      // nothing and opened no socket.
+      // nothing and opened no socket. The project derives from the root's
+      // directory name, so the task is the half with no source.
       expect(relay.connections).toBe(0);
-      expect(harness.notifications[0]).toContain("room.project");
+      expect(harness.notifications[0]).toContain("room.task");
 
       const joined = await harness.mesh({
         action: "join",
