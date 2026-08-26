@@ -25,6 +25,7 @@ OMP Relay lets two OMP terminals hand work to each other without sharing a proce
 - [Startup modes](#startup-modes)
 - [Manual setup](#manual-setup)
 - [Use the `mesh` tool](#use-the-mesh-tool)
+  - [Receiving a message mid-run](#receiving-a-message-mid-run)
 - [Verify two machines](#verify-two-machines)
 - [Protocol](#protocol)
 - [Development](#development)
@@ -333,6 +334,18 @@ Use mesh with action announce. Say: I am rewriting the migrations in db/; leave 
 ```
 
 A `routed` receipt means the relay queued the message for the recipient. It does not mean the recipient read, accepted, or answered it. Other results distinguish an offline peer, a full recipient queue, and an invalid target. An announcement's counts read the same way: `delivered` peers took it into their queues, `shed` peers were not reading their connection and never received it, and both counts zero means the room held nobody else — a fact about the room rather than a failed request. The `omp-relay` skill carries the rest of the workflow: resolving an informal reference against the roster, stopping when nobody else is in the room, and writing a briefing the far end can act on without shared context.
+
+### Receiving a message mid-run
+
+An inbound message is delivered as steering — the same path OMP uses for what you type into a session that is already working. It does not abort the run, but under OMP's default `interruptMode: immediate` the runtime skips tool calls the model had queued and not yet started, then tells it to retry them. A session receiving several messages in a row can therefore be seen cancelling and repeating work.
+
+That is host policy rather than relay behavior — typing into the session yourself does the same. On a machine that should absorb messages without disturbing work in flight, defer steering to the next step boundary:
+
+```bash
+omp config set interruptMode wait
+```
+
+The message still arrives inside the same turn, once the tool batch in flight finishes. The setting is read when a session starts, so it applies to sessions started after it.
 
 ## Verify two machines
 
