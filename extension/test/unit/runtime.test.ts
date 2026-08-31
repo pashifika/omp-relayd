@@ -1995,7 +1995,7 @@ describe("the session runtime", () => {
     }
   });
 
-  test("overlapping restores let only the newest callback write", async () => {
+  test("overlapping restores retain text typed between inbound starts", async () => {
     const recorder = recordingRelay({ deliverOnReady: [INBOUND, NOTICE] });
     const relay = await ScriptedRelay.start(recorder.script);
     try {
@@ -2005,6 +2005,7 @@ describe("the session runtime", () => {
 
       await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
       harness.setEditorText("");
+      harness.setEditorText(" plus an overlapping thought");
       await harness.messageStart([{ type: "text", text: NOTICE_TEXT }]);
       harness.setEditorText("");
       expect(harness.pendingTimeouts()).toBe(2);
@@ -2013,8 +2014,8 @@ describe("the session runtime", () => {
       expect(harness.editorText()).toBe("");
       harness.runNextTimeout();
 
-      expect(harness.editorText()).toBe("review draft");
-      expect(harness.editorWrites).toEqual(["review draft"]);
+      expect(harness.editorText()).toBe("review draft plus an overlapping thought");
+      expect(harness.editorWrites).toEqual(["review draft plus an overlapping thought"]);
 
       await shutdown();
     } finally {

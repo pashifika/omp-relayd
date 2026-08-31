@@ -3640,8 +3640,13 @@ function ompRelay(pi) {
     if (text === null || !consumeInboundInjection(text))
       return;
     const currentDraft = ctx.ui.getEditorText();
-    if (currentDraft.length > 0)
-      protectedDraft = currentDraft;
+    if (currentDraft.length > 0) {
+      if (protectedDraft === null || currentDraft.startsWith(protectedDraft)) {
+        protectedDraft = currentDraft;
+      } else {
+        protectedDraft += currentDraft;
+      }
+    }
     if (protectedDraft === null)
       return;
     const restore = ++restorationGeneration;
