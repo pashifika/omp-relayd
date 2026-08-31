@@ -208,6 +208,14 @@ interface SessionHarness {
    * raised on its own instead of polling for it.
    */
   readonly notified: Signal<string>;
+  readonly editorReads: string[];
+  readonly editorWrites: string[];
+  /** Replaces editor text as operator input or host behavior, without recording an extension write. */
+  setEditorText(text: string): void;
+  editorText(): string;
+  messageStart(content: unknown, role?: string): Promise<void>;
+  pendingTimeouts(): number;
+  runNextTimeout(): void;
   /** Changes what `ctx.isIdle()` reports to an inbound-delivery handler. */
   setIdle(idle: boolean): void;
   /** Invokes the registered `mesh` tool exactly as the runtime would. */
@@ -227,6 +235,10 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   const notified = new Signal<string>();
   let execute: ToolExecute | null = null;
   let idle = true;
+  const editorReads: string[] = [];
+  const editorWrites: string[] = [];
+  const deferredTimeouts: Array<() => void> = [];
+  let editorText = "";
 
   // Mirrors only the builder methods this extension calls, so a schema the real
   // facade cannot build fails registration here rather than at load time.
@@ -297,9 +309,21 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
         notifications.push(message);
         notified.fire(message);
       },
+      getEditorText() {
+        editorReads.push(editorText);
+        return editorText;
+      },
+      setEditorText(text: string) {
+        editorWrites.push(text);
+        editorText = text;
+      },
     },
     setTimeout(callback: () => void, milliseconds: number) {
       contextTimers.timeouts.push(milliseconds);
+      if (milliseconds === 0) {
+        deferredTimeouts.push(callback);
+        return 0;
+      }
       return realSetTimeout(callback, milliseconds);
     },
     setInterval(callback: () => void, milliseconds: number) {
@@ -320,6 +344,27 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
     ctx,
     notifications,
     notified,
+    editorReads,
+    editorWrites,
+    setEditorText(text) {
+      editorText = text;
+    },
+    editorText() {
+      return editorText;
+    },
+    async messageStart(content, role = "user") {
+      const handler = handlers.get("message_start");
+      if (handler === undefined) throw new Error("the extension registered no message_start handler");
+      await handler({ type: "message_start", message: { role, content } }, ctx);
+    },
+    pendingTimeouts() {
+      return deferredTimeouts.length;
+    },
+    runNextTimeout() {
+      const callback = deferredTimeouts.shift();
+      if (callback === undefined) throw new Error("no deferred context timeout");
+      callback();
+    },
     setIdle(value) {
       idle = value;
     },
@@ -1718,9 +1763,9 @@ describe("the session runtime", () => {
 
       // Explicit `steer`, even while idle. Omitting `deliverAs` would enter
       // `AgentSession.prompt()`, whose non-streaming path auto-reads `@filepath`
-      // mentions (agent-session.ts:5811-5820 in OMP 18.0.4). A queued steer
+      // mentions (agent-session.ts:6045-6056 in OMP 18.0.11). A queued steer
       // schedules the idle drain and may resume from any transcript tail
-      // (agent-session.ts:6226-6250, 6269-6275), so it still starts a turn.
+      // (agent-session.ts:6474-6506, 6515-6521), so it still starts a turn.
       expect(harness.calls.userMessages).toEqual([
         { content: NOTICE_TEXT, options: { deliverAs: "steer" } },
       ]);
@@ -1791,6 +1836,272 @@ describe("the session runtime", () => {
       ]);
 
       await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  const directedDraftCases = [
+    { scenario: "an idle directed message preserves the unsent draft", idle: true },
+    { scenario: "a steering directed message preserves the unsent draft", idle: false },
+  ];
+
+  test.each(directedDraftCases)("$scenario", async ({ idle }) => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle });
+      await harness.calls.injected.until(1);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      expect(harness.editorReads).toEqual(["review draft"]);
+      expect(harness.pendingTimeouts()).toBe(1);
+
+      // OMP clears after extension handlers and before the deferred callback.
+      harness.setEditorText("");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("review draft");
+      expect(harness.editorWrites).toEqual(["review draft"]);
+      expect(harness.calls.userMessages[0]?.options).toEqual({ deliverAs: "steer" });
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a deferred notice restores the draft present when the notice starts", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [NOTICE] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const written = layers({ port: relay.port, startup: "auto" });
+      const harness = sessionHarness(written.projectRoot);
+      harness.setIdle(false);
+      harness.setEditorText("draft when the notice arrived");
+      ompRelay(harness.api);
+
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      await harness.calls.injected.until(1);
+      harness.setEditorText("latest draft before notice start");
+      await harness.messageStart([{ type: "text", text: NOTICE_TEXT }]);
+      harness.setEditorText("");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("latest draft before notice start");
+      expect(harness.editorWrites).toEqual(["latest draft before notice start"]);
+      expect(harness.calls.userMessages[0]?.options).toEqual({ deliverAs: "followUp" });
+
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, harness.ctx);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("text entered after the host clear is appended to the protected draft", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.calls.injected.until(1);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      harness.setEditorText("");
+      harness.setEditorText(" plus a new thought");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("review draft plus a new thought");
+      expect(harness.editorWrites).toEqual(["review draft plus a new thought"]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("an already restored draft prefix is not duplicated", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.calls.injected.until(1);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      harness.setEditorText("");
+      harness.setEditorText("review draft plus a new thought");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("review draft plus a new thought");
+      expect(harness.editorWrites).toEqual([]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a later steer may start before an earlier deferred notice", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [NOTICE, INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      await harness.calls.injected.until(2);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      harness.setEditorText("");
+      harness.runNextTimeout();
+      await harness.messageStart([{ type: "text", text: NOTICE_TEXT }]);
+      harness.setEditorText("");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("review draft");
+      expect(harness.editorWrites).toEqual(["review draft", "review draft"]);
+      expect(harness.calls.userMessages.map((call) => call.options)).toEqual([
+        { deliverAs: "followUp" },
+        { deliverAs: "steer" },
+      ]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("repeated identical relay injections retain separate correlation counts", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND, INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.calls.injected.until(2);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      harness.setEditorText("");
+      harness.runNextTimeout();
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      harness.setEditorText("");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("review draft");
+      expect(harness.editorWrites).toEqual(["review draft", "review draft"]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("overlapping restores retain text typed between inbound starts", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND, NOTICE] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      await harness.calls.injected.until(2);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      harness.setEditorText("");
+      harness.setEditorText(" plus an overlapping thought");
+      await harness.messageStart([{ type: "text", text: NOTICE_TEXT }]);
+      harness.setEditorText("");
+      expect(harness.pendingTimeouts()).toBe(2);
+
+      harness.runNextTimeout();
+      expect(harness.editorText()).toBe("");
+      harness.runNextTimeout();
+
+      expect(harness.editorText()).toBe("review draft plus an overlapping thought");
+      expect(harness.editorWrites).toEqual(["review draft plus an overlapping thought"]);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("an unmatched local user message does not inspect or restore the editor", async () => {
+    const harness = sessionHarness(process.cwd());
+    ompRelay(harness.api);
+    harness.setEditorText("local draft");
+
+    await harness.messageStart("local submission");
+
+    expect(harness.editorReads).toEqual([]);
+    expect(harness.editorWrites).toEqual([]);
+    expect(harness.pendingTimeouts()).toBe(0);
+  });
+
+  test("an unmatched external user message does not consume relay correlation", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.calls.injected.until(1);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([{ type: "text", text: "external user message" }]);
+      expect(harness.editorReads).toEqual([]);
+      expect(harness.pendingTimeouts()).toBe(0);
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      expect(harness.editorReads).toEqual(["review draft"]);
+      expect(harness.pendingTimeouts()).toBe(1);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a matching user message with non-text content does not consume relay correlation", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.calls.injected.until(1);
+      harness.setEditorText("review draft");
+
+      await harness.messageStart([
+        { type: "text", text: INBOUND_TEXT },
+        { type: "image", data: "AA==", mimeType: "image/png" },
+      ]);
+      expect(harness.editorReads).toEqual([]);
+      expect(harness.pendingTimeouts()).toBe(0);
+
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      expect(harness.editorReads).toEqual(["review draft"]);
+      expect(harness.pendingTimeouts()).toBe(1);
+
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("session shutdown invalidates pending correlation and restoration", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.calls.injected.until(1);
+      harness.setEditorText("review draft");
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      expect(harness.pendingTimeouts()).toBe(1);
+
+      await shutdown();
+      harness.setEditorText("");
+      harness.runNextTimeout();
+      expect(harness.editorText()).toBe("");
+      expect(harness.editorWrites).toEqual([]);
+
+      harness.setEditorText("new local draft");
+      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      expect(harness.editorReads).toEqual(["review draft"]);
+      expect(harness.pendingTimeouts()).toBe(0);
     } finally {
       await relay.close();
     }

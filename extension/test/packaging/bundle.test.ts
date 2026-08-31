@@ -17,6 +17,7 @@ test("the standalone bundle registers mesh through the OMP loader", async () => 
   expect(loaded.extensions).toHaveLength(1);
   expect([...loaded.extensions[0]!.tools.keys()]).toEqual(["mesh"]);
   expect([...loaded.extensions[0]!.handlers.keys()].sort()).toEqual([
+    "message_start",
     "session_shutdown",
     "session_start",
   ]);

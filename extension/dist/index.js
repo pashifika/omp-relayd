@@ -3457,6 +3457,27 @@ function ompRelay(pi) {
   let live = null;
   let generation = 0;
   const notified = new Set;
+  const pendingInboundInjections = new Map;
+  let protectedDraft = null;
+  let restorationGeneration = 0;
+  const markInboundInjection = (text) => {
+    pendingInboundInjections.set(text, (pendingInboundInjections.get(text) ?? 0) + 1);
+  };
+  const consumeInboundInjection = (text) => {
+    const count = pendingInboundInjections.get(text);
+    if (count === undefined)
+      return false;
+    if (count === 1)
+      pendingInboundInjections.delete(text);
+    else
+      pendingInboundInjections.set(text, count - 1);
+    return true;
+  };
+  const resetDraftProtection = () => {
+    pendingInboundInjections.clear();
+    protectedDraft = null;
+    restorationGeneration += 1;
+  };
   let pendingPurpose = null;
   let purposeDelivered = false;
   const armPurpose = (resolved) => {
@@ -3489,6 +3510,7 @@ function ompRelay(pi) {
           }
           const injection = buildInboundInjection(delivery, config.room, purpose);
           pi.appendEntry(injection.entryType, injection.details);
+          markInboundInjection(injection.text);
           pi.sendUserMessage(injection.text, {
             deliverAs: deferred ? "followUp" : "steer"
           });
@@ -3610,9 +3632,39 @@ function ompRelay(pi) {
       return executeMesh(host, args);
     }
   });
+  pi.on("message_start", (event, ctx) => {
+    if (ctx.mode !== INTERACTIVE_MODE || event.message.role !== "user")
+      return;
+    const content = event.message.content;
+    const text = typeof content === "string" ? content : content.length === 1 && content[0]?.type === "text" ? content[0].text : null;
+    if (text === null || !consumeInboundInjection(text))
+      return;
+    const currentDraft = ctx.ui.getEditorText();
+    if (currentDraft.length > 0) {
+      if (protectedDraft === null || currentDraft.startsWith(protectedDraft)) {
+        protectedDraft = currentDraft;
+      } else {
+        protectedDraft += currentDraft;
+      }
+    }
+    if (protectedDraft === null)
+      return;
+    const restore = ++restorationGeneration;
+    ctx.setTimeout(() => {
+      if (restore !== restorationGeneration || protectedDraft === null)
+        return;
+      const draft = protectedDraft;
+      protectedDraft = null;
+      const editorText = ctx.ui.getEditorText();
+      if (!editorText.startsWith(draft)) {
+        ctx.ui.setEditorText(draft + editorText);
+      }
+    }, 0);
+  });
   pi.on("session_start", async (_event, ctx) => {
     const thisGeneration = ++generation;
     notified.clear();
+    resetDraftProtection();
     pendingPurpose = null;
     purposeDelivered = false;
     const previous = client;
@@ -3653,6 +3705,7 @@ function ompRelay(pi) {
   });
   pi.on("session_shutdown", async () => {
     generation += 1;
+    resetDraftProtection();
     const active = client;
     client = null;
     live = null;

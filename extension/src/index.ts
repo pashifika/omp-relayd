@@ -1128,6 +1128,27 @@ export default function ompRelay(pi: ExtensionAPI): void {
   let live: { readonly config: RelayConfig; readonly startup: StartupMode } | null = null;
   let generation = 0;
   const notified = new Set<string>();
+  const pendingInboundInjections = new Map<string, number>();
+  let protectedDraft: string | null = null;
+  let restorationGeneration = 0;
+
+  const markInboundInjection = (text: string): void => {
+    pendingInboundInjections.set(text, (pendingInboundInjections.get(text) ?? 0) + 1);
+  };
+
+  const consumeInboundInjection = (text: string): boolean => {
+    const count = pendingInboundInjections.get(text);
+    if (count === undefined) return false;
+    if (count === 1) pendingInboundInjections.delete(text);
+    else pendingInboundInjections.set(text, count - 1);
+    return true;
+  };
+
+  const resetDraftProtection = (): void => {
+    pendingInboundInjections.clear();
+    protectedDraft = null;
+    restorationGeneration += 1;
+  };
 
   /**
    * The purpose still owed to this session, under `auto` only.
@@ -1234,14 +1255,14 @@ export default function ompRelay(pi: ExtensionAPI): void {
           // A `message` always steers: `deliverAs: "steer"` queues on the
           // steering queue, and the runtime's drain gate resumes from *any*
           // transcript tail when that queue is non-empty
-          // (agent-session.ts:6269-6275 in OMP 18.0.4), so it starts a turn on
+          // (agent-session.ts:6515-6521 in OMP 18.0.11), so it starts a turn on
           // an idle session and steers into a running one.
           //
           // A `notice` must not interrupt work in flight, so it defers with
           // `followUp` while the model is streaming. Idle, it steers -- there is
           // nothing to interrupt, and `followUp` would not start a turn at all:
           // a follow-up-only resume needs an `assistant`/`toolResult` tail
-          // (agent-session.ts:6281-6288 in OMP 18.0.4), which a fresh session
+          // (agent-session.ts:6527-6533 in OMP 18.0.11), which a fresh session
           // does not have.
           //
           // The idle test can race a run that begins before the delivery lands,
@@ -1272,13 +1293,14 @@ export default function ompRelay(pi: ExtensionAPI): void {
           // `developer` (compaction/messages.ts:194-211), ranking a remote peer
           // above the local operator. Not a bare `sendUserMessage`: with no
           // `deliverAs` it takes the prompt path, which auto-reads `@path` file
-          // mentions out of the remote body (agent-session.ts:5811-5820 in OMP
-          // 18.0.4) — and neither `expandPromptTemplates: false` nor the
+          // mentions out of the remote body (agent-session.ts:6045-6056 in OMP
+          // 18.0.11) — and neither `expandPromptTemplates: false` nor the
           // `> ` body quoting stops that, because a preceding space already
           // satisfies the mention boundary. That applies to a notice exactly
           // as it does to a message,
           // which is why the idle branch here is `steer` and not an omitted
           // `deliverAs`.
+          markInboundInjection(injection.text);
           pi.sendUserMessage(injection.text, {
             deliverAs: deferred ? "followUp" : "steer",
           });
@@ -1499,9 +1521,45 @@ export default function ompRelay(pi: ExtensionAPI): void {
     },
   });
 
+  pi.on("message_start", (event, ctx) => {
+    if (ctx.mode !== INTERACTIVE_MODE || event.message.role !== "user") return;
+    const content = event.message.content;
+    const text =
+      typeof content === "string"
+        ? content
+        : content.length === 1 && content[0]?.type === "text"
+          ? content[0].text
+          : null;
+    if (text === null || !consumeInboundInjection(text)) return;
+
+    const currentDraft = ctx.ui.getEditorText();
+    if (currentDraft.length > 0) {
+      if (protectedDraft === null || currentDraft.startsWith(protectedDraft)) {
+        protectedDraft = currentDraft;
+      } else {
+        protectedDraft += currentDraft;
+      }
+    }
+    if (protectedDraft === null) return;
+
+    const restore = ++restorationGeneration;
+    // OMP 18.0.11 clears non-local user drafts after extension handlers
+    // (agent-session.ts:2209-2240; event-controller.ts:911-920).
+    ctx.setTimeout(() => {
+      if (restore !== restorationGeneration || protectedDraft === null) return;
+      const draft = protectedDraft;
+      protectedDraft = null;
+      const editorText = ctx.ui.getEditorText();
+      if (!editorText.startsWith(draft)) {
+        ctx.ui.setEditorText(draft + editorText);
+      }
+    }, 0);
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     const thisGeneration = ++generation;
     notified.clear();
+    resetDraftProtection();
     pendingPurpose = null;
     purposeDelivered = false;
 
@@ -1557,6 +1615,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     generation += 1;
+    resetDraftProtection();
     const active = client;
     client = null;
     live = null;
