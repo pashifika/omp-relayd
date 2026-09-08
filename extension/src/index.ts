@@ -1131,6 +1131,21 @@ export default function ompRelay(pi: ExtensionAPI): void {
   const pendingInboundInjections = new Map<string, number>();
   let protectedDraft: string | null = null;
   let restorationGeneration = 0;
+  let receptionCount = 0;
+
+  const setReception = (ctx: ExtensionContext, lines?: string[]): void => {
+    if (ctx.mode !== INTERACTIVE_MODE) return;
+    try {
+      ctx.ui.setWidget("omp-relay-reception", lines);
+    } catch (error) {
+      pi.logger.error("OMP Relay reception display failed", { error: describe(error) });
+    }
+  };
+
+  const resetReception = (ctx: ExtensionContext): void => {
+    receptionCount = 0;
+    setReception(ctx);
+  };
 
   const markInboundInjection = (text: string): void => {
     pendingInboundInjections.set(text, (pendingInboundInjections.get(text) ?? 0) + 1);
@@ -1248,6 +1263,12 @@ export default function ompRelay(pi: ExtensionAPI): void {
       scheduler: schedulerFrom(ctx),
       handlers: {
         onDelivery(delivery) {
+          receptionCount += 1;
+          setReception(ctx, [
+            `Relay: ${receptionCount} received`,
+            `Latest ${delivery.type === "notice" ? "room announcement" : "direct message"} from ${singleLine(delivery.from)} · ${singleLine(delivery.id)}`,
+          ]);
+
           // Which delivery mode this frame takes, decided before the preamble
           // is claimed, because the preamble may ride only a delivery that
           // starts or steers a turn.
@@ -1378,6 +1399,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
       const previous = client;
       client = null;
       live = null;
+      resetReception(ctx);
       if (previous !== null) {
         // A host-requested shutdown, which the client contract already settles
         // pending `list` and `send` requests through with a stated failure
@@ -1556,10 +1578,16 @@ export default function ompRelay(pi: ExtensionAPI): void {
     }, 0);
   });
 
+  pi.on("session_switch", (_event, ctx) => {
+    resetReception(ctx);
+    resetDraftProtection();
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     const thisGeneration = ++generation;
     notified.clear();
     resetDraftProtection();
+    resetReception(ctx);
     pendingPurpose = null;
     purposeDelivered = false;
 
@@ -1613,9 +1641,10 @@ export default function ompRelay(pi: ExtensionAPI): void {
     connect(ctx, outcome.resolved);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     generation += 1;
     resetDraftProtection();
+    resetReception(ctx);
     const active = client;
     client = null;
     live = null;
