@@ -3681,10 +3681,12 @@ function ompRelay(pi) {
       }
     }, 0);
   });
-  pi.on("session_switch", (_event, ctx) => {
+  const resetConversation = (_event, ctx) => {
     resetReception(ctx);
     resetDraftProtection();
-  });
+  };
+  pi.on("session_switch", resetConversation);
+  pi.on("session_branch", resetConversation);
   pi.on("session_start", async (_event, ctx) => {
     const thisGeneration = ++generation;
     notified.clear();

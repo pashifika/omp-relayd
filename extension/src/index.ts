@@ -1578,10 +1578,12 @@ export default function ompRelay(pi: ExtensionAPI): void {
     }, 0);
   });
 
-  pi.on("session_switch", (_event, ctx) => {
+  const resetConversation = (_event: unknown, ctx: ExtensionContext): void => {
     resetReception(ctx);
     resetDraftProtection();
-  });
+  };
+  pi.on("session_switch", resetConversation);
+  pi.on("session_branch", resetConversation);
 
   pi.on("session_start", async (_event, ctx) => {
     const thisGeneration = ++generation;

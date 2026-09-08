@@ -1726,7 +1726,7 @@ describe("reception feedback", () => {
     }
   });
 
-  test("room changes, conversation replacement and shutdown clear the previous reception scope", async () => {
+  test.each(["session_switch", "session_branch"])("room changes, %s and shutdown clear the previous reception scope", async (event) => {
     const recorder = recordingRelay();
     const relay = await ScriptedRelay.start(recorder.script);
     try {
@@ -1742,7 +1742,7 @@ describe("reception feedback", () => {
       await harness.calls.injected.until(2);
       expect([...harness.widgets.values()].flat().join("\n")).toMatch(/1.*received/);
 
-      await harness.handlers.get("session_switch")?.({ type: "session_switch", reason: "new" }, harness.ctx);
+      await harness.handlers.get(event)?.({ type: event }, harness.ctx);
       expect(harness.widgets.size).toBe(0);
       recorder.deliver({ ...INBOUND, id: "new-conversation" });
       await harness.calls.injected.until(3);
@@ -2175,7 +2175,7 @@ describe("the session runtime", () => {
     }
   });
 
-  test.each(["session_shutdown", "session_switch"])("%s invalidates pending correlation and restoration", async (event) => {
+  test.each(["session_shutdown", "session_switch", "session_branch"])("%s invalidates pending correlation and restoration", async (event) => {
     const recorder = recordingRelay({ deliverOnReady: [INBOUND, NOTICE] });
     const relay = await ScriptedRelay.start(recorder.script);
     try {
