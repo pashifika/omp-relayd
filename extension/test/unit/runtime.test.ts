@@ -203,6 +203,7 @@ interface SessionHarness {
   readonly contextTimers: ContextTimers;
   readonly ctx: ExtensionContext;
   readonly notifications: string[];
+  readonly widgets: Map<string, string[]>;
   /**
    * Fires on every `ctx.ui.notify`, so a test can wait for a report the client
    * raised on its own instead of polling for it.
@@ -233,6 +234,7 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
   const contextTimers: ContextTimers = { timeouts: [], intervals: [] };
   const notifications: string[] = [];
   const notified = new Signal<string>();
+  const widgets = new Map<string, string[]>();
   let execute: ToolExecute | null = null;
   let idle = true;
   const editorReads: string[] = [];
@@ -309,6 +311,10 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
         notifications.push(message);
         notified.fire(message);
       },
+      setWidget(key: string, content: string[] | undefined) {
+        if (content === undefined) widgets.delete(key);
+        else widgets.set(key, content);
+      },
       getEditorText() {
         editorReads.push(editorText);
         return editorText;
@@ -344,6 +350,7 @@ function sessionHarness(cwd: string, mode = "tui"): SessionHarness {
     ctx,
     notifications,
     notified,
+    widgets,
     editorReads,
     editorWrites,
     setEditorText(text) {
@@ -1662,6 +1669,92 @@ describe("the machine's purpose under automatic startup", () => {
   });
 });
 
+describe("reception feedback", () => {
+  test("a busy mixed burst stays bounded and identifies the latest reception without editing input", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      await harness.mesh({ action: "join" });
+      harness.setEditorText("未送信のメモ");
+      for (let index = 0; index < 10; index += 1) {
+        recorder.deliver({
+          type: index % 2 === 0 ? "message" : "notice",
+          id: `burst-${index}`,
+          from: "sender\u001b[2J\nforged",
+          body: `Work item ${index}`,
+        });
+      }
+      await harness.calls.injected.until(10);
+
+      const display = [...harness.widgets.values()].flat().join("\n");
+      expect(harness.widgets.size).toBe(1);
+      expect(display).toMatch(/10.*received/);
+      expect(display).toContain("room announcement");
+      expect(display).toContain("burst-9");
+      expect(display).toContain("sender\uFFFD[2J\uFFFDforged");
+      expect(display).not.toMatch(/\u001b/);
+      expect(harness.calls.userMessages).toHaveLength(10);
+      expect(harness.calls.entries).toHaveLength(10);
+      expect(harness.editorText()).toBe("未送信のメモ");
+      expect(harness.editorWrites).toEqual([]);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a failed reception display still delivers each message and notice", async () => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      await harness.mesh({ action: "join" });
+      harness.ctx.ui.setWidget = () => { throw new Error("display unavailable"); };
+      recorder.deliver(INBOUND);
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+
+      expect(harness.calls.userMessages).toEqual([
+        { content: INBOUND_TEXT, options: { deliverAs: "steer" } },
+        { content: NOTICE_TEXT, options: { deliverAs: "followUp" } },
+      ]);
+      expect(harness.calls.entries).toHaveLength(2);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test.each(["session_switch", "session_branch"])("room changes, %s and shutdown clear the previous reception scope", async (event) => {
+    const recorder = recordingRelay();
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay);
+      await harness.mesh({ action: "join" });
+      recorder.deliver(INBOUND);
+      await harness.calls.injected.until(1);
+      expect([...harness.widgets.values()].flat().join("\n")).toContain("message-42");
+
+      await harness.mesh({ action: "join", task: "another-room" });
+      expect(harness.widgets.size).toBe(0);
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+      expect([...harness.widgets.values()].flat().join("\n")).toMatch(/1.*received/);
+
+      await harness.handlers.get(event)?.({ type: event }, harness.ctx);
+      expect(harness.widgets.size).toBe(0);
+      recorder.deliver({ ...INBOUND, id: "new-conversation" });
+      await harness.calls.injected.until(3);
+      expect([...harness.widgets.values()].flat().join("\n")).toMatch(/1.*received/);
+      await shutdown();
+      expect(harness.widgets.size).toBe(0);
+    } finally {
+      await relay.close();
+    }
+  });
+});
+
 describe("the session runtime", () => {
   test("schedules every client timer through the context, never the ambient timers", async () => {
     // The listener is started before the globals are replaced, and the wrappers
@@ -2082,26 +2175,27 @@ describe("the session runtime", () => {
     }
   });
 
-  test("session shutdown invalidates pending correlation and restoration", async () => {
-    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+  test.each(["session_shutdown", "session_switch", "session_branch"])("%s invalidates pending correlation and restoration", async (event) => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND, NOTICE] });
     const relay = await ScriptedRelay.start(recorder.script);
     try {
       const { harness, shutdown } = await startAutoSession(relay);
-      await harness.calls.injected.until(1);
+      await harness.calls.injected.until(2);
       harness.setEditorText("review draft");
       await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
       expect(harness.pendingTimeouts()).toBe(1);
 
-      await shutdown();
+      await harness.handlers.get(event)?.({ type: event, reason: "new" }, harness.ctx);
       harness.setEditorText("");
       harness.runNextTimeout();
       expect(harness.editorText()).toBe("");
       expect(harness.editorWrites).toEqual([]);
 
       harness.setEditorText("new local draft");
-      await harness.messageStart([{ type: "text", text: INBOUND_TEXT }]);
+      await harness.messageStart([{ type: "text", text: NOTICE_TEXT }]);
       expect(harness.editorReads).toEqual(["review draft"]);
       expect(harness.pendingTimeouts()).toBe(0);
+      await shutdown();
     } finally {
       await relay.close();
     }

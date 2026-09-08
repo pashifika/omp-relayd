@@ -261,13 +261,13 @@ jobs:
         timeout-minutes: 5
         run: bun run test:unit
 
-      - name: Build and smoke-test the standalone extension bundle
+      - name: Build the extension and verify installation packaging
         timeout-minutes: 5
         run: bun run test:packaging
 
-      # `test:packaging` rebuilds `dist/index.js` before loading it, so a green
-      # packaging step proves that a fresh bundle builds and loads -- never that
-      # the committed one matches the source beside it. The README tells an
+      # `test:packaging` rebuilds `dist/index.js` before testing installation;
+      # `interop` exercises that standalone bundle. Neither proves that the
+      # committed one matches the source beside it. The README tells an
       # operator to load the committed file directly after `git clone`, with no
       # build step, so without this a pull request carrying an innocuous source
       # diff and a substituted bundle would merge green.

@@ -36,7 +36,7 @@ OMP Relay lets two OMP terminals hand work to each other without sharing a proce
 For normal use:
 
 - Docker with Compose v2
-- Oh My Pi `18.0.1`
+- Oh My Pi (verified with `18.1.14`)
 
 Normal use pulls a published image and needs no Rust toolchain. To rebuild or test the extension, install Bun `1.3.14`. To build the relay outside Docker, install Rust `1.85.0` or later.
 
@@ -336,6 +336,10 @@ Use mesh with action announce. Say: I am rewriting the migrations in db/; leave 
 A `routed` receipt means the relay queued the message for the recipient. It does not mean the recipient read, accepted, or answered it. Other results distinguish an offline peer, a full recipient queue, and an invalid target. An announcement's counts read the same way: `delivered` peers took it into their queues, `shed` peers were not reading their connection and never received it, and both counts zero means the room held nobody else — a fact about the room rather than a failed request. The `omp-relay` skill carries the rest of the workflow: resolving an informal reference against the roster, stopping when nobody else is in the room, and writing a briefing the far end can act on without shared context.
 
 ### Receiving a message mid-run
+
+The interactive receiver shows a bounded indicator above the editor: the reception count and the latest delivery's kind, sender and ID. It updates while a model or tool is busy, without replacing your input. It means **received locally**, not processed or answered. A room or conversation change clears it; reconnecting does not count old messages again.
+
+This display does not change delivery: directed messages use steering, and room announcements wait until the current turn ends when the receiver is busy. It adds no message history, acknowledgement or attachment download.
 
 An inbound message is delivered as steering — the same path OMP uses for what you type into a session that is already working. It does not abort the run, but under OMP's default `interruptMode: immediate` the runtime skips tool calls the model had queued and not yet started, then tells it to retry them. A session receiving several messages in a row can therefore be seen cancelling and repeating work.
 
