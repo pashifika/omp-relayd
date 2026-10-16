@@ -10,11 +10,14 @@
  *   mode: local
  *   address: 127.0.0.1:7788
  * startup: manual
+ * receptionDisplay: false
  * peer:
  *   name: macbook-reviewer
  *   purpose: |
  *     This terminal has the Linux toolchain. Prefer running builds here.
  * ```
+ *
+ * `receptionDisplay` enables only local reception feedback; it defaults to Off.
  *
  * The project file, `<project_root>/.omp/omp-relay.yml`, is committed and
  * carries what belongs to the work:
@@ -144,6 +147,8 @@ export interface RelayConfig {
 export interface GlobalConfig {
   readonly transport: TransportConfig;
   readonly startup: StartupMode;
+  /** Whether to show local reception feedback. Defaults to false. */
+  readonly receptionDisplay: boolean;
   /** The configured peer name, or `null` when derivation should supply one. */
   readonly peer: string | null;
   /** Operator-authored participation policy for this machine, or `null`. */
@@ -228,6 +233,7 @@ export interface ProjectRoot {
 export interface ResolvedClient {
   readonly config: RelayConfig;
   readonly startup: StartupMode;
+  readonly receptionDisplay: boolean;
   readonly purpose: string | null;
   readonly sources: ResolvedSources;
   readonly globalPath: string;
@@ -446,7 +452,13 @@ export async function loadProjectConfig(path: string): Promise<ProjectOutcome> {
 // ---------------------------------------------------------------------------
 
 /** Fields the project layer may not carry, and why placement is enforced. */
-const GLOBAL_ONLY_FIELDS: readonly string[] = ["transport", "startup", "peer", "purpose"];
+const GLOBAL_ONLY_FIELDS: readonly string[] = [
+  "transport",
+  "startup",
+  "receptionDisplay",
+  "peer",
+  "purpose",
+];
 
 /**
  * Validates an already-parsed global document.
@@ -520,6 +532,14 @@ export function validateGlobalConfig(
     startup = rawStartup;
   }
 
+  const rawReceptionDisplay = root["receptionDisplay"];
+  if (rawReceptionDisplay !== undefined && typeof rawReceptionDisplay !== "boolean") {
+    return problem(
+      "receptionDisplay",
+      `receptionDisplay must be a boolean in ${path}, found ${typeName(rawReceptionDisplay)}`,
+    );
+  }
+
   let peerName: string | null = null;
   let purpose: string | null = null;
   const rawPeer = root["peer"];
@@ -550,6 +570,7 @@ export function validateGlobalConfig(
     config: {
       transport: { mode: "local", host: address.host, port: address.port },
       startup,
+      receptionDisplay: rawReceptionDisplay ?? false,
       peer: peerName,
       purpose,
     },
@@ -795,6 +816,7 @@ export async function resolveWithGlobal(
     resolved: {
       config: { transport: global.transport, room: { project, task }, peer },
       startup: global.startup,
+      receptionDisplay: global.receptionDisplay,
       purpose: global.purpose,
       sources: {
         project: projectSource,

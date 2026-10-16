@@ -226,6 +226,7 @@ describe("the global layer's schema", () => {
     expect(outcome.config).toEqual({
       transport: { mode: "local", host: "127.0.0.1", port: 7788 },
       startup: "manual",
+      receptionDisplay: false,
       peer: "macbook-reviewer",
       purpose: null,
     });
@@ -295,6 +296,31 @@ describe("the global layer's schema", () => {
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.problem.field).toBe("startup");
+  });
+
+  interface InvalidReceptionDisplayCase {
+    readonly scenario: string;
+    readonly value: string;
+    readonly expected: string;
+  }
+
+  const invalidReceptionDisplays: InvalidReceptionDisplayCase[] = [
+    { scenario: "a quoted false receptionDisplay is refused", value: '"false"', expected: "receptionDisplay" },
+    { scenario: "a quoted true receptionDisplay is refused", value: '"true"', expected: "receptionDisplay" },
+    { scenario: "a numeric receptionDisplay is refused", value: "0", expected: "receptionDisplay" },
+    { scenario: "a null receptionDisplay is refused", value: "null", expected: "receptionDisplay" },
+    { scenario: "an empty receptionDisplay is refused", value: "", expected: "receptionDisplay" },
+    { scenario: "a list receptionDisplay is refused", value: "[false]", expected: "receptionDisplay" },
+    { scenario: "a mapping receptionDisplay is refused", value: "{enabled: false}", expected: "receptionDisplay" },
+  ];
+
+  test.each(invalidReceptionDisplays)("$scenario", ({ value, expected }) => {
+    const outcome = check(`${GLOBAL}receptionDisplay: ${value}\n`);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.problem.field).toBe(expected);
+    expect(outcome.problem.reason).toContain(expected);
+    expect(outcome.problem.reason).toContain("/g/omp-relay.yml");
   });
 
   test("a peer name at 65 UTF-8 bytes is refused before anything is sent", () => {
@@ -439,6 +465,16 @@ describe("field placement is enforced by name and by file", () => {
     },
     { scenario: "a project file may not name startup", field: "startup", block: "startup: auto\n" },
     {
+      scenario: "a project file may not enable receptionDisplay",
+      field: "receptionDisplay",
+      block: "receptionDisplay: true\n",
+    },
+    {
+      scenario: "a project file may not disable receptionDisplay",
+      field: "receptionDisplay",
+      block: "receptionDisplay: false\n",
+    },
+    {
       scenario: "a project file may not name peer",
       field: "peer",
       block: "peer:\n  name: stolen\n",
@@ -565,6 +601,53 @@ describe("loading", () => {
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.problem.reason).toContain("not valid YAML");
+  });
+});
+
+describe("reception display resolution", () => {
+  interface ReceptionDisplayCase {
+    readonly scenario: string;
+    readonly block: string;
+    readonly expected: boolean;
+  }
+
+  const receptionDisplays: ReceptionDisplayCase[] = [
+    { scenario: "an omitted receptionDisplay resolves to Off", block: "", expected: false },
+    { scenario: "an explicit false receptionDisplay resolves to Off", block: "receptionDisplay: false\n", expected: false },
+    { scenario: "an explicit true receptionDisplay resolves to On", block: "receptionDisplay: true\n", expected: true },
+  ];
+
+  test.each(receptionDisplays)("$scenario", async ({ block, expected }) => {
+    const scope = await machine({ global: `${GLOBAL}${block}` });
+    const loaded = await loadGlobalConfig(scope.env);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.config.receptionDisplay).toBe(expected);
+
+    const outcome = await resolveClient({ env: scope.env, cwd: scope.projectRoot });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.resolved.receptionDisplay).toBe(expected);
+    expect(outcome.resolved.config).toEqual({
+      transport: { mode: "local", host: "127.0.0.1", port: 7788 },
+      room: { project: "omp-relayd", task: "layer-client-configuration" },
+      peer: "macbook-reviewer",
+    });
+  });
+
+  test("the active agent directory supplies receptionDisplay instead of the environment directory", async () => {
+    const environment = await machine({ global: `${GLOBAL}receptionDisplay: false\n` });
+    const active = await machine({ global: `${GLOBAL}receptionDisplay: true\n` });
+    const outcome = await resolveClient({
+      env: environment.env,
+      cwd: environment.projectRoot,
+      agentDir: active.agentDir,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.resolved.globalPath).toBe(active.globalPath);
+    expect(outcome.resolved.receptionDisplay).toBe(true);
   });
 });
 

@@ -1132,6 +1132,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
   let protectedDraft: string | null = null;
   let restorationGeneration = 0;
   let receptionCount = 0;
+  let receptionDisplay = false;
 
   const setReception = (ctx: ExtensionContext, lines?: string[]): void => {
     if (ctx.mode !== INTERACTIVE_MODE) return;
@@ -1145,6 +1146,12 @@ export default function ompRelay(pi: ExtensionAPI): void {
   const resetReception = (ctx: ExtensionContext): void => {
     receptionCount = 0;
     setReception(ctx);
+  };
+
+  const adoptReceptionDisplay = (ctx: ExtensionContext, enabled: boolean): void => {
+    if (receptionDisplay === enabled) return;
+    receptionDisplay = enabled;
+    resetReception(ctx);
   };
 
   const markInboundInjection = (text: string): void => {
@@ -1257,17 +1264,20 @@ export default function ompRelay(pi: ExtensionAPI): void {
    * none, because it does not await.
    */
   const connect = (ctx: ExtensionContext, resolved: ResolvedClient): RelayClient => {
+    adoptReceptionDisplay(ctx, resolved.receptionDisplay);
     const config = resolved.config;
     const next = new RelayClient({
       config,
       scheduler: schedulerFrom(ctx),
       handlers: {
         onDelivery(delivery) {
-          receptionCount += 1;
-          setReception(ctx, [
-            `Relay: ${receptionCount} received`,
-            `Latest ${delivery.type === "notice" ? "room announcement" : "direct message"} from ${singleLine(delivery.from)} · ${singleLine(delivery.id)}`,
-          ]);
+          if (receptionDisplay) {
+            receptionCount += 1;
+            setReception(ctx, [
+              `Relay: ${receptionCount} received`,
+              `Latest ${delivery.type === "notice" ? "room announcement" : "direct message"} from ${singleLine(delivery.from)} · ${singleLine(delivery.id)}`,
+            ]);
+          }
 
           // Which delivery mode this frame takes, decided before the preamble
           // is claimed, because the preamble may ride only a delivery that
@@ -1394,6 +1404,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
 
     let active: RelayClient;
     if (unchanged) {
+      adoptReceptionDisplay(ctx, resolved.receptionDisplay);
       active = client as RelayClient;
     } else {
       const previous = client;
@@ -1589,6 +1600,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
     const thisGeneration = ++generation;
     notified.clear();
     resetDraftProtection();
+    receptionDisplay = false;
     resetReception(ctx);
     pendingPurpose = null;
     purposeDelivered = false;
@@ -1646,6 +1658,7 @@ export default function ompRelay(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (_event, ctx) => {
     generation += 1;
     resetDraftProtection();
+    receptionDisplay = false;
     resetReception(ctx);
     const active = client;
     client = null;

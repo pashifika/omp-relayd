@@ -157,14 +157,14 @@ Configuration is read from two files, and each field is accepted in exactly one 
 
 | File | Carries | Committed? |
 |---|---|---|
-| `~/.omp/agent/omp-relay.yml` | `transport`, `startup`, `peer` | No. It is your machine's. |
+| `~/.omp/agent/omp-relay.yml` | `transport`, `startup`, `receptionDisplay`, `peer` | No. It is your machine's. |
 | `<project-root>/.omp/omp-relay.yml` | `room` | Yes. Both ends read the same one. |
 
 The split follows how long each value lives. A relay address and a peer name describe one machine; a room describes one piece of work, and two checkouts of a repository should agree on it without either operator configuring anything.
 
 Three rules follow from that, and validation enforces all three:
 
-- A project file may not name `transport`, `startup`, `peer`, or `purpose`. It is committed, so a checkout able to name `transport` could redirect your session's traffic, and one able to name `purpose` could inject instructions into every agent that joins from it.
+- A project file may not name `transport`, `startup`, `receptionDisplay`, `peer`, or `purpose`. It is committed, so a checkout able to name `transport` could redirect your session's traffic, and one able to name `purpose` could inject instructions into every agent that joins from it. Display preferences belong to the operator, not the checkout.
 - The global file may not name `room`.
 - With no global file, the extension stays inert. The global file is the grant: cloning a repository that carries a project file never causes a connection.
 
@@ -177,6 +177,7 @@ transport:
   mode: local
   address: 127.0.0.1:7788
 startup: manual
+receptionDisplay: false
 peer:
   # Optional. Omitted, the peer name is the first label of this host's name,
   # so `MacBook-Pro.local` becomes `MacBook-Pro`.
@@ -193,6 +194,7 @@ GLOBAL
 | `transport.mode` | string | Exactly `local` |
 | `transport.address` | string | `host:port`, with port `1`–`65535`; bracket IPv6 addresses |
 | `startup` | string | `manual` or `auto`. Optional; defaults to `manual` |
+| `receptionDisplay` | boolean | Optional; defaults to `false` (Off). `true` enables the reception indicator. Strings, null, and other types are rejected |
 | `peer.name` | string | Optional. Non-empty, at most 64 UTF-8 bytes, no `/` or `@`, no leading or trailing whitespace. Defaults to the first label of the host name |
 | `peer.purpose` | string | Optional. At most 4096 UTF-8 bytes of your own instructions to the agent on this machine |
 
@@ -337,7 +339,11 @@ A `routed` receipt means the relay queued the message for the recipient. It does
 
 ### Receiving a message mid-run
 
-The interactive receiver shows a bounded indicator above the editor: the reception count and the latest delivery's kind, sender and ID. It updates while a model or tool is busy, without replacing your input. It means **received locally**, not processed or answered. A room or conversation change clears it; reconnecting does not count old messages again.
+Reception feedback above the editor is **Off by default**, including after upgrading an existing configuration. To enable it, set `receptionDisplay: true` in your global `omp-relay.yml` and join again, or restart the session and join if startup is manual. Editing the file alone does not update a running session.
+
+When enabled, a bounded indicator shows the reception count and the latest delivery's kind, sender and ID. It updates while a model or tool is busy, without replacing your input. It means **received locally**, not processed or answered. A room or conversation change clears it; reconnecting does not count old messages again.
+
+Set `receptionDisplay: false` (or remove it) and join again to remove the indicator. An identical live room/peer join does not reconnect. Enabling waits for the next arrival and starts at one; a repeated On join preserves the count. Off hides only this indicator, not messages, session records, or error notifications.
 
 This display does not change delivery: directed messages use steering, and room announcements wait until the current turn ends when the receiver is busy. It adds no message history, acknowledgement or attachment download.
 

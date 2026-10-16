@@ -2720,7 +2720,13 @@ async function loadProjectConfig(path) {
   }
   return { ok: true, path, config: validated.config };
 }
-var GLOBAL_ONLY_FIELDS = ["transport", "startup", "peer", "purpose"];
+var GLOBAL_ONLY_FIELDS = [
+  "transport",
+  "startup",
+  "receptionDisplay",
+  "peer",
+  "purpose"
+];
 function validateGlobalConfig(document, path) {
   const root = asRecord(document);
   if (root === null) {
@@ -2753,6 +2759,10 @@ function validateGlobalConfig(document, path) {
     }
     startup = rawStartup;
   }
+  const rawReceptionDisplay = root["receptionDisplay"];
+  if (rawReceptionDisplay !== undefined && typeof rawReceptionDisplay !== "boolean") {
+    return problem("receptionDisplay", `receptionDisplay must be a boolean in ${path}, found ${typeName(rawReceptionDisplay)}`);
+  }
   let peerName = null;
   let purpose = null;
   const rawPeer = root["peer"];
@@ -2779,6 +2789,7 @@ function validateGlobalConfig(document, path) {
     config: {
       transport: { mode: "local", host: address.host, port: address.port },
       startup,
+      receptionDisplay: rawReceptionDisplay ?? false,
       peer: peerName,
       purpose
     }
@@ -2899,6 +2910,7 @@ async function resolveWithGlobal(global, globalPath, options) {
     resolved: {
       config: { transport: global.transport, room: { project, task }, peer },
       startup: global.startup,
+      receptionDisplay: global.receptionDisplay,
       purpose: global.purpose,
       sources: {
         project: projectSource,
@@ -3461,6 +3473,7 @@ function ompRelay(pi) {
   let protectedDraft = null;
   let restorationGeneration = 0;
   let receptionCount = 0;
+  let receptionDisplay = false;
   const setReception = (ctx, lines) => {
     if (ctx.mode !== INTERACTIVE_MODE)
       return;
@@ -3473,6 +3486,12 @@ function ompRelay(pi) {
   const resetReception = (ctx) => {
     receptionCount = 0;
     setReception(ctx);
+  };
+  const adoptReceptionDisplay = (ctx, enabled) => {
+    if (receptionDisplay === enabled)
+      return;
+    receptionDisplay = enabled;
+    resetReception(ctx);
   };
   const markInboundInjection = (text) => {
     pendingInboundInjections.set(text, (pendingInboundInjections.get(text) ?? 0) + 1);
@@ -3510,17 +3529,20 @@ function ompRelay(pi) {
     }
   };
   const connect2 = (ctx, resolved) => {
+    adoptReceptionDisplay(ctx, resolved.receptionDisplay);
     const config = resolved.config;
     const next = new RelayClient({
       config,
       scheduler: schedulerFrom(ctx),
       handlers: {
         onDelivery(delivery) {
-          receptionCount += 1;
-          setReception(ctx, [
-            `Relay: ${receptionCount} received`,
-            `Latest ${delivery.type === "notice" ? "room announcement" : "direct message"} from ${singleLine(delivery.from)} \xB7 ${singleLine(delivery.id)}`
-          ]);
+          if (receptionDisplay) {
+            receptionCount += 1;
+            setReception(ctx, [
+              `Relay: ${receptionCount} received`,
+              `Latest ${delivery.type === "notice" ? "room announcement" : "direct message"} from ${singleLine(delivery.from)} \xB7 ${singleLine(delivery.id)}`
+            ]);
+          }
           const deferred = delivery.type === "notice" && !ctx.isIdle();
           const purpose = deferred ? null : pendingPurpose;
           if (purpose !== null) {
@@ -3568,6 +3590,7 @@ function ompRelay(pi) {
     const unchanged = current !== null && client !== null && client.state === "ready" && current.config.room.project === resolved.config.room.project && current.config.room.task === resolved.config.room.task && current.config.peer === resolved.config.peer;
     let active;
     if (unchanged) {
+      adoptReceptionDisplay(ctx, resolved.receptionDisplay);
       active = client;
     } else {
       const previous = client;
@@ -3691,6 +3714,7 @@ function ompRelay(pi) {
     const thisGeneration = ++generation;
     notified.clear();
     resetDraftProtection();
+    receptionDisplay = false;
     resetReception(ctx);
     pendingPurpose = null;
     purposeDelivered = false;
@@ -3733,6 +3757,7 @@ function ompRelay(pi) {
   pi.on("session_shutdown", async (_event, ctx) => {
     generation += 1;
     resetDraftProtection();
+    receptionDisplay = false;
     resetReception(ctx);
     const active = client;
     client = null;

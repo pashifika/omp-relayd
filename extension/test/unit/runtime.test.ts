@@ -12,7 +12,7 @@
  * called directly proves nothing about whether the runtime ever calls it.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,7 @@ import {
   REQUEST_TIMEOUT_MS,
   type Report,
 } from "../../src/client.ts";
+import * as config from "../../src/config.ts";
 import {
   AGENT_DIR_ENV,
   CONFIG_FILE_NAME,
@@ -405,6 +406,7 @@ interface Layers {
 interface GlobalLayer {
   readonly port: number;
   readonly startup?: "manual" | "auto";
+  readonly receptionDisplay?: boolean;
   readonly purpose?: string;
 }
 
@@ -417,6 +419,9 @@ function writeGlobal(agentDir: string, options: GlobalLayer): void {
       "  mode: local",
       `  address: 127.0.0.1:${options.port}`,
       ...(options.startup === undefined ? [] : [`startup: ${options.startup}`]),
+      ...(options.receptionDisplay === undefined
+        ? []
+        : [`receptionDisplay: ${options.receptionDisplay}`]),
       "peer:",
       `  name: ${PEER}`,
       ...(options.purpose === undefined ? [] : [`  purpose: ${JSON.stringify(options.purpose)}`]),
@@ -601,12 +606,13 @@ const ADMIT_AND_DELIVER: Script = (frame, session) => {
  */
 async function startAutoSession(
   relay: ScriptedRelay,
-  options: { purpose?: string; idle?: boolean } = {},
+  options: { purpose?: string; idle?: boolean; receptionDisplay?: boolean } = {},
 ): Promise<{ harness: SessionHarness; shutdown: () => Promise<void>; written: Layers }> {
   const written = layers({
     port: relay.port,
     startup: "auto",
     ...(options.purpose === undefined ? {} : { purpose: options.purpose }),
+    ...(options.receptionDisplay === undefined ? {} : { receptionDisplay: options.receptionDisplay }),
   });
   const harness = sessionHarness(written.projectRoot);
   if (options.idle !== undefined) harness.setIdle(options.idle);
@@ -1670,11 +1676,316 @@ describe("the machine's purpose under automatic startup", () => {
 });
 
 describe("reception feedback", () => {
+  test("automatic startup enables feedback before a delivery on the handshake", async () => {
+    const relay = await ScriptedRelay.start(ADMIT_AND_DELIVER);
+    try {
+      const { harness, shutdown } = await startAutoSession(relay, { receptionDisplay: true });
+      await harness.calls.injected.until(1);
+
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 1 received");
+      expect(harness.calls.entries).toHaveLength(1);
+      expect(relay.connections).toBe(1);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("identical joins toggle feedback without replay or reconnect and preserve unchanged On", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay);
+      await harness.calls.injected.until(1);
+      expect(harness.widgets.size).toBe(0);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: true });
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+      expect(harness.widgets.size).toBe(0);
+
+      const enabled = await harness.mesh({ action: "join" });
+      expect(enabled.details["unchanged"]).toBe(true);
+      expect(harness.widgets.size).toBe(0);
+      recorder.deliver(INBOUND);
+      await harness.calls.injected.until(3);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 1 received");
+      const displayed = harness.widgets.get("omp-relay-reception");
+
+      const unchanged = await harness.mesh({ action: "join" });
+      expect(unchanged.details["unchanged"]).toBe(true);
+      expect(harness.widgets.get("omp-relay-reception")).toEqual(displayed);
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(4);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 2 received");
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      const disabled = await harness.mesh({ action: "join" });
+      expect(disabled.details["unchanged"]).toBe(true);
+      expect(harness.widgets.size).toBe(0);
+      recorder.deliver(INBOUND);
+      await harness.calls.injected.until(5);
+      expect(harness.widgets.size).toBe(0);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: true });
+      const reenabled = await harness.mesh({ action: "join" });
+      expect(reenabled.details["unchanged"]).toBe(true);
+      expect(harness.widgets.size).toBe(0);
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(6);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 1 received");
+      expect(harness.calls.userMessages).toHaveLength(6);
+      expect(harness.calls.entries).toHaveLength(6);
+      expect(recorder.hellos).toEqual([{ ...ROOM, peer: PEER }]);
+      expect(relay.connections).toBe(1);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("invalid configuration leaves the live preference and count intact", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { receptionDisplay: true });
+      await harness.calls.injected.until(1);
+      const displayed = harness.widgets.get("omp-relay-reception");
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      writeFileSync(projectConfigPath(written.projectRoot), "room: []\n", "utf8");
+      const failed = await harness.mesh({ action: "join" });
+      expect(failed.details["status"]).toBe("failed");
+      expect(harness.widgets.get("omp-relay-reception")).toEqual(displayed);
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 2 received");
+      expect(relay.connections).toBe(1);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("a superseded resolution cannot disable the newer join's feedback", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    const resolved = new Signal<void>();
+    const release = Promise.withResolvers<void>();
+    const resolveClient = config.resolveClient;
+    const resolving = spyOn(config, "resolveClient");
+    let parked: Promise<MeshToolResult> | undefined;
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { receptionDisplay: true });
+      await harness.calls.injected.until(1);
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      resolving.mockImplementationOnce(async (options) => {
+        const outcome = await resolveClient(options);
+        resolved.fire(undefined);
+        await release.promise;
+        return outcome;
+      });
+      parked = harness.mesh({ action: "join" });
+      await resolved.until(1);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: true });
+      const winner = await harness.mesh({ action: "join" });
+      expect(winner.details["unchanged"]).toBe(true);
+      release.resolve();
+      const superseded = await parked;
+      expect(superseded.details["status"]).toBe("failed");
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 2 received");
+      expect(relay.connections).toBe(1);
+      await shutdown();
+    } finally {
+      release.resolve();
+      await parked;
+      resolving.mockRestore();
+      await relay.close();
+    }
+  });
+
+  test("a replacement superseded during shutdown cannot overwrite the winning preference", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    const stopped = new Signal<void>();
+    const release = Promise.withResolvers<void>();
+    const stop = RelayClient.prototype.stop;
+    const stopping = spyOn(RelayClient.prototype, "stop");
+    let parked: Promise<MeshToolResult> | undefined;
+    let shutdown: (() => Promise<void>) | undefined;
+    try {
+      const session = await startAutoSession(relay, { receptionDisplay: true });
+      shutdown = session.shutdown;
+      const { harness, written } = session;
+      await harness.calls.injected.until(1);
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      stopping.mockImplementationOnce(async function (this: RelayClient) {
+        await stop.call(this);
+        stopped.fire(undefined);
+        await release.promise;
+      });
+      parked = harness.mesh({ action: "join", task: "superseded-room" });
+      await stopped.until(1);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: true });
+      const winner = await harness.mesh({ action: "join", task: "winning-room" });
+      expect(winner.details["task"]).toBe("winning-room");
+      await harness.calls.injected.until(2);
+      release.resolve();
+      const superseded = await parked;
+      expect(superseded.details["status"]).toBe("failed");
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 1 received");
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(3);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 2 received");
+      expect(harness.calls.entries).toHaveLength(3);
+      expect(recorder.hellos).toEqual([
+        { ...ROOM, peer: PEER },
+        { project: ROOM.project, task: "winning-room", peer: PEER },
+      ]);
+      expect(relay.connections).toBe(2);
+    } finally {
+      release.resolve();
+      await parked;
+      stopping.mockRestore();
+      await shutdown?.();
+      await relay.close();
+    }
+  });
+
+  test("an identical join applies Off before its roster and retains it after refusal", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { receptionDisplay: true });
+      await harness.calls.injected.until(1);
+      const requested = new Signal<{ frame: unknown; session: RelaySession }>();
+      relay.rescript((frame, session) => {
+        if (isFrame(frame, "list")) requested.fire({ frame, session });
+        else recorder.script(frame, session);
+      });
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      const joining = harness.mesh({ action: "join" });
+      await requested.until(1);
+      expect(harness.widgets.size).toBe(0);
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+      expect(harness.widgets.size).toBe(0);
+
+      const request = requested.last;
+      if (request === undefined) throw new Error("no roster request was received");
+      request.session.send({
+        type: "error",
+        code: "malformed_frame",
+        message: "the roster is unavailable",
+        request_id: String(frameField(request.frame, "request_id")),
+      });
+      const joined = await joining;
+      expect(joined.details["status"]).toBe("roster_unknown");
+      expect(joined.details["unchanged"]).toBe(true);
+      recorder.deliver(INBOUND);
+      await harness.calls.injected.until(3);
+      expect(harness.widgets.size).toBe(0);
+      expect(harness.calls.entries).toHaveLength(3);
+      expect(relay.connections).toBe(1);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("fresh session starts do not inherit On, with or without preceding shutdown", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    try {
+      const { harness, shutdown, written } = await startAutoSession(relay, { receptionDisplay: true });
+      await harness.calls.injected.until(1);
+      expect(harness.widgets.size).toBe(1);
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "auto" });
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      await harness.calls.injected.until(2);
+      expect(harness.widgets.size).toBe(0);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: true });
+      await harness.mesh({ action: "join" });
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(3);
+      expect(harness.widgets.size).toBe(1);
+      await shutdown();
+      expect(harness.widgets.size).toBe(0);
+
+      writeGlobal(written.agentDir, { port: relay.port, startup: "auto" });
+      await harness.handlers.get("session_start")?.({ type: "session_start" }, harness.ctx);
+      await harness.calls.injected.until(4);
+      expect(harness.widgets.size).toBe(0);
+      expect(harness.calls.entries).toHaveLength(4);
+      await shutdown();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  test("automatic reconnect retains On and its count without rereading an edited file", async () => {
+    const recorder = recordingRelay();
+    const connections = new Signal<RelaySession>();
+    const relay = await ScriptedRelay.start((frame, session) => {
+      recorder.script(frame, session);
+      if (isFrame(frame, "hello")) connections.fire(session);
+    });
+    const written = layers({ port: relay.port, receptionDisplay: true });
+    const harness = sessionHarness(written.projectRoot);
+    const scheduler = new FakeScheduler();
+    const ctx = {
+      ...harness.ctx,
+      setTimeout: scheduler.setTimeout.bind(scheduler),
+      setInterval: scheduler.setInterval.bind(scheduler),
+      clearTimer: scheduler.clearTimeout.bind(scheduler),
+    } as unknown as ExtensionContext;
+    ompRelay(harness.api);
+    try {
+      await harness.mesh({ action: "join" }, ctx);
+      recorder.deliver(INBOUND);
+      await harness.calls.injected.until(1);
+      const displayed = harness.widgets.get("omp-relay-reception");
+      expect(displayed?.[0]).toBe("Relay: 1 received");
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      const connection = connections.last;
+      if (connection === undefined) throw new Error("no connection was admitted");
+      connection.drop();
+      await harness.notified.until(1);
+      const intervals = scheduler.delaysOf("interval").length;
+      scheduler.fireNewest("timeout");
+      await connections.until(2);
+      // Outbound hello and inbound ready each arm the heartbeat.
+      await scheduler.until("interval", intervals + 2, HEARTBEAT_INTERVAL_MS);
+      const listed = await harness.mesh({ action: "list" }, ctx);
+      expect(listed.details["peers"]).toEqual([PEER]);
+      expect(harness.widgets.get("omp-relay-reception")).toEqual(displayed);
+      expect(harness.calls.userMessages).toHaveLength(1);
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(2);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 2 received");
+      expect(recorder.hellos).toEqual([{ ...ROOM, peer: PEER }, { ...ROOM, peer: PEER }]);
+    } finally {
+      await harness.handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+      await relay.close();
+    }
+  });
+
   test("a busy mixed burst stays bounded and identifies the latest reception without editing input", async () => {
     const recorder = recordingRelay();
     const relay = await ScriptedRelay.start(recorder.script);
     try {
-      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false, receptionDisplay: true });
       await harness.mesh({ action: "join" });
       harness.setEditorText("未送信のメモ");
       for (let index = 0; index < 10; index += 1) {
@@ -1690,6 +2001,8 @@ describe("reception feedback", () => {
       const display = [...harness.widgets.values()].flat().join("\n");
       expect(harness.widgets.size).toBe(1);
       expect(display).toMatch(/10.*received/);
+      expect(harness.widgets.get("omp-relay-reception")).toHaveLength(2);
+      expect(display).not.toContain("Work item");
       expect(display).toContain("room announcement");
       expect(display).toContain("burst-9");
       expect(display).toContain("sender\uFFFD[2J\uFFFDforged");
@@ -1708,7 +2021,7 @@ describe("reception feedback", () => {
     const recorder = recordingRelay();
     const relay = await ScriptedRelay.start(recorder.script);
     try {
-      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      const { harness, shutdown, written } = await startAutoSession(relay, { idle: false, receptionDisplay: true });
       await harness.mesh({ action: "join" });
       harness.ctx.ui.setWidget = () => { throw new Error("display unavailable"); };
       recorder.deliver(INBOUND);
@@ -1720,6 +2033,18 @@ describe("reception feedback", () => {
         { content: NOTICE_TEXT, options: { deliverAs: "followUp" } },
       ]);
       expect(harness.calls.entries).toHaveLength(2);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      const disabled = await harness.mesh({ action: "join" });
+      expect(disabled.details["unchanged"]).toBe(true);
+      recorder.deliver(INBOUND);
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(4);
+      expect(harness.calls.userMessages.slice(2)).toEqual([
+        { content: INBOUND_TEXT, options: { deliverAs: "steer" } },
+        { content: NOTICE_TEXT, options: { deliverAs: "followUp" } },
+      ]);
+      expect(harness.calls.entries).toHaveLength(4);
       await shutdown();
     } finally {
       await relay.close();
@@ -1730,7 +2055,7 @@ describe("reception feedback", () => {
     const recorder = recordingRelay();
     const relay = await ScriptedRelay.start(recorder.script);
     try {
-      const { harness, shutdown } = await startAutoSession(relay);
+      const { harness, shutdown } = await startAutoSession(relay, { receptionDisplay: true });
       await harness.mesh({ action: "join" });
       recorder.deliver(INBOUND);
       await harness.calls.injected.until(1);
@@ -1811,6 +2136,7 @@ describe("the session runtime", () => {
     try {
       const { harness, shutdown } = await startAutoSession(relay);
       await harness.calls.injected.until(1);
+      expect(harness.widgets.size).toBe(0);
 
       // The delivery option is asserted, not treated as incidental: it is the
       // property that keeps remote text off the prompt-preprocessing path. A
@@ -1851,8 +2177,9 @@ describe("the session runtime", () => {
     const recorder = recordingRelay({ deliverOnReady: [NOTICE] });
     const relay = await ScriptedRelay.start(recorder.script);
     try {
-      const { harness, shutdown } = await startAutoSession(relay, { idle: true });
+      const { harness, shutdown } = await startAutoSession(relay, { idle: true, receptionDisplay: false });
       await harness.calls.injected.until(1);
+      expect(harness.widgets.size).toBe(0);
 
       // Explicit `steer`, even while idle. Omitting `deliverAs` would enter
       // `AgentSession.prompt()`, whose non-streaming path auto-reads `@filepath`
@@ -1886,13 +2213,26 @@ describe("the session runtime", () => {
     const recorder = recordingRelay({ deliverOnReady: [NOTICE] });
     const relay = await ScriptedRelay.start(recorder.script);
     try {
-      const { harness, shutdown } = await startAutoSession(relay, { idle: false });
+      const { harness, shutdown } = await startAutoSession(relay, { idle: false, receptionDisplay: false });
       await harness.calls.injected.until(1);
+      expect(harness.widgets.size).toBe(0);
 
       expect(harness.calls.userMessages).toEqual([
         { content: NOTICE_TEXT, options: { deliverAs: "followUp" } },
       ]);
       expect(harness.calls.customMessages).toEqual([]);
+      expect(harness.calls.entries).toEqual([
+        {
+          customType: INBOUND_NOTICE_TYPE,
+          data: {
+            id: NOTICE.id,
+            from: NOTICE.from,
+            ...ROOM,
+            body: NOTICE.body,
+            reply_to: NOTICE.reply_to,
+          },
+        },
+      ]);
 
       await shutdown();
     } finally {
