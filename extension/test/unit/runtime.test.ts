@@ -1809,6 +1809,56 @@ describe("reception feedback", () => {
     }
   });
 
+  test("a replacement superseded during shutdown cannot overwrite the winning preference", async () => {
+    const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
+    const relay = await ScriptedRelay.start(recorder.script);
+    const stopped = new Signal<void>();
+    const release = Promise.withResolvers<void>();
+    const stop = RelayClient.prototype.stop;
+    const stopping = spyOn(RelayClient.prototype, "stop");
+    let parked: Promise<MeshToolResult> | undefined;
+    let shutdown: (() => Promise<void>) | undefined;
+    try {
+      const session = await startAutoSession(relay, { receptionDisplay: true });
+      shutdown = session.shutdown;
+      const { harness, written } = session;
+      await harness.calls.injected.until(1);
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: false });
+      stopping.mockImplementationOnce(async function (this: RelayClient) {
+        await stop.call(this);
+        stopped.fire(undefined);
+        await release.promise;
+      });
+      parked = harness.mesh({ action: "join", task: "superseded-room" });
+      await stopped.until(1);
+
+      writeGlobal(written.agentDir, { port: relay.port, receptionDisplay: true });
+      const winner = await harness.mesh({ action: "join", task: "winning-room" });
+      expect(winner.details["task"]).toBe("winning-room");
+      await harness.calls.injected.until(2);
+      release.resolve();
+      const superseded = await parked;
+      expect(superseded.details["status"]).toBe("failed");
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 1 received");
+
+      recorder.deliver(NOTICE);
+      await harness.calls.injected.until(3);
+      expect(harness.widgets.get("omp-relay-reception")?.[0]).toBe("Relay: 2 received");
+      expect(harness.calls.entries).toHaveLength(3);
+      expect(recorder.hellos).toEqual([
+        { ...ROOM, peer: PEER },
+        { project: ROOM.project, task: "winning-room", peer: PEER },
+      ]);
+      expect(relay.connections).toBe(2);
+    } finally {
+      release.resolve();
+      await parked;
+      stopping.mockRestore();
+      await shutdown?.();
+      await relay.close();
+    }
+  });
+
   test("an identical join applies Off before its roster and retains it after refusal", async () => {
     const recorder = recordingRelay({ deliverOnReady: [INBOUND] });
     const relay = await ScriptedRelay.start(recorder.script);
